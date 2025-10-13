@@ -1,5 +1,4 @@
-﻿from __future__ import annotations
-from project.metrics.es import es95_wealth
+from __future__ import annotations
 
 import math
 from typing import Any, Dict, Iterable, Optional
@@ -137,4 +136,3 @@ def fixup_metrics_with_cvar(args, out: Dict[str, Any]) -> Dict[str, Any]:
         metrics["es_mode"] = es_mode
         metrics["es95_note"] = f"failed to recompute ES95: {type(e).__name__}"
     return out
-

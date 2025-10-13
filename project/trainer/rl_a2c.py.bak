@@ -1,10 +1,9 @@
-﻿# project/trainer/rl_a2c.py
+# project/trainer/rl_a2c.py
 import time, csv, math, os, random, contextlib
 from pathlib import Path
 from typing import Any, Dict, Callable, Optional, Tuple
 
 import numpy as np
-from project.metrics.es import es95_wealth
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -177,7 +176,7 @@ class DualCVaRStage:
 
 # ---------- Teacher policy ----------
 def teacher_action(cfg):
-    # 4% rule monthly, w??.6(clip to w_max)
+    # 4% rule monthly, w≈0.6(clip to w_max)
     q4_m = 1.0 - (1.0 - 0.04) ** (1.0 / cfg.steps_per_year)
     q_cap = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
     q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
@@ -236,7 +235,7 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
             # define c_star_t
             mode = str(cstar_mode or "annuity")
             if mode == "fixed":
-                c_star = float(getattr(cfg, "cstar_m", 0.04/12)) * 1.0  # wealth-normalized obs?먯꽌 1.0? W0
+                c_star = float(getattr(cfg, "cstar_m", 0.04/12)) * 1.0  # wealth-normalized obs에서 1.0은 W0
                 c_star = float(c_star) * float(obs[1])  # obs[1]=W/W0
             elif mode == "vpw":
                 m = cfg.monthly(); g = m['g_m']; Nm = env.base.T - env.base.t
@@ -255,7 +254,7 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
             rew += float(survive_bonus)
         if (done or trunc):
             if cvar_hook is not None:
-                rew += float(cvar_hook(info))           # ?믊뼘텰VaR_dual(L) on terminal wealth
+                rew += float(cvar_hook(info))           # −λ·CVaR_dual(L) on terminal wealth
             lw = float(getattr(cfg, "lw_scale", 0.0) or 0.0)
             if lw != 0.0:
                 rew += lw * float(info.get("W_T", 0.0))
@@ -400,10 +399,10 @@ def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device
 
 # ---------- CSV logger ----------
 def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
-    """trainer ?꾩슜 媛꾨떒 CSV 濡쒓렇 (諛곗슦/寃쎈줈 ??鍮꾩쭅?ы솕 ?꾨뱶???쒖쇅)"""
+    """trainer 전용 간단 CSV 로그 (배우/경로 등 비직렬화 필드는 제외)"""
     out_logs = Path(outputs_dir) / "_logs"; out_logs.mkdir(parents=True, exist_ok=True)
     dest = out_logs / "metrics.csv"; write_header = (not dest.exists())
-    # ?덉쟾???꾨뱶留?異붿텧
+    # 안전한 필드만 추출
     safe = {k: v for k, v in fields.items()
             if isinstance(v, (int, float, str, bool)) or v is None}
     with dest.open("a", newline="", encoding="utf-8") as f:
@@ -415,25 +414,25 @@ def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
 
 # ---------- Actor adapter (policy -> (q,w)) ----------
 def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> Callable[[Dict[str, Any]], Tuple[float, float]]:
-    """evaluate()?먯꽌 諛붾줈 ?????덈뒗 寃쎈웾 actor ?대뙌??
-       ???뺤콉???ㅼ젣 ?낅젰李⑥썝??留욎떠 obs瑜??щ씪?댁뒪/?⑤뵫?섏뿬 shape mismatch 諛⑹?
+    """evaluate()에서 바로 쓸 수 있는 경량 actor 어댑터
+       ⟶ 정책의 실제 입력차원에 맞춰 obs를 슬라이스/패딩하여 shape mismatch 방지
     """
-    # 李몄“ ?쒓컙/?뺢퇋??湲곗?
+    # 참조 시간/정규화 기준
     T_ref = int(getattr(cfg, "T", 0) or getattr(cfg, "horizon_years", 35) * getattr(cfg, "steps_per_year", 12))
     T_ref = max(T_ref, 1)
     W0 = float(getattr(cfg, "W0", 1.0) or 1.0)
 
-    # ?뺤콉???ㅼ젣 ?낅젰 李⑥썝 異붾줎
+    # 정책의 실제 입력 차원 추론
     try:
         in_dim = int(policy.backbone[0].in_features)  # nn.Linear(in_features=...)
     except Exception:
-        in_dim = 4  # ?덉쟾 湲곕낯媛?
+        in_dim = 4  # 안전 기본값
 
     policy = policy.to(device)
     policy.eval()
 
     def _build_obs(state: Dict[str, Any]) -> np.ndarray:
-        """?뺢퇋?붾맂 4D canonical obs瑜?留뚮뱺 ???뺤콉 in_dim??留욎떠 ?먮Ⅴ嫄곕굹 ?⑤뵫"""
+        """정규화된 4D canonical obs를 만든 뒤 정책 in_dim에 맞춰 자르거나 패딩"""
         try:
             if "t_norm" in state:
                 t_norm = float(state["t_norm"])
@@ -597,7 +596,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         }
         torch.save(ckpt, ckpt_path)
     except Exception:
-        ckpt_path = None  # ????ㅽ뙣??臾댁떆
+        ckpt_path = None  # 저장 실패는 무시
 
     # XAI (optional, best-effort)
     if bool(getattr(cfg, "xai_on", True)):
@@ -637,8 +636,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         "best_epoch": best_epoch,
         "train_time_s": float(train_t1 - train_t0),
         "eval_time_s": float(eval_t1 - eval_t0),
-        "actor": actor,                 # runner媛 evaluate(cfg, actor, ...)濡??ы룊媛 媛??
-        "ckpt_path": ckpt_path,         # ???寃쎈줈 (?놁쑝硫?None)
-        "eval_WT": metrics_mp.get("eval_WT"),  # 寃쎈줈蹂?W_T
+        "actor": actor,                 # runner가 evaluate(cfg, actor, ...)로 재평가 가능
+        "ckpt_path": ckpt_path,         # 저장 경로 (없으면 None)
+        "eval_WT": metrics_mp.get("eval_WT"),  # 경로별 W_T
     }
-

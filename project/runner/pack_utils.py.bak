@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
-from project.metrics.es import es95_wealth
+from __future__ import annotations
+
 from typing import Any, Dict, Iterable, Optional, Tuple, List
+
 from .cvar_utils import maybe_extract_WT
 
-# ---- evaluate ?숈쟻 ?꾪룷??----
+# ---- evaluate 동적 임포트 ----
 def _import_evaluate():
     candidates = [
         "project.runner.evaluate",
@@ -21,7 +22,7 @@ def _import_evaluate():
 
 _evaluate = _import_evaluate()  # type: ignore
 
-# ---- n_paths 異붿젙 ----
+# ---- n_paths 추정 ----
 def _estimate_n_paths(args, out: Dict[str, Any]) -> Optional[int]:
     try:
         if isinstance(out, dict):
@@ -46,7 +47,7 @@ def _estimate_n_paths(args, out: Dict[str, Any]) -> Optional[int]:
         pass
     return None
 
-# ---- stdout 異뺤냼/?붿빟 ----
+# ---- stdout 축소/요약 ----
 def prune_for_stdout(args, out: Dict[str, Any]) -> Any:
     def _sel_metrics(md: Dict[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
         return {k: md[k] for k in md if k in keys}
@@ -120,7 +121,7 @@ def prune_for_stdout(args, out: Dict[str, Any]) -> Any:
 
     return out
 
-# ---- cfg/actor 異붿텧 ----
+# ---- cfg/actor 추출 ----
 def try_extract_cfg_actor(res: Any) -> Tuple[Optional[Any], Optional[Any]]:
     if isinstance(res, tuple) and len(res) >= 2:
         return res[0], res[1]
@@ -135,7 +136,7 @@ def try_extract_cfg_actor(res: Any) -> Tuple[Optional[Any], Optional[Any]]:
             return cfg, actor
     return None, None
 
-# ---- ?됯? 寃곌낵 ?⑦궧(+?꾩슂??寃쎈줈 ?ы룊媛) ----
+# ---- 평가 결과 패킹(+필요시 경로 재평가) ----
 def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False) -> Dict[str, Any]:
     if isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], dict):
         pack: Dict[str, Any] = {"metrics": dict(res[0])}
@@ -202,4 +203,3 @@ def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False
                 pass
 
     return pack
-

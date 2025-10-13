@@ -1,6 +1,5 @@
-﻿# project/runner/run.py
+# project/runner/run.py
 from __future__ import annotations
-from project.metrics.es import es95_wealth
 
 import contextlib
 import os
@@ -20,7 +19,7 @@ from .logging_filters import silence_stdio
 # market CSV loader
 from ..data.loader import load_market_csv
 
-# ??HOTFIX 0-2: 濡쒖뺄 濡ㅼ븘?껋뿉?쒕룄 ?됯?? ?숈씪??Env ?ъ슜(?곹깭 ?ㅼ????꾨뱶 ?듭씪)
+# ⚠ HOTFIX 0-2: 로컬 롤아웃에서도 평가와 동일한 Env 사용(상태 스케일/필드 통일)
 # from ..env import RetirementEnv
 from ..env.retirement_env import RetirementEnv  # type: ignore
 
@@ -43,8 +42,8 @@ def _fmt_hms(sec: float) -> str:
 # --------------------------
 def _parse_alpha_mix(args) -> Tuple[float, float, float]:
     """
-    慣 ?뚯떛: --alpha_mix "a,b,c" or 媛쒕퀎 --alpha_kr/us/au.
-    ?⑹씠 1???꾨땲硫??먮룞 ?뺢퇋?? 誘몄?????(1/3,1/3,1/3).
+    α 파싱: --alpha_mix "a,b,c" or 개별 --alpha_kr/us/au.
+    합이 1이 아니면 자동 정규화. 미지정 시 (1/3,1/3,1/3).
     """
     def _as_float(x, default=None):
         try:
@@ -77,8 +76,8 @@ def _parse_alpha_mix(args) -> Tuple[float, float, float]:
 
 def _get_fx_hedge_params(args) -> Tuple[float, float]:
     """
-    h_FX ??[0,1], ???섑뿤吏鍮꾩슜(湲곕낯 0.002=0.2%)
-    CLI???놁쑝硫??띿꽦???놁쓣 ???덉쑝??議곗슜??湲곕낯媛??ъ슜.
+    h_FX ∈ [0,1], 연 환헤지비용(기본 0.002=0.2%)
+    CLI에 없으면 속성이 없을 수 있으니 조용히 기본값 사용.
     """
     h = getattr(args, "h_FX", getattr(args, "h_fx", None))
     try:
@@ -91,7 +90,7 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
     try:
         fx_cost_annual = float(fx_cost_annual)
     except Exception:
-        fx_cost_annual = 0.002  # 0.2%p/??
+        fx_cost_annual = 0.002  # 0.2%p/년
     return h, fx_cost_annual
 
 
@@ -100,10 +99,10 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
 # --------------------------
 def _wire_market_data(cfg: SimConfig, args) -> None:
     """
-    market_mode=bootstrap ??寃쎌슦 CSV 濡쒕뜑瑜??듯빐
-    ?먯떆 ?쒓퀎?댁쓣 cfg??二쇱엯. (硫?곗옄???쇳빀 + ?섑뿤吏 諛섏쁺)
+    market_mode=bootstrap 인 경우 CSV 로더를 통해
+    원시 시계열을 cfg에 주입. (멀티자산 혼합 + 환헤지 반영)
     """
-    # eval/plot?먯꽌 李몄“???뚮옒洹몃룄 cfg??怨좎젙 二쇱엯
+    # eval/plot에서 참조할 플래그도 cfg에 고정 주입
     setattr(cfg, "bands", getattr(args, "bands", "on"))
     setattr(cfg, "data_window", getattr(args, "data_window", None))
     setattr(cfg, "use_real_rf", getattr(args, "use_real_rf", "on"))
@@ -114,19 +113,19 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     market_csv = getattr(args, "market_csv", None)
     if not market_csv:
         raise SystemExit(
-            "market_mode=bootstrap ?댁?留?--market_csv 媛 吏?뺣릺吏 ?딆븯?듬땲?? "
-            "?먮뒗 --data_profile(dev|full)???ъ슜?섏꽭??"
+            "market_mode=bootstrap 이지만 --market_csv 가 지정되지 않았습니다. "
+            "또는 --data_profile(dev|full)을 사용하세요."
         )
 
     abs_csv = os.path.abspath(market_csv)
     if not os.path.exists(abs_csv):
         cwd = os.getcwd()
         raise SystemExit(
-            "market_csv ?뚯씪??李얠쓣 ???놁뒿?덈떎.\n"
+            "market_csv 파일을 찾을 수 없습니다.\n"
             f"  asked: {market_csv}\n"
             f"  abs:   {abs_csv}\n"
             f"  cwd:   {cwd}\n"
-            "?뚰듃: ?ㅼ젣 ?뚯씪 寃쎈줈瑜?吏?뺥븯嫄곕굹 --data_profile dev|full ???ъ슜?섏꽭??"
+            "힌트: 실제 파일 경로를 지정하거나 --data_profile dev|full 을 사용하세요."
         )
 
     blob = load_market_csv(
@@ -137,7 +136,7 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         cache=True,
     )
 
-    # ---- 媛쒕퀎 ?쒓퀎??異붿텧 ----
+    # ---- 개별 시계열 추출 ----
     ret_kr = blob.get("ret_kr_eq")
     ret_us_l = blob.get("ret_us_eq_krw")
     ret_au = blob.get("ret_gold_krw")
@@ -146,10 +145,10 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     dates = blob.get("dates")
     cpi = blob.get("cpi")
 
-    # (媛???? FX ?붿닔?듬쪧
+    # (가능 시) FX 월수익률
     ret_fx = blob.get("ret_fx") or blob.get("ret_fx_usdkrw") or None
 
-    # ---- ?섑뿤吏 泥섎━ (US) ----
+    # ---- 환헤지 처리 (US) ----
     import numpy as np
     steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
     h_fx, fx_cost_ann = _get_fx_hedge_params(args)
@@ -218,8 +217,8 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
 
 def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
     """
-    ?ㅼ뼇???뺥깭??policy/agent瑜?(q,w) 諛섑솚 actor(state)->(float,float) 濡??섑븨.
-    state??dict/ndarray 紐⑤몢 ?덉슜 (?뺤콉???먰븯???뺥깭瑜?洹몃?濡??꾨떖).
+    다양한 형태의 policy/agent를 (q,w) 반환 actor(state)->(float,float) 로 래핑.
+    state는 dict/ndarray 모두 허용 (정책이 원하는 형태를 그대로 전달).
     """
     if policy_like is None:
         raise RuntimeError("policy_like is None")
@@ -246,9 +245,9 @@ def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
     return _actor
 
 
-# --- evaluate 寃곌낵 ?뺢퇋???좏떥 ---
+# --- evaluate 결과 정규화 유틸 ---
 def _normalize_evaluate_output(ret, es_mode: str):
-    """evaluate 諛섑솚??(metrics: dict, extras: dict)濡??뺢퇋??"""
+    """evaluate 반환을 (metrics: dict, extras: dict)로 정규화."""
     metrics, extras = {}, {}
 
     if isinstance(ret, dict):
@@ -261,9 +260,7 @@ def _normalize_evaluate_output(ret, es_mode: str):
         if len(ret) > 2:
             extras["_rest"] = ret[2:]
     else:
-        metrics = {"note": "unexpected evaluate return type", "type": str(type(ret)),
-  'es95_source': es95_source
-}
+        metrics = {"note": "unexpected evaluate return type", "type": str(type(ret))}
 
     if "es_mode" not in metrics:
         metrics["es_mode"] = str(es_mode).lower()
@@ -271,7 +268,7 @@ def _normalize_evaluate_output(ret, es_mode: str):
 
 
 def _call_evaluate(cfg, actor, es_mode: str):
-    """return_paths 吏??鍮꾩???紐⑤몢 ?덉쟾 ?몄텧."""
+    """return_paths 지원/비지원 모두 안전 호출."""
     try:
         ret = evaluate(cfg, actor, es_mode=str(es_mode).lower(), return_paths=True)
     except TypeError:
@@ -280,14 +277,14 @@ def _call_evaluate(cfg, actor, es_mode: str):
 
 
 # ==========================
-# ?덉쟾??寃쎈줈 ?ы룊媛(濡쒖뺄 濡ㅼ븘??
+# 안전한 경로 재평가(로컬 롤아웃)
 # ==========================
 def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: Any) -> _np.ndarray:
     """
-    ??HOTFIX 0-1: ?뺤콉???꾨떖???곹깭瑜???긽 ndarray([t_norm, W]) 濡?媛뺤젣.
-    - dict: {"t": step_index, "W": wealth} 媛????[t_norm, W]
-    - ndarray: 洹몃?濡?float 諛곗뿴濡?媛뺤젣 罹먯뒪??
-    - 湲고?: [0.0, env.W] ?대갚
+    ⚠ HOTFIX 0-1: 정책에 전달할 상태를 항상 ndarray([t_norm, W]) 로 강제.
+    - dict: {"t": step_index, "W": wealth} 가정 → [t_norm, W]
+    - ndarray: 그대로 float 배열로 강제 캐스팅
+    - 기타: [0.0, env.W] 폴백
     """
     if isinstance(raw_obs, dict):
         T = int(getattr(env, "T", 1) or 1)
@@ -299,10 +296,10 @@ def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: An
         arr = _np.asarray(raw_obs, dtype=float).ravel()
         if arr.size >= 2:
             return arr[:2]
-        # 愿痢≪씠 1李⑥썝留??⑤떎硫?W??env.W 濡?蹂닿컯
+        # 관측이 1차원만 온다면 W는 env.W 로 보강
         W_now = float(getattr(env, "W", 0.0))
         return _np.asarray([float(arr[0]) if arr.size >= 1 else 0.0, W_now], dtype=float)
-    # 湲고? ?대갚
+    # 기타 폴백
     return _np.asarray([0.0, float(getattr(env, "W", 0.0))], dtype=float)
 
 
@@ -310,17 +307,17 @@ def _rollout_terminal_wealths(cfg: SimConfig,
                               actor: Callable[[Any], tuple[float, float]],
                               n_paths: int) -> List[float]:
     """
-    evaluate媛 寃쎈줈瑜???二쇨굅?? ?ㅼ뭡??蹂듭젣 ?섏떖 ??諛⑹뼱?곸쑝濡?吏곸젒 寃쎈줈 ?섑뵆.
-    - ?숈씪 Env ?ъ슜(?곹깭 ?ㅼ????꾨뱶 ?숈씪)
-    - seed瑜??섍린吏 ?딄퀬 reset()留?諛섎났 ???대? path_counter/RNG濡?寃쎈줈 ?ㅼ뼇??
-    - ?곹깭????긽 ndarray([t_norm, W])濡??뺤콉???꾨떖
+    evaluate가 경로를 안 주거나, 스칼라 복제 의심 시 방어적으로 직접 경로 샘플.
+    - 동일 Env 사용(상태 스케일/필드 동일)
+    - seed를 넘기지 않고 reset()만 반복 → 내부 path_counter/RNG로 경로 다양화
+    - 상태는 항상 ndarray([t_norm, W])로 정책에 전달
     """
     env = RetirementEnv(cfg)
     WTs: List[float] = []
     n_paths = int(max(1, n_paths))
 
     for _ in range(n_paths):
-        env.reset()  # seed ?몄옄 誘몄쟾????寃쎈줈 ?ㅼ뼇?붾뒗 Env ?대????꾩엫
+        env.reset()  # seed 인자 미전달 → 경로 다양화는 Env 내부에 위임
         done = False
         while not done:
             raw = env._obs() if hasattr(env, "_obs") else None
@@ -332,7 +329,7 @@ def _rollout_terminal_wealths(cfg: SimConfig,
 
 
 def _looks_degenerate_wt(xs) -> bool:
-    """寃쎈줈 諛곗뿴???녾굅?? ?꾨? ?숈씪/嫄곗쓽 ?숈씪?섎㈃ True."""
+    """경로 배열이 없거나, 전부 동일/거의 동일하면 True."""
     try:
         arr = _np.asarray(xs, dtype=float).ravel()
         if arr.size <= 1:
@@ -357,7 +354,7 @@ def run_once(args) -> Dict[str, Any]:
 
         ensure_dir(args.outputs)
 
-        # tag ??cfg 二쇱엯 (autosave?먯꽌 ?ъ슜)
+        # tag → cfg 주입 (autosave에서 사용)
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
@@ -382,7 +379,7 @@ def run_once(args) -> Dict[str, Any]:
         m, extras = _call_evaluate(cfg, actor, es_mode=args.es_mode)
         time_eval = time.perf_counter() - t4
 
-    # ---- 諛⑹뼱???꾩쿂由? eval_WT 蹂댁젙 ----
+    # ---- 방어적 후처리: eval_WT 보정 ----
     extras = extras or {}
     need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
 
@@ -400,7 +397,7 @@ def run_once(args) -> Dict[str, Any]:
             except Exception as _e:
                 extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
 
-    # --- 硫뷀듃由?蹂묓빀: ?곌툑 ?뚯깮 ?뚮씪誘명꽣????긽 湲곕줉(誘몄꽕????0.0) ---
+    # --- 메트릭 병합: 연금 파생 파라미터는 항상 기록(미설정 시 0.0) ---
     if isinstance(m, dict):
         y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
         a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
@@ -414,7 +411,7 @@ def run_once(args) -> Dict[str, Any]:
             }
         )
 
-    # 珥??됯? 寃쎈줈 ??蹂닿퀬??
+    # 총 평가 경로 수(보고용)
     n_paths_total = len(extras.get("eval_WT", [])) or (
         getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0))
         * len(getattr(cfg, "seeds", []))
@@ -444,7 +441,7 @@ def run_once(args) -> Dict[str, Any]:
         es_mode=args.es_mode,
         n_paths=int(n_paths_total),
         args=slim_args(args),
-        extra=extras,  # 寃쎈줈 ??遺媛?뺣낫 (CSV?먮뒗 ???????
+        extra=extras,  # 경로 등 부가정보 (CSV에는 저장 안 함)
         timing=timing,
         time_total_s=timing["total_s"],
         time_total_hms=timing["total_hms"],
@@ -461,25 +458,25 @@ def _maybe_load_actor_from_ckpt(
     cfg_hint: Optional[Any],
 ) -> Optional[Callable[[Any], tuple[float, float]]]:
     """
-    trainer媛 actor/policy瑜?吏곸젒 ??二쇰뒗 寃쎌슦 ckpt?먯꽌 濡쒕뵫 ?쒕룄.
-    ?곗꽑 project/trainer/policy_io.load_policy_as_actor(ckpt, cfg_hint)瑜??쒕룄?섍퀬
-    ?ㅽ뙣 ??怨쇨굅/???濡쒕뜑?ㅼ쓣 ?쒖감?곸쑝濡??쒕룄.
+    trainer가 actor/policy를 직접 안 주는 경우 ckpt에서 로딩 시도.
+    우선 project/trainer/policy_io.load_policy_as_actor(ckpt, cfg_hint)를 시도하고
+    실패 시 과거/대안 로더들을 순차적으로 시도.
     """
     if not ckpt_path:
         return None
 
-    # 理쒖떊 濡쒕뜑 ?곗꽑 (cfg ?뚰듃 ?꾨떖)
+    # 최신 로더 우선 (cfg 힌트 전달)
     try:
         from ..trainer.policy_io import load_policy_as_actor  # type: ignore
         t0 = time.perf_counter()
-        actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)  # ???쒓렇?덉쿂
+        actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)  # 새 시그니처
         _ = time.perf_counter() - t0
         if callable(actor):
             return actor
     except Exception:
         pass
 
-    # 援щ쾭???泥?濡쒕뜑 ?꾨낫
+    # 구버전/대체 로더 후보
     loaders = [
         ("..trainer.policy_io", "load_policy_as_actor"),
         ("..trainer.policy_io", "load_actor"),
@@ -493,10 +490,10 @@ def _maybe_load_actor_from_ckpt(
             modobj = importlib.import_module(mod, package=__package__)
             loader = getattr(modobj, attr)
             try:
-                policy_like = loader(ckpt_path, cfg_hint)  # cfg_hint 吏??濡쒕뜑
+                policy_like = loader(ckpt_path, cfg_hint)  # cfg_hint 지원 로더
             except TypeError:
-                policy_like = loader(ckpt_path)  # 援ы삎 ?쒓렇?덉쿂
-            return _to_actor(policy_like)  # actor/policy-like 紐⑤몢 吏??
+                policy_like = loader(ckpt_path)  # 구형 시그니처
+            return _to_actor(policy_like)  # actor/policy-like 모두 지원
         except Exception:
             continue
     return None
@@ -505,7 +502,7 @@ def _maybe_load_actor_from_ckpt(
 def run_rl(args):
     t_all_0 = time.perf_counter()
 
-    # RL???숈씪?섍쾶 cfg 二쇱엯 ??trainer ?대? Env ?앹꽦 ???ㅻ뜲?댄꽣 ?ъ슜
+    # RL도 동일하게 cfg 주입 → trainer 내부 Env 생성 시 실데이터 사용
     t0 = time.perf_counter()
     cfg: SimConfig = make_cfg(args)
     time_make_cfg = time.perf_counter() - t0
@@ -647,7 +644,7 @@ def run_rl(args):
             "h_FX": getattr(cfg, "h_FX", None),
         },
         ckpt_path=ckpt_path,
-        extra=extras_dict,   # ?ш린 ?덉뿉 eval_WT ??寃쎈줈 ?뺣낫媛 ?ы븿?????덉쓬
+        extra=extras_dict,   # 여기 안에 eval_WT 등 경로 정보가 포함될 수 있음
         timing=timing,
         time_total_s=timing["total_s"],
         time_total_hms=timing["total_hms"],
@@ -657,4 +654,3 @@ def run_rl(args):
         do_autosave(out.get("metrics") or {}, cfg, args, out)
 
     return out
-

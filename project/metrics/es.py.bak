@@ -1,0 +1,13 @@
+# project/metrics/es.py
+import numpy as np
+
+def es95_wealth(wealth_terminal: np.ndarray, alpha: float = 0.95):
+    """
+    ES95 (wealth): 하위 (1-alpha)=5% 구간의 평균 WT.
+    값이 클수록 (꼬리 구간의) 최종부가 더 높다는 뜻 → '좋음'.
+    """
+    if wealth_terminal.ndim != 1:
+        wealth_terminal = wealth_terminal.reshape(-1)
+    q = np.quantile(wealth_terminal, 1 - alpha)  # 5% 분위
+    tail = wealth_terminal[wealth_terminal <= q]
+    return float(tail.mean()) if tail.size > 0 else float(q)

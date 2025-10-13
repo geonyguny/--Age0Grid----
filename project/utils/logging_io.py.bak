@@ -1,4 +1,3 @@
-﻿from project.metrics.es import es95_wealth
 # project/utils/logging_io.py
 import os, csv, json, time
 from datetime import datetime
@@ -49,10 +48,9 @@ def dump_result_json(path: str, args: dict, metrics: dict, extras: dict=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "ts": int(time.time()),
-        "args": args,           # hedge_cost/hedge_tx ?대? args???ы븿
+        "args": args,           # hedge_cost/hedge_tx 이미 args에 포함
         "metrics": metrics,
         "extras": extras or {}
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-

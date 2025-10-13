@@ -6,6 +6,7 @@ import os
 import csv
 import datetime
 import inspect
+import sys
 from typing import Callable, Tuple, Optional, Dict, Any, Union, List
 
 import numpy as _np
@@ -33,8 +34,12 @@ _METRICS_HEADER: list[str] = [
     "y_ann", "a_factor", "P",
     # sweep/overlay params persisted in logs
     "ann_alpha",
-    # (NEW) diagnostics for ES
+    # diagnostics for ES
     "es95_source", "es95_note",
+    # expected utility reporting
+    "EU", "EU_per_year", "delta_annual",
+    # (NEW) utility/reporting config & loss baseline audit
+    "crra_gamma", "u_scale", "report_utility", "F_target_used",
 ]
 
 
@@ -91,6 +96,21 @@ def _clean_finite(a: _np.ndarray) -> tuple[_np.ndarray, int, int]:
     arr = _np.asarray(a, dtype=float)
     mask = _np.isfinite(arr)
     return arr[mask], int(arr.size), int((~mask).sum())
+
+
+def _crra_u(c: float, gamma: float) -> float:
+    """CRRA 효용 (c>0). gamma≈1이면 로그 효용으로 처리."""
+    c = max(float(c), 1e-12)
+    if abs(float(gamma) - 1.0) < 1e-12:
+        return float(_np.log(c))
+    return float((c ** (1.0 - float(gamma)) - 1.0) / (1.0 - float(gamma)))
+
+
+def _stderr(msg: str) -> None:
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 # =========================
@@ -183,7 +203,44 @@ def metrics_loss(WT_samples: _np.ndarray, F: float = 1.0, alpha: float = 0.95) -
 
 
 # =========================
-# Evaluation (wealth/loss + consumption bands)
+# Soft assertions (consumption / wealth)
+# =========================
+
+def _soft_assert_streams(WT_arr: _np.ndarray, C_all: List[_np.ndarray], quiet: bool) -> List[str]:
+    """
+    WT_arr: 최종자산 배열이 아니라, 여기서는 경로별 최종값들만 있어도 최소한의 검사는 가능.
+    C_all: 각 경로의 소비 시계열(고정 길이, NaN 패딩)
+    반환: 경고 메시지 리스트(비어있으면 이상 없음)
+    """
+    warns: List[str] = []
+
+    # Wealth warnings (terminal values)
+    if WT_arr.size == 0 or not _np.isfinite(WT_arr).all():
+        bad = int(_np.sum(~_np.isfinite(WT_arr))) if WT_arr.size > 0 else 0
+        warns.append(f"wealth_nonfinite={bad}/{WT_arr.size}")
+    if _np.any(WT_arr < -1e-9):
+        nneg = int(_np.sum(WT_arr < -1e-9))
+        wmin = float(_np.nanmin(WT_arr))
+        warns.append(f"wealth_negative_paths={nneg} (min={wmin:.6g})")
+
+    # Consumption warnings (sequence-level)
+    if C_all:
+        C_mat = _np.vstack(C_all)
+        if not _np.isfinite(C_mat).all():
+            bad = int(_np.sum(~_np.isfinite(C_mat)))
+            warns.append(f"consumption_nonfinite_count={bad}")
+        if _np.nanmin(C_mat) < -1e-12:
+            nneg = int(_np.sum(C_mat < -1e-12))
+            cmin = float(_np.nanmin(C_mat))
+            warns.append(f"consumption_negative_count={nneg} (min={cmin:.6g})")
+
+    if warns and not quiet:
+        _stderr("[warn] soft-assert: " + "; ".join(warns))
+    return warns
+
+
+# =========================
+# Evaluation (wealth/loss + consumption bands + EU)
 # =========================
 
 def evaluate(
@@ -206,7 +263,7 @@ def evaluate(
     -------
     metrics : dict
         EW, ES95, EL(손실모드), Ruin, mean_WT, 소비 밴드 등 요약 메트릭
-        + es_mode, es95_source(진단)
+        + es_mode, es95_source(진단) + (옵션) EU, EU_per_year, delta_annual
     extras? : dict (optional)
         eval_WT : list[float]  # 경로별 최종자산 (CLI의 CVaR 재계산에 사용)
         ruin_flags : list[bool]
@@ -235,6 +292,9 @@ def evaluate(
     early_flags: List[bool] = []
     C_all: List[_np.ndarray] = []  # consumption series (NaN padded to T)
 
+    # EU accumulators (path level, optional)
+    path_EU: List[float] = []
+
     # hedge aggregates
     agg_hedge_hits = 0.0
     agg_steps = 0.0
@@ -244,6 +304,24 @@ def evaluate(
     seeds = getattr(cfg, "seeds", [0]) or [0]
     # CLI와 호환: n_paths(일반) / rl_n_paths_eval(RL)
     n_eval = int(getattr(cfg, "n_paths", getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1)) or 1))
+
+    report_utility = str(getattr(cfg, "report_utility", "off")).lower() == "on"
+    gamma = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
+    u_scale = float(getattr(cfg, "u_scale", 1.0) or 1.0)
+    delta_ann = getattr(cfg, "delta_annual", None)
+    spm = int(getattr(env, "steps_per_year", 12) or 12)
+
+    # delta_annual이 주어졌을 때만 월 할인율로 변환(정합성 보장)
+    if delta_ann is None:
+        delta_m = 1.0
+    else:
+        try:
+            delta_ann_f = float(delta_ann)
+            # 0<delta≤1 범위로 클리핑(수치적 안전)
+            delta_ann_f = max(1e-12, min(1.0, delta_ann_f))
+            delta_m = float(delta_ann_f ** (1.0 / float(spm)))
+        except Exception:
+            delta_m = 1.0
 
     for sd in seeds:
         base = int(sd) * 100_000
@@ -260,6 +338,18 @@ def evaluate(
             if take > 0:
                 row[:take] = C_hist[:take]
             C_all.append(row)
+
+            # EU on the consumption stream (optional, robust)
+            if report_utility:
+                try:
+                    eu = 0.0
+                    for t_idx, c_t in enumerate(_np.asarray(C_hist, dtype=float)):
+                        if _np.isfinite(c_t):
+                            eu += (delta_m ** t_idx) * (u_scale * _crra_u(c_t, gamma))
+                    path_EU.append(float(eu))
+                except Exception:
+                    # EU 계산 실패는 메트릭의 필수 항목이 아니므로 무음 처리
+                    pass
 
             agg_hedge_hits += float(ep_stats.get("hedge_hits", 0.0))
             agg_steps += float(ep_stats.get("steps", 0.0))
@@ -288,16 +378,26 @@ def evaluate(
         ruin_rate = float(_np.mean(_np.logical_or(early_fin, WT_fin <= 0.0))) if WT_fin.size > 0 else 0.0
 
         if str(es_mode).lower() == "loss":
-            F = float(getattr(cfg, "F_target", 1.0))
+            # loss 기준선 선택(명시 없으면 1.0로 fallback) + 감사 로깅
+            F_raw = getattr(cfg, "F_target", None)
+            if F_raw is None:
+                F = 1.0
+                es_note_msgs.append("F_target_fallback_to_1.0")
+            else:
+                F = float(F_raw)
+                if F == 0.0:
+                    es_note_msgs.append("F_target_explicit_zero")
             alpha = float(getattr(cfg, "alpha", 0.95))
             m = metrics_loss(WT_fin, F=F, alpha=alpha)
             m["mean_WT"] = float(WT_fin.mean()) if WT_fin.size > 0 else 0.0
             m["es95_source"] = "computed_in_evaluate_loss"
+            m["F_target_used"] = float(F)
         else:
             alpha = float(getattr(cfg, "alpha", 0.95))
             m = metrics_wealth(WT_fin, alpha=alpha)
             m["mean_WT"] = m["EW"]
             m["es95_source"] = "computed_in_evaluate_wealth"
+            m["F_target_used"] = None
 
     m["Ruin"] = ruin_rate
     m["es_mode"] = str(es_mode).lower()
@@ -347,6 +447,39 @@ def evaluate(
                          index=False, encoding="utf-8")
         else:
             m.update({"p10_c_last": 0.0, "p50_c_last": 0.0, "p90_c_last": 0.0, "C_ES95_avg": 0.0})
+
+    # EU summary (+ config echo)
+    try:
+        if path_EU:
+            m["EU"] = float(_np.nanmean(_np.asarray(path_EU, dtype=float)))
+            # 연환산: 총 기간(T months) → years = T/spm
+            spm_local = int(getattr(env, "steps_per_year", 12) or 12)
+            yrs = float(max(1.0, (T or int(getattr(env, "T", spm_local))) / spm_local))
+            m["EU_per_year"] = float(m["EU"] / yrs)
+            m["delta_annual"] = getattr(cfg, "delta_annual", None)
+        else:
+            m["EU"] = None
+            m["EU_per_year"] = None
+            m["delta_annual"] = getattr(cfg, "delta_annual", None)
+        # EU 리포팅 설정/파라미터도 메트릭에 반영
+        m["report_utility"] = bool(report_utility)
+        m["crra_gamma"] = float(gamma)
+        m["u_scale"] = float(u_scale)
+    except Exception:
+        m["EU"] = None
+        m["EU_per_year"] = None
+        m["delta_annual"] = getattr(cfg, "delta_annual", None)
+        m["report_utility"] = bool(report_utility)
+        m["crra_gamma"] = float(gamma)
+        m["u_scale"] = float(u_scale)
+
+    # 소프트 어설션 실행
+    try:
+        warns = _soft_assert_streams(WT_arr, C_all, quiet=(str(getattr(cfg, "quiet", "on")).lower() == "on"))
+        if warns:
+            es_note_msgs.append("soft_assert: " + "; ".join(warns))
+    except Exception:
+        pass
 
     # (quiet=off) 분포 진단 출력
     if str(getattr(cfg, "quiet", "on")).lower() != "on":
@@ -415,9 +548,31 @@ def _maybe_upgrade_header(csv_path: str, expected: list[str]) -> None:
         pass
 
 
+def _append_row(csv_path: str, row: dict) -> None:
+    """단일 CSV에 헤더를 보장하며 행을 추가."""
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_METRICS_HEADER)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+
+def _sanitize_tag(tag: str) -> str:
+    """폴더명 안전화를 위한 태그 정규화(영숫자, -, _, . 만 유지)."""
+    safe = []
+    for ch in str(tag):
+        if ch.isalnum() or ch in "-_.":
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("_") or "untagged"
+
+
 def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None) -> str:
     """
     outputs/_logs/metrics.csv에 한 줄 append.
+    추가로 tag가 있으면 outputs/_logs/<tag>/metrics.csv 에도 미러링.
     (extras는 파일에 쓰지 않음)
     """
     out_dir = outputs or getattr(cfg, "outputs", "./outputs")
@@ -483,14 +638,29 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
         # ES diagnostics
         "es95_source": metrics.get("es95_source"),
         "es95_note": metrics.get("es95_note"),
+        # EU reporting
+        "EU": metrics.get("EU"),
+        "EU_per_year": metrics.get("EU_per_year"),
+        "delta_annual": getattr(cfg, "delta_annual", None),
+        # utility/reporting config & loss baseline audit
+        "crra_gamma": getattr(cfg, "crra_gamma", None),
+        "u_scale": getattr(cfg, "u_scale", None),
+        "report_utility": (str(getattr(cfg, "report_utility", "off")).lower() == "on"),
+        "F_target_used": metrics.get("F_target_used"),
     }
 
-    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=_METRICS_HEADER)
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
+    # 글로벌 로그에 기록
+    _append_row(csv_path, row)
+
+    # 태그별 로그 미러링
+    tag = getattr(cfg, "tag", None)
+    if tag:
+        safe_tag = _sanitize_tag(tag)
+        tag_dir = os.path.join(logs_dir, safe_tag)
+        _ensure_dir(tag_dir)
+        tag_csv = os.path.join(tag_dir, "metrics.csv")
+        _maybe_upgrade_header(tag_csv, _METRICS_HEADER)
+        _append_row(tag_csv, row)
 
     return csv_path
 

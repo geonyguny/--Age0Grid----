@@ -1,9 +1,10 @@
 # project/env.py
 from __future__ import annotations
 
+import sys
 import numpy as _np
 from numpy.random import Generator as _Generator, default_rng as _np_default_rng, SeedSequence as _SeedSequence
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 
 from .config import SimConfig
 from .market import IIDNormalMarket, BootstrapMarket
@@ -59,13 +60,16 @@ class RetirementEnv:
 
     Notes:
       - Floor(level) 적용 시 q_min = min(1, f_min_real / W_t)
-      - w ∈ [0, w_max]
+      - w ∈ [w_min_dev(optional), w_max]
       - Market: IIDNormal or Bootstrap (real returns)
-      - Hedge(MVP):
+      - Hedge:
           * mode="mu": per-period μ haircut (R_t ← R_t - cost_m)
           * mode="sigma": per-period σ reduction (R_t ← μ_m + (1-k)·(R_t - μ_m))
     """
 
+    # --------------------
+    # ctor
+    # --------------------
     def __init__(
         self,
         cfg: SimConfig,
@@ -75,6 +79,12 @@ class RetirementEnv:
         self.cfg = cfg
         self.m = cfg.monthly()  # {'mu_m','sigma_m','rf_m','phi_m','p_m','g_m','beta_m'}
         self.T = int(cfg.horizon_years) * int(cfg.steps_per_year)
+
+        # ---- Warn hook & quiet flag ----
+        self.warn_hook: Optional[Callable[[Dict[str, Any]], None]] = getattr(cfg, "warn_hook", None)
+        self.warn_limit: int = int(getattr(cfg, "warn_limit", 20) or 20)
+        self._warn_counts: Dict[str, int] = {}
+        self._quiet = (str(getattr(cfg, "quiet", "on")).lower() == "on")
 
         # ----- RNG 배선: base_seed → [env, market] 서브스트림 분리 -----
         base_seed = getattr(cfg, "seed", None)
@@ -128,6 +138,11 @@ class RetirementEnv:
         )
         self._boot_block  = int(getattr(cfg, "bootstrap_block", 24) or 24)
 
+        # Dev: minimum risky weight floor (옵션)
+        self._w_min_dev: Optional[float] = getattr(cfg, "w_min_dev", None)
+        if self._w_min_dev is not None:
+            self._w_min_dev = float(max(0.0, min(float(self._w_min_dev), float(getattr(cfg, "w_max", 1.0) or 1.0))))
+
         # Paths
         self.path_risky: _np.ndarray = _np.zeros(self.T, dtype=float)
         self.path_safe:  _np.ndarray = _np.zeros(self.T, dtype=float)
@@ -171,11 +186,14 @@ class RetirementEnv:
 
     def reseed(self, base_seed: Optional[int]) -> None:
         """런 타임에 base_seed로 env/market RNG를 재구성."""
-        # master를 base_seed로(또는 OS 엔트로피로) 초기화하고 child 2개 뽑음
         _init_ss_master(base_seed)
         self._rng = _np_default_rng(_next_child_ss())
         self._rng_market = _np_default_rng(_next_child_ss())
         self._try_wire_market_rng(self._rng_market)
+
+    # alias
+    def set_seed(self, base_seed: Optional[int]) -> None:
+        self.reseed(base_seed)
 
     # --------------------
     # internals
@@ -207,6 +225,32 @@ class RetirementEnv:
     def _obs(self) -> Dict[str, Any]:
         # 간단 dict 관측치
         return dict(t=self.t, W=self.W, W0=self.W0, peakW=self.peakW, age=self.age)
+
+    # --------------------
+    # warn hook
+    # --------------------
+    def _warn(self, code: str, msg: str, **data: Any) -> None:
+        cnt = self._warn_counts.get(code, 0)
+        if cnt >= self.warn_limit:
+            return
+        self._warn_counts[code] = cnt + 1
+
+        payload = dict(code=code, msg=msg, t=self.t, W=self.W)
+        if data:
+            payload.update(data)
+
+        # hook 우선
+        if self.warn_hook:
+            try:
+                self.warn_hook(payload)
+            except Exception:
+                pass
+        # quiet=off 이면 stderr에도
+        if not self._quiet:
+            try:
+                print(f"[env-warn] {code}: {msg} | {data}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
 
     # --------------------
     # API
@@ -252,7 +296,7 @@ class RetirementEnv:
                 self.path_safe  = _np.full(self.T, float(self.m["rf_m"]), dtype=float)
 
         # one-line debug (quiet=off)
-        if str(getattr(self.cfg, "quiet", "on")).lower() != "on":
+        if not self._quiet:
             def _cs(arr: _np.ndarray) -> float:
                 arr = _np.asarray(arr, dtype=float)
                 return float(_np.nanmean(arr[:16])) if arr.size else float("nan")
@@ -267,11 +311,29 @@ class RetirementEnv:
     def step(self, q: float, w: float) -> Tuple[Dict, float, bool, bool, Dict]:
         info: Dict[str, Any] = {}
 
-        # 1) clipping
-        w = float(_np.clip(float(w), 0.0, self.cfg.w_max))
+        # Defensive checks for inputs
+        if not _np.isfinite(q):
+            self._warn("q_nonfinite", f"q is non-finite; forcing 0.0", q=q)
+            q = 0.0
+        if not _np.isfinite(w):
+            self._warn("w_nonfinite", f"w is non-finite; forcing 0.0", w=w)
+            w = 0.0
+
+        # 1) clipping (dev min floor + max)
+        w_max = float(self.cfg.w_max)
+        w_min = float(self._w_min_dev) if self._w_min_dev is not None else 0.0
+        w0 = w
+        w = float(_np.clip(float(w), w_min, w_max))
+        if w != w0:
+            info["w_clipped"] = float(w)
+            if w_min > 0.0 and w < w_min + 1e-12:
+                info["w_clipped_min"] = True
+
         q = float(_np.clip(float(q), 0.0, 1.0))
         if getattr(self.cfg, "floor_on", False) and getattr(self.cfg, "f_min_real", 0.0) > 0.0 and self.W > 0.0:
             q_min = min(1.0, float(self.cfg.f_min_real) / self.W)
+            if q < q_min:
+                info["q_floor_applied"] = float(q_min)
             q = max(q, q_min)
 
         # 2) consumption
@@ -283,11 +345,22 @@ class RetirementEnv:
         R_risk = float(self.path_risky[idx])
         R_safe = float(self.path_safe[idx])
 
+        # sanitize non-finite returns
+        if not _np.isfinite(R_risk):
+            self._warn("R_risk_nonfinite", "non-finite risky return; forcing 0.0", idx=idx, R_risk=R_risk)
+            R_risk = 0.0
+        if not _np.isfinite(R_safe):
+            self._warn("R_safe_nonfinite", "non-finite safe return; forcing 0.0", idx=idx, R_safe=R_safe)
+            R_safe = 0.0
+
         # print first two steps (quiet=off)
-        if str(getattr(self.cfg, "quiet", "on")).lower() != "on" and self.t < 2:
+        if not self._quiet and self.t < 2:
             print(f"[env] t={self.t} R_risk={R_risk:.6f} R_safe={R_safe:.6f}")
 
         gross = 1.0 + (w * R_risk) + ((1.0 - w) * R_safe)
+        if gross < 0.0:
+            self._warn("gross_negative", "gross multiplier < 0 (extreme returns)", gross=gross, w=w, Rr=R_risk, Rs=R_safe)
+
         W_next = W_net * gross
 
         # 4) fee on beginning-of-step wealth
@@ -311,7 +384,12 @@ class RetirementEnv:
         bequest_val = 0.0
         if self.mortality_on and (self.W > 0.0):
             p = float(self.mort.p_death_month(self.age)) if self.mort is not None else 0.0
-            if self._rng.random() < max(0.0, min(p, 1.0)):
+            p = max(0.0, min(p, 1.0))
+            draw = self._rng.random()
+            if not _np.isfinite(draw):
+                self._warn("rng_nonfinite", "rng produced non-finite; resampling")
+                draw = float(_np.random.random())
+            if draw < p:
                 died = True
                 kappa = self.bequest_kappa
                 gamma = self.bequest_gamma
@@ -336,4 +414,7 @@ class RetirementEnv:
             info["bequest"] = float(bequest_val)
 
         done = bool(self.t >= self.T or self.W <= 0.0 or died)
+        if early_ruin:
+            self._warn("early_ruin", "wealth hit zero before horizon", t=self.t)
+
         return self._obs(), c_t, done, early_ruin, info

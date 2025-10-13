@@ -1,4 +1,4 @@
-﻿# project/runner/cli.py
+# project/runner/cli.py
 from __future__ import annotations
 
 import argparse

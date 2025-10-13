@@ -1,17 +1,16 @@
-﻿# project/runner/io_utils.py
+# project/runner/io_utils.py
 from __future__ import annotations
-from project.metrics.es import es95_wealth
 import os, csv, datetime
 from typing import Any, Dict
 
 def ensure_dir(path: str): os.makedirs(path, exist_ok=True)
 def now_iso() -> str:
-    # ?뚯씪紐끒룹젙??移쒗솕????꾩뒪?ы봽(濡쒖뺄)
+    # 파일명·정렬 친화적 타임스탬프(로컬)
     return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 SCHEMA_VERSION = "v2"
 
-# 怨좎젙 ?ㅻ뜑(???쒖꽌 蹂댁옣)
+# 고정 헤더(열 순서 보장)
 CSV_FIELDS = [
     "ts", "schema", "asset", "method", "es_mode", "tag",
     "alpha", "lambda", "F_target",
@@ -22,7 +21,7 @@ CSV_FIELDS = [
     "market_mode", "market_csv", "data_window", "use_real_rf",
     "bands", "outputs",
     "seeds", "n_paths",
-    # RL ?섏씠?쇰뱾
+    # RL 하이퍼들
     "rl_epochs", "rl_steps_per_epoch", "rl_n_paths_eval",
     "entropy_coef", "value_coef", "gae_lambda", "lr", "max_grad_norm",
     "rl_q_cap", "teacher_eps0", "teacher_decay",
@@ -30,18 +29,18 @@ CSV_FIELDS = [
     # Hedge / mortality / ann
     "hedge", "hedge_mode", "hedge_sigma_k", "hedge_cost", "hedge_tx",
     "mortality", "ann_on", "ann_alpha", "ann_L", "ann_d", "ann_index",
-    # 李몄“ 寃쎈줈
+    # 참조 경로
     "ckpt_path",
 ]
 
 def _s(v: Any) -> Any:
-    # CSV ?덉젙?붾? ?꾪빐 由ъ뒪???쒗뵆? 怨듬갚 援щ텇 臾몄옄?대줈, None? 鍮덉뭏?쇰줈
+    # CSV 안정화를 위해 리스트/튜플은 공백 구분 문자열로, None은 빈칸으로
     if v is None: return ""
     if isinstance(v, (list, tuple)): return " ".join(str(x) for x in v)
     return v
 
 def slim_args(args) -> dict:
-    # 湲곗〈 ?⑥닔 ?좎?(?몃? ?ъ슜)
+    # 기존 함수 유지(외부 사용)
     keys = [
         "asset","method","baseline","w_max","fee_annual","horizon_years",
         "alpha","lambda_term","F_target","p_annual","g_real_annual",
@@ -137,7 +136,7 @@ def append_metrics_csv(path: str, payload: Dict[str, Any]):
         "ckpt_path": payload.get("ckpt_path"),
     }
 
-    # ????쒓린 ?뺢퇋??
+    # 타입/표기 정규화
     for k in list(row.keys()):
         row[k] = _s(row[k])
 
@@ -151,8 +150,8 @@ def append_metrics_csv(path: str, payload: Dict[str, Any]):
 
 def do_autosave(metrics: dict, cfg, args, out_payload: dict):
     """
-    ?곗꽑 eval.save_metrics_autocsv()媛 ?덉쑝硫?洹몃?濡??ъ슜.
-    ?놁쑝硫?怨좎젙 ?ㅽ궎留?CSV濡??대갚.
+    우선 eval.save_metrics_autocsv()가 있으면 그대로 사용.
+    없으면 고정 스키마 CSV로 폴백.
     """
     try:
         try:
@@ -165,4 +164,3 @@ def do_autosave(metrics: dict, cfg, args, out_payload: dict):
             print(f"[autosave] metrics -> {csv_path}")
     except Exception as e:
         print(f"[autosave] skipped: {e}")
-

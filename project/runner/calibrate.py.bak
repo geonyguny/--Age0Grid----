@@ -1,6 +1,5 @@
-﻿# project/runner/calibrate.py
+# project/runner/calibrate.py
 from __future__ import annotations
-from project.metrics.es import es95_wealth
 from dataclasses import dataclass, asdict
 from typing import Dict, Tuple, Optional, Iterable, Any, Callable, List
 from argparse import Namespace
@@ -10,7 +9,7 @@ import math
 from .run import run_once
 
 # ======================================================================
-# 怨듭슜: WT 異붿텧 / ES(Acerbi?밫asche) / ES(loss) ?ш퀎??
+# 공용: WT 추출 / ES(Acerbi–Tasche) / ES(loss) 재계산
 # ======================================================================
 
 def _maybe_extract_WT(candidate: Any) -> Optional[Iterable[float]]:
@@ -118,7 +117,7 @@ def _first_seed_list(seeds_val: Any) -> list[int]:
     return [0]
 
 # ======================================================================
-# Evaluator 肄쒕갚 & Fast ?꾨━??
+# Evaluator 콜백 & Fast 프리셋
 # ======================================================================
 
 def _eval_point(args: Namespace,
@@ -126,8 +125,8 @@ def _eval_point(args: Namespace,
                 F_target: Optional[float] = None,
                 fast: bool = True) -> Tuple[Dict[str, Any], Optional[float]]:
     """
-    ?⑥씪 ??method/hyper) ?됯? + ES(loss) 寃쎈줈?덈꺼 ?ш퀎??
-    諛섑솚: (寃곌낵 JSON, ES95(loss))
+    단일 점(method/hyper) 평가 + ES(loss) 경로레벨 재계산
+    반환: (결과 JSON, ES95(loss))
     """
     overrides: Dict[str, Any] = dict(es_mode="loss")
     if lambda_term is not None:
@@ -135,11 +134,11 @@ def _eval_point(args: Namespace,
     if F_target is not None:
         overrides["F_target"] = float(F_target)
 
-    # Fast ?꾨━??罹섎━釉뚮젅?댁뀡 ?먯깋 ?④퀎) ??seeds ?⑥씪??+ 寃쎈줈 異뺤냼
+    # Fast 프리셋(캘리브레이션 탐색 단계) — seeds 단일화 + 경로 축소
     if fast and str(getattr(args, "calib_fast", "on")).lower() == "on":
         seeds1 = _first_seed_list(getattr(args, "seeds", [0]))
         overrides.update(dict(
-            # HJB 鍮좊Ⅸ 寃⑹옄/?섑뵆 ???꾩슂 ??solver?먯꽌 ?ㅻ쾭?쇱씠??媛??
+            # HJB 빠른 격자/샘플 — 필요 시 solver에서 오버라이드 가능
             hjb_W_grid=81, hjb_Nshock=128, hjb_eta_n=41,
             n_paths=200, seeds=seeds1
         ))
@@ -147,7 +146,7 @@ def _eval_point(args: Namespace,
     local = _copy_args(args, **overrides)
     res = run_once(local)
 
-    # path-level ES(loss) ?ш퀎??
+    # path-level ES(loss) 재계산
     F = float(getattr(local, "F_target", getattr(args, "F_target", 0.0)) or 0.0)
     alpha = float(getattr(local, "alpha", getattr(args, "alpha", 0.95)) or 0.95)
     es_paths, patch = _compute_es_loss(res, F_target=F, alpha=alpha)
@@ -156,26 +155,26 @@ def _eval_point(args: Namespace,
         m = res.get("metrics") or {}
         m.update(patch)
         res["metrics"] = m
-        # extras.eval_WT 議댁옱 蹂댁옣(?놁쑝硫?鍮?由ъ뒪??
+        # extras.eval_WT 존재 보장(없으면 빈 리스트)
         ex = res.get("extras") or {}
         if "eval_WT" not in ex:
             ex["eval_WT"] = ex.get("eval_WT", [])
         res["extras"] = ex
         return res, float(es_paths)
 
-    # WT?놁뼱 ES 怨꾩궛 遺덇? ??湲곗〈 媛??ъ슜(媛????
+    # WT없어 ES 계산 불가 → 기존 값 사용(가능 시)
     es0 = (res.get("metrics") or {}).get("ES95")
     return res, float(es0) if es0 is not None else None
 
 
 def make_evaluator(args: Namespace) -> Callable[[Optional[float], Optional[float], bool], Tuple[Dict[str, Any], Optional[float]]]:
-    """?몃??먯꽌 ?ъ궗??媛?ν븳 evaluator ?앹꽦??"""
+    """외부에서 재사용 가능한 evaluator 생성자."""
     def _inner(lambda_term: Optional[float] = None, F_target: Optional[float] = None, fast: bool = True):
         return _eval_point(args, lambda_term=lambda_term, F_target=F_target, fast=fast)
     return _inner
 
 # ======================================================================
-# Dataclass & ?쒖닔 罹섎━釉뚮젅?댁뀡 猷⑦떞
+# Dataclass & 순수 캘리브레이션 루틴
 # ======================================================================
 
 @dataclass
@@ -184,7 +183,7 @@ class CalibResult:
     stopped: str                   # "tol_met" | "iter_max" | "plateau" | "unattainable_low" | "unattainable_high" | "incomplete"
     target: float
     tol: float
-    selected_value: float          # F_selected or lambda_selected 媛?
+    selected_value: float          # F_selected or lambda_selected 값
     selected_ES95: Optional[float]
     history: List[Dict[str, Optional[float]]]
     time_total_s: float
@@ -196,7 +195,7 @@ class CalibResult:
 
     def to_json(self) -> Dict[str, Any]:
         d = asdict(self)
-        # 異쒕젰 ???듭씪: F_selected / lambda_selected
+        # 출력 키 통일: F_selected / lambda_selected
         mode = d.pop("mode")
         sel = d.pop("selected_value")
         payload = {
@@ -231,8 +230,8 @@ def calibrate_F(
     max_iter: int,
 ) -> Tuple[Dict[str, Any], CalibResult]:
     """
-    F_target ?대텇 ?먯깋: ES(loss) ??target
-    洹쒖튃(es_mode=loss): ES95 > target ??怨쇱쐞????F ??(?뚮퉬??
+    F_target 이분 탐색: ES(loss) ≈ target
+    규칙(es_mode=loss): ES95 > target ⇒ 과위험 ⇒ F ↑ (소비↓)
     """
     t0 = time.perf_counter()
     n_fast = n_slow = 0
@@ -249,17 +248,17 @@ def calibrate_F(
             n_slow += 1; t_slow += dt
         return res, es
 
-    # 釉뚮옒???됯?
+    # 브래킷 평가
     res_lo, es_lo = _wrap(F_min, True)
     res_hi, es_hi = _wrap(F_max, True)
 
-    # ?덉뒪?좊━ ?꾩쟻
+    # 히스토리 누적
     history: List[Dict[str, Optional[float]]] = [
         {"F_target": float(F_min), "ES95": float(es_lo) if es_lo is not None else None},
         {"F_target": float(F_max), "ES95": float(es_hi) if es_hi is not None else None},
     ]
 
-    # ?대텇 ?먯깋
+    # 이분 탐색
     status = "iter_max"
     best_F = F_min
     best_res, best_es = res_lo, es_lo
@@ -277,19 +276,19 @@ def calibrate_F(
         prev_es = es_mid
 
         if es_mid is None:
-            # ?뺣낫 遺議????섑븳 ?대룞
+            # 정보 부족 → 하한 이동
             F_min = F_mid
             best_F, best_res, best_es = F_mid, res_mid, es_mid
             status = "incomplete"
             continue
 
-        # ?섎졃 ?먯젙
+        # 수렴 판정
         if abs(es_mid - target) <= tol:
             best_F, best_res, best_es = F_mid, res_mid, es_mid
             status = "tol_met"
             break
 
-        # ?⑥“ 利앷? 媛??ES??when F??. 怨쇱쐞??ES>target)?대㈃ F??
+        # 단조 증가 가정(ES↑ when F↑). 과위험(ES>target)이면 F↑
         if es_mid > target:
             F_min = F_mid
         else:
@@ -297,7 +296,7 @@ def calibrate_F(
 
         best_F, best_res, best_es = F_mid, res_mid, es_mid
 
-    # 理쒖쥌 ?щ줈???됯?
+    # 최종 슬로우 평가
     final_res, final_es = _wrap(best_F, False)
 
     cr = CalibResult(
@@ -307,7 +306,7 @@ def calibrate_F(
         tol=tol,
         selected_value=float(best_F),
         selected_ES95=float(final_es) if final_es is not None else None,
-        history=history[-5:],  # tail留?蹂닿?
+        history=history[-5:],  # tail만 보관
         time_total_s=time.perf_counter() - t0,
         evals_fast=n_fast,
         evals_slow=n_slow,
@@ -327,8 +326,8 @@ def calibrate_lambda_core(
     max_iter: int,
 ) -> Tuple[Dict[str, Any], CalibResult]:
     """
-    貫 ?대텇 ?먯깋: ES(loss) ??target
-    (寃쏀뿕??媛?? 貫?????꾪뿕(ES)??寃쏀뼢 ??ES > target?대㈃ 貫??
+    λ 이분 탐색: ES(loss) ≈ target
+    (경험적 가정) λ↑ ⇒ 위험(ES)↓ 경향 → ES > target이면 λ↑
     """
     t0 = time.perf_counter()
     n_fast = n_slow = 0
@@ -348,7 +347,7 @@ def calibrate_lambda_core(
     res_lo, es_lo = _wrap(lam_min, True)
     res_hi, es_hi = _wrap(lam_max, True)
 
-    # 釉뚮옒???깅┰ ?щ?(?????꾨옒/?????꾩씪 ???덈궡)
+    # 브래킷 성립 여부(둘 다 아래/둘 다 위일 때 안내)
     unattainable: Optional[str] = None
     if (es_lo is not None) and (es_hi is not None):
         if (es_lo < target) and (es_hi < target):
@@ -362,7 +361,7 @@ def calibrate_lambda_core(
     ]
 
     if unattainable:
-        # ??媛源뚯슫 寃쎄퀎 ?좏깮
+        # 더 가까운 경계 선택
         cand = lam_min if (es_lo is not None and es_hi is not None and abs(es_lo - target) <= abs(es_hi - target)) else lam_max
         final_res, final_es = _wrap(cand, False)
         cr = CalibResult(
@@ -372,7 +371,7 @@ def calibrate_lambda_core(
             tol=tol,
             selected_value=float(cand),
             selected_ES95=float(final_es) if final_es is not None else None,
-            history=[],  # tail ?놁쓬
+            history=[],  # tail 없음
             time_total_s=time.perf_counter() - t0,
             evals_fast=n_fast,
             evals_slow=n_slow,
@@ -408,7 +407,7 @@ def calibrate_lambda_core(
             status = "tol_met"
             break
 
-        # (媛?? ES(loss) vs 貫: ?⑥“ 媛먯냼 ??ES>target?대㈃ 貫??
+        # (가정) ES(loss) vs λ: 단조 감소 → ES>target이면 λ↑
         if es_mid > target:
             lam_min = mid
         else:
@@ -435,20 +434,20 @@ def calibrate_lambda_core(
     return final_res, cr
 
 # ======================================================================
-# ?뷀듃由ы룷?명듃(湲곗〈 ?명솚): calibrate_lambda(args)
+# 엔트리포인트(기존 호환): calibrate_lambda(args)
 # - calib_param=lambda | F
-# - 寃곌낵 JSON??cvar_calibration ?뱀뀡 蹂묓빀
+# - 결과 JSON에 cvar_calibration 섹션 병합
 # ======================================================================
 
 def calibrate_lambda(args: Namespace) -> Dict[str, Any]:
     """
-    湲곗〈 CLI ?명솚 ?뷀듃由? calib_param???곕씪 貫 ?먮뒗 F瑜??대텇 ?먯깋.
-    - 紐⑤뱺 ?됯??먯꽌 es_mode=loss 媛뺤젣
-    - path-level ES(Acerbi?밫asche)濡??쇨? ?ш퀎??
-    - 寃곌낵 JSON: cvar_calibration = {
+    기존 CLI 호환 엔트리: calib_param에 따라 λ 또는 F를 이분 탐색.
+    - 모든 평가에서 es_mode=loss 강제
+    - path-level ES(Acerbi–Tasche)로 일관 재계산
+    - 결과 JSON: cvar_calibration = {
         mode, stopped, cvar_target, cvar_tol,
         F_selected|lambda_selected, selected_ES95,
-        history(瑗щ━ 5媛?, time_total_s/hms, evals/time 遺꾪빐, 寃쎄퀎媛?meta)
+        history(꼬리 5개), time_total_s/hms, evals/time 분해, 경계값(meta)
       }
     """
     mode = str(getattr(args, "calib_param", "lambda")).lower()
@@ -461,19 +460,19 @@ def calibrate_lambda(args: Namespace) -> Dict[str, Any]:
     if mode == "f":
         F0 = float(getattr(args, "F_target", 0.60) or 0.60)
 
-        # None?대㈃ F0짹0.5濡??먮룞 釉뚮옒???ㅼ젙
+        # None이면 F0±0.5로 자동 브래킷 설정
         F_min_arg = getattr(args, "F_min", None)
         F_max_arg = getattr(args, "F_max", None)
         F_min = float(F_min_arg) if F_min_arg is not None else (F0 - 0.5)
         F_max = float(F_max_arg) if F_max_arg is not None else (F0 + 0.5)
 
-        # NaN/Inf 諛⑹?
+        # NaN/Inf 방지
         if not math.isfinite(F_min):
             F_min = F0 - 0.5
         if not math.isfinite(F_max):
             F_max = F0 + 0.5
 
-        # ?섎せ??釉뚮옒??援먯젙(F_min >= F_max??寃쎌슦 F0 以묒떖 ?ъ꽕??
+        # 잘못된 브래킷 교정(F_min >= F_max인 경우 F0 중심 재설정)
         if F_min >= F_max:
             half = max(0.1, abs(F0) * 0.5)
             F_min, F_max = F0 - half, F0 + half
@@ -498,4 +497,3 @@ def calibrate_lambda(args: Namespace) -> Dict[str, Any]:
     final_res.setdefault("cvar_calibration", {})
     final_res["cvar_calibration"].update(cr.to_json())
     return final_res
-
