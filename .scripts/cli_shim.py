@@ -7,7 +7,7 @@ def strip_unknown(argv):
         if skip:
             skip -= 1; continue
         low = str(tok).lower()
-        # 怨쇨굅 ?듭뀡 ?명솚?? --dump_eval ?쒓굅
+        # 과거 옵션 호환성: --dump_eval 제거
         if low in ("--dump_eval","--dump-eval"):
             if i+1 < len(argv) and not str(argv[i+1]).startswith("-"):
                 skip = 1

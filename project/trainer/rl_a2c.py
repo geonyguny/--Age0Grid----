@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import Any, Dict, Callable, Optional, Tuple
 
 import numpy as np
+
+# (keep import for compatibility; not strictly used here)
 from project.metrics.es import es95_wealth
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +22,30 @@ except Exception:
     pass
 
 
+# ---------- small helpers ----------
+def _to_f(x, default=0.0) -> float:
+    """Python float로 강제 + None/NaN/Inf를 default로 치환"""
+    try:
+        if x is None:
+            return float(default)
+        xf = float(x)
+        if not np.isfinite(xf):
+            return float(default)
+        return xf
+    except Exception:
+        return float(default)
+
+def _sanitize_tensor(x: torch.Tensor, fill=0.0) -> torch.Tensor:
+    """텐서 내 NaN/Inf 치환"""
+    if not torch.is_tensor(x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+    mask = ~torch.isfinite(x)
+    if mask.any():
+        x = x.clone()
+        x[mask] = float(fill)
+    return x
+
+
 # ---------- Gym-like shim ----------
 class _GymShim:
     def __init__(self, base_env: RetirementEnv):
@@ -26,11 +53,11 @@ class _GymShim:
 
     def _obs_vec(self, s):
         if isinstance(s, dict):
-            t  = float(s.get("t", s.get("age", 0.0)))
-            W  = float(s.get("W", s.get("W_t", 0.0)))
+            t  = _to_f(s.get("t", s.get("age", 0.0)), 0.0)
+            W  = _to_f(s.get("W", s.get("W_t", 0.0)), 0.0)
             T  = max(getattr(self.base, "T", 1), 1)
-            W0 = float(getattr(self.base, "W0", 1.0)) or 1.0
-            age = float(s.get("age", 0.0))
+            W0 = _to_f(getattr(self.base, "W0", 1.0), 1.0) or 1.0
+            age = _to_f(s.get("age", 0.0), 0.0)
             age_norm = age / 120.0
             return np.array([t/float(T), W/ W0, age_norm, 0.0], dtype=np.float32)
         return np.asarray(s, dtype=np.float32)
@@ -54,10 +81,12 @@ class _GymShim:
             s_next, r, done, info = out; trunc = False
         else:
             raise RuntimeError(f"Unexpected step() return length: {len(out)}")
+        # 보상 안전화
+        r = _to_f(r, 0.0)
         obs = self._obs_vec(s_next)
         if isinstance(info, dict) and "W_T" not in info:
             try:
-                W_T = float(getattr(self.base, "W", None) or (s_next.get("W") if isinstance(s_next, dict) else 0.0))
+                W_T = _to_f(getattr(self.base, "W", None) or (s_next.get("W") if isinstance(s_next, dict) else 0.0), 0.0)
                 info["W_T"] = W_T
             except Exception:
                 pass
@@ -138,16 +167,46 @@ class PolicyNet(nn.Module):
 
 
 # ---------- GAE ----------
-def compute_gae(rews, vals, dones, gamma, lam):
-    T = len(rews)
-    adv = torch.zeros(T, device=vals.device)
-    lastgaelam = 0.0
+def compute_gae(rews: torch.Tensor,
+                vals: torch.Tensor,
+                dones: torch.Tensor,
+                gamma: float,
+                lam: float):
+    """
+    Safe GAE:
+      - rews, vals: shape [T]
+      - dones: bool or {0,1} tensor of shape [T]
+      - bootstrap with 0 for v_{T}
+    """
+    # squeeze to [T]
+    if rews.ndim > 1: rews = rews.squeeze(-1)
+    if vals.ndim > 1: vals = vals.squeeze(-1)
+    if dones.ndim > 1: dones = dones.squeeze(-1)
+
+    T = int(rews.shape[0])
+    device = rews.device
+    dtype  = rews.dtype
+
+    # v_{T} = 0 (no bootstrap from critic) → append one zero
+    vals_ext = torch.cat([vals, torch.zeros(1, device=device, dtype=dtype)], dim=0)
+
+    # nonterminal mask as float
+    if dones.dtype == torch.bool:
+        dones_f = dones.float()
+    else:
+        # assume already 0/1 floats
+        dones_f = dones.to(dtype)
+
+    adv = torch.zeros(T, device=device, dtype=dtype)
+    lastgaelam = torch.zeros((), device=device, dtype=dtype)
+
     for t in reversed(range(T)):
-        nonterminal = 1.0 - float(dones[t])
-        delta = rews[t] + gamma * (vals[t+1] if t+1 < T else 0.0) * nonterminal - vals[t]
+        nonterminal = 1.0 - dones_f[t]
+        delta = rews[t] + gamma * vals_ext[t + 1] * nonterminal - vals_ext[t]
         lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
         adv[t] = lastgaelam
-    ret = adv + vals[:T]
+
+    ret = adv + vals
     return adv, ret
 
 
@@ -156,6 +215,8 @@ class DualCVaR:
     def __init__(self, alpha=0.95, eta_init=0.0, tau=0.3):
         self.alpha = alpha; self.eta = eta_init; self.tau = tau
     def update_eta_with_batch(self, L_batch):
+        if len(L_batch) == 0:
+            return
         q_alpha = np.quantile(L_batch, self.alpha)
         self.eta = (1.0 - self.tau) * self.eta + self.tau * float(q_alpha)
     def terminal_penalty(self, L):
@@ -177,7 +238,7 @@ class DualCVaRStage:
 
 # ---------- Teacher policy ----------
 def teacher_action(cfg):
-    # 4% rule monthly, w??.6(clip to w_max)
+    # 4% rule monthly, w≈0.6 (clip to w_max)
     q4_m = 1.0 - (1.0 - 0.04) ** (1.0 / cfg.steps_per_year)
     q_cap = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
     q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
@@ -225,27 +286,26 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
 
         obs2, c_t, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
 
-        # reward shaping
+        # reward shaping (안전화 포함)
         rew = 0.0
         # utility of consumption
         if u_scale != 0.0:
-            rew += u_scale * u_crra(c_t, gamma=gamma_crra)
+            rew += u_scale * u_crra(_to_f(c_t, 0.0), gamma=gamma_crra)
 
         # stage-wise CVaR on consumption shortfall
         if (stage_cvar is not None) and (getattr(cfg, "cvar_stage_on", False)):
-            # define c_star_t
             mode = str(cstar_mode or "annuity")
             if mode == "fixed":
-                c_star = float(getattr(cfg, "cstar_m", 0.04/12)) * 1.0  # wealth-normalized obs?먯꽌 1.0? W0
+                c_star = float(getattr(cfg, "cstar_m", 0.04/12)) * 1.0
                 c_star = float(c_star) * float(obs[1])  # obs[1]=W/W0
             elif mode == "vpw":
                 m = cfg.monthly(); g = m['g_m']; Nm = env.base.T - env.base.t
                 a = (1.0 - (1.0+g)**(-Nm))/g if g > 0 else max(Nm, 1)
                 q_m = min(1.0, 1.0 / a)
-                c_star = q_m * float(obs[1])  # wealth-normalized
+                c_star = q_m * float(obs[1])
             else:
                 c_star = float(cfg.monthly()['p_m']) * float(obs[1])
-            L_t = max(c_star - float(c_t), 0.0)
+            L_t = max(c_star - _to_f(c_t, 0.0), 0.0)
             stage_L_list.append(L_t)
             lam_s = float(getattr(cfg, "lambda_stage", 0.0) or 0.0)
             if lam_s > 0.0:
@@ -255,10 +315,10 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
             rew += float(survive_bonus)
         if (done or trunc):
             if cvar_hook is not None:
-                rew += float(cvar_hook(info))           # ?믊뼘텰VaR_dual(L) on terminal wealth
+                rew += float(cvar_hook(info))
             lw = float(getattr(cfg, "lw_scale", 0.0) or 0.0)
             if lw != 0.0:
-                rew += lw * float(info.get("W_T", 0.0))
+                rew += lw * _to_f(info.get("W_T", 0.0), 0.0)
 
         # keep graph
         obs_list.append(obs_t.squeeze(0))
@@ -266,18 +326,24 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
         logp_list.append(logp)    # keep grad
         ent_list.append(ent)
         val_list.append(v)
-        rew_list.append(torch.tensor(rew, dtype=torch.float32, device=device))
-        done_list.append(done or trunc)
+        rew_list.append(torch.tensor(_to_f(rew, 0.0), dtype=torch.float32, device=device))
+        done_list.append(bool(done or trunc))
         obs = obs2
         if done or trunc:
             obs, _ = env.reset(seed=None)
 
+    # stack
     obs_t = torch.stack(obs_list)
     logp  = torch.stack(logp_list)
     ent   = torch.stack(ent_list)
     val   = torch.stack(val_list)
     rews  = torch.stack(rew_list)
-    dones = torch.tensor(done_list, device=device, dtype=torch.bool)
+    dones = torch.tensor(done_list, device=rews.device, dtype=torch.float32)
+
+    # ---- final sanitization before GAE ----
+    rews = _sanitize_tensor(rews, 0.0).float()
+    val  = _sanitize_tensor(val,  0.0).float()
+
     adv, ret = compute_gae(rews, val, dones, gamma, lam)
     return {
         "obs": obs_t,
@@ -306,7 +372,6 @@ def evaluate_mean_policy(make_env_fn, policy, cfg, n_paths=300, device="cpu") ->
             Ws.append(float(W_T)); env.close()
     Ws = np.array(Ws, dtype=np.float64)
     EW = float(Ws.mean())
-    # loss tail (CVaR on loss) at alpha=0.95
     F_t = float(getattr(cfg, "F_target", 1.0) or 1.0)
     L = np.maximum(F_t - Ws, 0.0)
     k = max(1, int(0.05 * len(L)))
@@ -321,7 +386,7 @@ def make_policy_heatmaps(policy, cfg, outputs, device="cpu"):
     import matplotlib.pyplot as plt
     out = Path(outputs) / "xai"; out.mkdir(parents=True, exist_ok=True)
     W_grid = np.linspace(0.1, 2.0, 81, dtype=np.float32)
-    Tn = 20  # 20 time slices
+    Tn = 20
     Q = np.zeros((Tn, len(W_grid)), dtype=np.float32)
     Wp = np.zeros_like(Q)
     with torch.no_grad():
@@ -400,10 +465,8 @@ def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device
 
 # ---------- CSV logger ----------
 def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
-    """trainer ?꾩슜 媛꾨떒 CSV 濡쒓렇 (諛곗슦/寃쎈줈 ??鍮꾩쭅?ы솕 ?꾨뱶???쒖쇅)"""
     out_logs = Path(outputs_dir) / "_logs"; out_logs.mkdir(parents=True, exist_ok=True)
     dest = out_logs / "metrics.csv"; write_header = (not dest.exists())
-    # ?덉쟾???꾨뱶留?異붿텧
     safe = {k: v for k, v in fields.items()
             if isinstance(v, (int, float, str, bool)) or v is None}
     with dest.open("a", newline="", encoding="utf-8") as f:
@@ -415,33 +478,27 @@ def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
 
 # ---------- Actor adapter (policy -> (q,w)) ----------
 def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> Callable[[Dict[str, Any]], Tuple[float, float]]:
-    """evaluate()?먯꽌 諛붾줈 ?????덈뒗 寃쎈웾 actor ?대뙌??
-       ???뺤콉???ㅼ젣 ?낅젰李⑥썝??留욎떠 obs瑜??щ씪?댁뒪/?⑤뵫?섏뿬 shape mismatch 諛⑹?
-    """
-    # 李몄“ ?쒓컙/?뺢퇋??湲곗?
     T_ref = int(getattr(cfg, "T", 0) or getattr(cfg, "horizon_years", 35) * getattr(cfg, "steps_per_year", 12))
     T_ref = max(T_ref, 1)
     W0 = float(getattr(cfg, "W0", 1.0) or 1.0)
 
-    # ?뺤콉???ㅼ젣 ?낅젰 李⑥썝 異붾줎
     try:
-        in_dim = int(policy.backbone[0].in_features)  # nn.Linear(in_features=...)
+        in_dim = int(policy.backbone[0].in_features)
     except Exception:
-        in_dim = 4  # ?덉쟾 湲곕낯媛?
+        in_dim = 4
 
     policy = policy.to(device)
     policy.eval()
 
     def _build_obs(state: Dict[str, Any]) -> np.ndarray:
-        """?뺢퇋?붾맂 4D canonical obs瑜?留뚮뱺 ???뺤콉 in_dim??留욎떠 ?먮Ⅴ嫄곕굹 ?⑤뵫"""
         try:
             if "t_norm" in state:
                 t_norm = float(state["t_norm"])
             else:
-                t_val = float(state.get("t", state.get("age", 0.0)))
+                t_val = _to_f(state.get("t", state.get("age", 0.0)), 0.0)
                 t_norm = max(0.0, min(1.0, t_val / float(T_ref)))
-            W = float(state.get("W", state.get("W_t", 0.0)))
-            age = float(state.get("age", 65.0))
+            W = _to_f(state.get("W", state.get("W_t", 0.0)), 0.0)
+            age = _to_f(state.get("age", 65.0), 65.0)
             obs4 = np.array([t_norm, W / max(W0, 1e-12), age / 120.0, 0.0], dtype=np.float32)
         except Exception:
             obs4 = np.array([0.0, 1.0, 65.0/120.0, 0.0], dtype=np.float32)
@@ -464,8 +521,15 @@ def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> 
 def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_epoch=2048,
              lr=3e-4, gamma=None, gae_lambda=0.95, entropy_coef=0.01, value_coef=0.5,
              max_grad_norm=0.5, device=None) -> Dict[str, Any]:
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    gamma = gamma or getattr(cfg, "beta", 0.996)
+
+    # ★ robust gamma: cfg.beta가 None/비정상이어도 안전하게 float로 고정
+    beta_cfg = getattr(cfg, "beta", 0.996)
+    try:
+        gamma = float(gamma if gamma is not None else (beta_cfg if beta_cfg is not None else 0.996))
+    except Exception:
+        gamma = 0.996
 
     def _make_env_local():
         return _GymShim(RetirementEnv(cfg))
@@ -503,7 +567,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     optim_all = optim.Adam(policy.parameters(), lr=lr)
 
     train_t0 = time.perf_counter()
-    best_epoch = None  # (optional) keep here if you add model selection
+    best_epoch = None
     for epoch in range(rl_epochs):
         eps = teacher_eps0 * (teacher_decay ** epoch)
         batch = rollout(_make_env_local(), policy, cfg, steps_per_epoch, gamma, gae_lambda,
@@ -560,7 +624,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
 
         # arch inference from actual module
         try:
-            first = policy.backbone[0]  # nn.Linear
+            first = policy.backbone[0]
             obs_dim_save = int(first.in_features)
             hidden_save = int(first.out_features)
         except Exception:
@@ -583,7 +647,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
 
         ckpt = {
             "state_dict": policy.state_dict(),
-            "obs_dim": obs_dim_save,  # legacy-friendly
+            "obs_dim": obs_dim_save,
             "arch": {"obs_dim": obs_dim_save, "hidden": hidden_save},
             "cfg_hints": {
                 "q_floor": float(getattr(cfg, "q_floor", 0.0) or 0.0),
@@ -597,7 +661,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         }
         torch.save(ckpt, ckpt_path)
     except Exception:
-        ckpt_path = None  # ????ㅽ뙣??臾댁떆
+        ckpt_path = None
 
     # XAI (optional, best-effort)
     if bool(getattr(cfg, "xai_on", True)):
@@ -625,10 +689,8 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     )
     append_metrics_csv(outputs, fields_csv)
 
-    # actor adapter (used by run.py / cli to re-evaluate with rich metrics)
     actor = make_actor_from_policy(policy, cfg, device=device)
 
-    # final return to runner
     return {
         "EW": metrics_mp["EW"],
         "ES95": metrics_mp["ES95"],
@@ -637,8 +699,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         "best_epoch": best_epoch,
         "train_time_s": float(train_t1 - train_t0),
         "eval_time_s": float(eval_t1 - eval_t0),
-        "actor": actor,                 # runner媛 evaluate(cfg, actor, ...)濡??ы룊媛 媛??
-        "ckpt_path": ckpt_path,         # ???寃쎈줈 (?놁쑝硫?None)
-        "eval_WT": metrics_mp.get("eval_WT"),  # 寃쎈줈蹂?W_T
+        "actor": actor,
+        "ckpt_path": ckpt_path,
+        "eval_WT": metrics_mp.get("eval_WT"),
     }
-

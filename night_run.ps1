@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 [CmdletBinding()]
 param(
   # Python/Module/Output
@@ -102,7 +102,7 @@ function Get-BaseArgs {
 
   $args = @(
     "--method",$Method,
-    # ✅ rule일 때 baseline 필수 전달 (중요 버그 픽스)
+    # ✅ rule일 때 baseline 필수 전달 (중요)
     $(if($Method -eq "rule"){ @("--baseline",$Baseline) } else { @() }),
     "--market_mode",$MarketMode,
     "--horizon_years","$HorizonY",
@@ -172,6 +172,7 @@ function Print-ETA {
   Write-Host ("[ETA ] {0}/{1} avg={2}s eta={3}" -f $done, $total, [int]$avg, $eta.ToString("yyyy-MM-dd HH:mm:ss"))
 }
 
+# ✅ 안전 실행: 파워셸의 & 호출 대신 ProcessStartInfo로 인자 전체를 문자열화
 function Invoke-Run {
   param([string]$Tag,[string]$OutDir,[hashtable]$Fixed = @{})
 
@@ -189,8 +190,27 @@ function Invoke-Run {
   $started = Get-Date
   Write-Host "[RUN ] $Tag -> $OutDir (`$Method=$Method)"
 
-  & $Py $shim $Module @args
-  $rc = $LASTEXITCODE
+  # ---- 안전 실행부 (여기만 기존과 다름)
+  $argList = @($shim, $Module) + $args
+  $quoted = $argList | ForEach-Object {
+    if ($_ -is [string] -and $_.Contains(' ')) { '"' + $_ + '"' } else { $_ }
+  }
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = (Resolve-Path $Py)
+  $psi.Arguments = ($quoted -join ' ')
+  $psi.RedirectStandardOutput = $false
+  $psi.RedirectStandardError  = $false
+  $psi.UseShellExecute = $true
+
+  try {
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.WaitForExit()
+    $rc = [int]$proc.ExitCode
+  } catch {
+    Write-Host "[ERR ] failed to start python: $($_.Exception.Message)" -ForegroundColor Red
+    $rc = 1
+  }
+
   $sw.Stop()
   $ended = Get-Date
 
@@ -216,7 +236,7 @@ function Invoke-Run {
     n_paths   = $NPaths
     module    = $Module
     commit    = ""
-    version   = "night_run.ps1 v6 (rl+baseline+summary fixes)"
+    version   = "night_run.ps1 v7 (safe proc + rule-baseline)"
   }
   Append-DecisionLog -OutRootLocal $OutRoot -Row $row
   Print-ETA
@@ -270,20 +290,20 @@ function Make-Summary {
         $w_label = ($full -split "[\\\/]") | Where-Object { $_ -like "w_*" } | Select-Object -Last 1
         if (-not $w_label) { $w_label = "NA" }
 
-        # 안전 파싱: method
+        # method
         $methodVal = ""
         if ($r.PSObject.Properties.Name -contains "method") { $methodVal = [string]$r.method }
 
-        # ✅ HJB/RL은 w_fixed 개념 없음 → 무조건 NA
+        # HJB/RL은 w_fixed 없음 → NA
         if ($methodVal -in @("hjb","rl")) { $w_label = "NA" }
 
-        # ✅ baseline: 규칙 기반이면 반드시 CSV에서 읽는다(구버전 대비)
+        # baseline: rule이면 CSV에 들어있음
         $baselineVal = ""
         if ($r.PSObject.Properties.Name -contains "baseline" -and $r.baseline) {
           $baselineVal = [string]$r.baseline
         }
 
-        # seed/elapsed 안전 파싱
+        # seed/elapsed
         $seedVal = ""
         foreach ($cand in @("seed","seed_id","seed_idx")) {
           if ($r.PSObject.Properties.Name -contains $cand -and $r.$cand) { $seedVal = [string]$r.$cand; break }
@@ -294,16 +314,22 @@ function Make-Summary {
           if ($r.PSObject.Properties.Name -contains $cand -and $r.$cand) { $elapsedVal = [string]$r.$cand; break }
         }
 
+        # 지표 안전 파싱 (누락 시 0)
+        $EWv      = 0.0; if ($r.PSObject.Properties.Name -contains "EW")      { [double]::TryParse($r.EW,      [ref]$EWv)      | Out-Null }
+        $ES95v    = 0.0; if ($r.PSObject.Properties.Name -contains "ES95")    { [double]::TryParse($r.ES95,    [ref]$ES95v)    | Out-Null }
+        $RuinPctv = 0.0; if ($r.PSObject.Properties.Name -contains "RuinPct") { [double]::TryParse($r.RuinPct, [ref]$RuinPctv) | Out-Null }
+        $MeanWTv  = 0.0; if ($r.PSObject.Properties.Name -contains "mean_WT") { [double]::TryParse($r.mean_WT, [ref]$MeanWTv)  | Out-Null }
+
         $rows += [pscustomobject]@{
           tag      = $r.tag
           method   = $methodVal
           baseline = $baselineVal
           w_fixed  = $w_label
           seed     = $seedVal
-          EW       = [double]$r.EW
-          ES95     = [double]$r.ES95
-          RuinPct  = [double]$r.RuinPct
-          mean_WT  = [double]$r.mean_WT
+          EW       = $EWv
+          ES95     = $ES95v
+          RuinPct  = $RuinPctv
+          mean_WT  = $MeanWTv
           elapsed  = $elapsedVal
           out_dir  = $full
         }
@@ -313,11 +339,8 @@ function Make-Summary {
     }
   }
 
-  # ✅ 중복 제거: 같은 (tag,method,baseline,w_fixed,seed) 기준
-  $rows =
-    $rows |
-    Sort-Object tag,method,baseline,w_fixed,seed -Unique
-
+  # 중복 제거
+  $rows = $rows | Sort-Object tag,method,baseline,w_fixed,seed -Unique
   $rows | Export-Csv -NoTypeInformation -Encoding UTF8 $cleanPath
   Write-Host "  -> $cleanPath"
 
