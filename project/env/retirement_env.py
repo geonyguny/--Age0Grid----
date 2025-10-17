@@ -92,9 +92,10 @@ def _load_market_arrays(csv_path: str, use_real_rf: str) -> Tuple[np.ndarray, np
 class RetirementEnv:
     """
     Retirement decumulation env (월 리밸런스)
-      - state: (t_norm, W_t) as ndarray([t/(T-1), W])
+      - state: ndarray([t_norm, W_t])
       - action: (q, w) ∈ [0,1]^2
-      - order: clip → consumption → returns(+hedge) → fee
+      - order: clipping → consumption → returns(+hedge) → fee
+      - q_floor=None → 0.0 안전처리, floor_on이면 q_min=max(q_floor, f_min_real/W)
 
     주입 지원:
       cfg/kwargs에 data_ret_series, data_rf_series, data_cpi 가 있으면 CSV 대신 이를 사용.
@@ -119,9 +120,11 @@ class RetirementEnv:
         self.W0 = _safe_float(self._get(cfg, kwargs, "W0", 1.0), 1.0)
         self.w_max = _safe_float(self._get(cfg, kwargs, "w_max", 1.0), 1.0)
 
-        # None이면 0.0 처리 (핵심 패치)
+        # floor_on + f_min_real 지원 / q_floor None→0.0
         _qf = self._get(cfg, kwargs, "q_floor", 0.0)
-        self.q_floor = _safe_float(0.0 if _qf is None else _qf, 0.0)
+        self.q_floor_base = _safe_float(0.0 if _qf is None else _qf, 0.0)
+        self.floor_on = str(self._get(cfg, kwargs, "floor_on", "off") or "off").lower() == "on"
+        self.f_min_real = _safe_float(self._get(cfg, kwargs, "f_min_real", 0.0), 0.0)
 
         self.fee_annual = _safe_float(
             self._get(cfg, kwargs, "phi_adval", self._get(cfg, kwargs, "fee_annual", 0.004)), 0.004
@@ -241,7 +244,7 @@ class RetirementEnv:
                     print(f"[env:mort] failed to load/parse mort_table: {e}")
 
         rf_from_cfg = self._get(cfg, kwargs, "r_f_real_annual", None)
-        self.r_f_real_annual = _safe_float(r_f_from_cfg if (r_f_from_cfg:=rf_from_cfg) is not None else 0.02, 0.02)
+        self.r_f_real_annual = _safe_float(rf_from_cfg if (rf_from_cfg:=rf_from_cfg) is not None else 0.02, 0.02)
 
     # ----- market path builders -----
     def _bootstrap_path(self, T: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -334,6 +337,17 @@ class RetirementEnv:
         """과거 호환용 shim."""
         return self._obs()
 
+    # ----- floor helper -----
+    def _q_min_now(self) -> float:
+        """동적 소비하한: floor_on이면 f_min_real/W와 q_floor_base 중 큰 값을 적용."""
+        if not self.floor_on:
+            return float(self.q_floor_base or 0.0)
+        W_now = max(_safe_float(self.W, 0.0), 0.0)
+        if W_now <= 0.0:
+            return 0.0
+        dyn = max(0.0, min(1.0, _safe_float(self.f_min_real, 0.0) / W_now))
+        return max(float(self.q_floor_base or 0.0), dyn)
+
     # ----- hedge -----
     def _apply_hedge(self, r_risky_raw: float, r_safe: float, w: float) -> Tuple[float, bool]:
         """헤지 모드/강도에 따른 r_risky_eff와 hedge_active 플래그."""
@@ -370,9 +384,12 @@ class RetirementEnv:
           - step([q, w]) / step((q, w)) / step(np.array([q, w]))
         Returns: (obs, reward, done, trunc, info)
         변경점 요약:
+          - clipping → consumption → returns(+hedge) → fee
+          - floor_on: q_min=max(q_floor_base, f_min_real/W)
           - 헤지 비용은 hedge_active=True 스텝에만 1회 차감
+          - fee는 본 스텝 시작 자산(W_t) 기준 월차감 (정책 규약)
           - 매 스텝 후 is_new_year / cpi_yoy 갱신
-          - [ANN] 소비식: c = y_ann + q*W (연금은 외부 유입)
+          - [ANN] c = y_ann + q*W (연금은 외부 유입)
           - 모든 입력/중간값 NaN/Inf 방호
         """
         # ---- parse (q, w) ----
@@ -397,15 +414,18 @@ class RetirementEnv:
         if self.t >= self.T:
             return self._obs(), 0.0, True, False, {}
 
-        # 1) clip action ----------------------------------------------------
-        q = max(_safe_float(getattr(self, "q_floor", 0.0), 0.0), _clip01(q))
+        # 현재 스텝 시작 자산(수수료 기준 보존)
+        W_start = max(_safe_float(self.W, 0.0), 0.0)
+
+        # 1) clipping ----------------------------------------------------
+        q_min = self._q_min_now()
+        q = max(q_min, _clip01(q))
         w = _clip01(min(w, _safe_float(getattr(self, "w_max", 1.0), 1.0)))
 
         # 2) consumption ----------------------------------------------------
         y_ann = _safe_float(getattr(self, "y_ann", 0.0), 0.0)
-        W_now = max(_safe_float(self.W, 0.0), 0.0)
-        c = _safe_float(y_ann + q * W_now, 0.0)
-        W_after_c = max(W_now - q * W_now, 0.0)  # 연금은 외부 유입
+        c = _safe_float(y_ann + q * W_start, 0.0)
+        W_after_c = max(W_start - q * W_start, 0.0)  # 연금은 외부 유입
 
         # 3) returns (+hedge) ----------------------------------------------
         r_risky_raw = _safe_float(self.path_risky[self.t], 0.0)
@@ -422,12 +442,12 @@ class RetirementEnv:
                 r_port -= w * htx
 
         gross = _safe_float(1.0 + r_port, 1.0)
-        W_after_ret = _safe_float(W_after_c * gross, W_after_c)
+        W_before_fee = _safe_float(W_after_c * gross, W_after_c)
 
-        # 4) fee ------------------------------------------------------------
+        # 4) fee (월차감, 기준=W_start) ------------------------------------
         fee_m = _safe_float(getattr(self, "fee_m", 0.0), 0.0)
-        fee   = _safe_float(fee_m * W_after_ret, 0.0)
-        self.W = max(_safe_float(W_after_ret - fee, 0.0), 0.0)
+        fee   = _safe_float(fee_m * W_start, 0.0)
+        self.W = max(_safe_float(W_before_fee - fee, 0.0), 0.0)
 
         # 보상(효용 + 생존)
         reward = _safe_float(getattr(self, "u_scale", 0.0), 0.0) * _crra_u(
@@ -465,6 +485,7 @@ class RetirementEnv:
             "ann_a_factor": float(self.ann_a_factor),
             "W": float(self.W),
             "q": float(q),
+            "q_min": float(q_min),
             "w": float(w),
             "r_risky": float(r_risky_raw),
             "r_risky_eff": float(r_risky_eff),
@@ -473,8 +494,11 @@ class RetirementEnv:
             "hedge_mode": str(getattr(self, "hedge_mode", "sigma")).lower(),
             "hedge_active": bool(hedge_active),
             "hedge_k": float(getattr(self, "hedge_sigma_k", 0.0)),
+            "fee_m": float(fee_m),
+            "fee": float(fee),
             "cpi_yoy": float(_safe_float(self.cpi_yoy, 0.0)),
             "is_new_year": bool(self.is_new_year),
+            "age_years": float(self.age_years),
             "life_table": bool(self.life_table is not None),
             "FlipNegToPos": bool(flip_neg_to_pos),
             "UpDriftRate": bool(up_drift),

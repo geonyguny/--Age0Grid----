@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 # project/hjb.py
 from __future__ import annotations
-
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import numpy as _np
+
 from .config import SimConfig
 
 
+# ---------- RNG ----------
 def _make_rng(seed: Optional[int]) -> _np.random.Generator:
     """SeedSequence 기반 default_rng 생성 (seed=None이면 OS 엔트로피)."""
     if seed is None:
@@ -15,217 +16,211 @@ def _make_rng(seed: Optional[int]) -> _np.random.Generator:
     return _np.random.default_rng(ss)
 
 
+# ---------- Small helpers ----------
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _crra_u(c: _np.ndarray, gamma: float = 3.0) -> _np.ndarray:
+    """벡터화된 CRRA 효용(γ≈1이면 로그 근사)."""
+    c = _np.maximum(_np.asarray(c, dtype=float), 1e-12)
+    if abs(gamma - 1.0) < 1e-12:
+        return _np.log(c)
+    return (c ** (1.0 - gamma) - 1.0) / (1.0 - gamma)
+
+
+def _interp1d_grid(x_grid: _np.ndarray, y_on_grid: _np.ndarray, xq: _np.ndarray) -> _np.ndarray:
+    """
+    등간격이 아닐 수 있는 1D grid에서 선형보간(클램프 포함).
+    x_grid: (N,), y_on_grid: (N,), xq: (M,)
+    """
+    xg = _np.asarray(x_grid, dtype=float)
+    yg = _np.asarray(y_on_grid, dtype=float)
+    xq = _np.asarray(xq, dtype=float)
+    idx = _np.clip(_np.searchsorted(xg, xq) - 1, 0, xg.size - 2)
+    xl = xg[idx]
+    xr = xg[idx + 1]
+    w = _np.where(xr > xl, (xq - xl) / (xr - xl), 0.0)
+    return (1.0 - w) * yg[idx] + w * yg[idx + 1]
+
+
+# ---------- HJB ----------
 class HJBSolver:
     """
     Backward DP on (t, W) with discrete controls (q, w).
 
-    - q-grid: 5 points [0, 0.25*q4, 0.5*q4, 0.75*q4, q4]  (q4: 연 4%를 월로 환산)
-    - Terminal CVaR (RU-dual):
-        V_T(W) = - λ * [ η + (1/(1-α)) * max(F - W - η, 0) ]
-      (lambda_term<=0이면 η 탐색 생략; η=0 고정)
-    - (dev) stage tail penalty / w^2 penalty: 반드시 lambda_term로 스케일
-    - (dev) w_min_dev: 너무 낮은 risky 비중 제외(정책 분산 확보용)
-    - (dev) dev_split_w_grid: λ=0 / λ>0 에 서로 다른 w-grid (정책 분리 가시화)
-    - Hedge: cfg.hedge, hedge_mode, hedge_cost/hedge_sigma_k를 Solver에도 동일 반영
+    q-grid: 5 pts = [0, 0.25*q4, 0.5*q4, 0.75*q4, q4], q4 = 월환산 4%룰
+    w-grid: cfg.hjb_w_grid (없으면 [0, .25, .5, .75, 1]∩[0,w_max]), w_min_dev 필터 적용
+
+    Terminal CVaR (RU-dual):
+      V_T(W) = - λ * [ η + (1/(1-α)) * max(F - W - η, 0) ]
+      (λ<=0이면 η 탐색 생략; η=0 고정)
+
+    Hedge: cfg.hedge / hedge_mode / hedge_sigma_k / hedge_cost를 간단 규칙으로 반영
+    Fee: 월 수수료 φ_m = m['phi_m'] (t 시점의 W_t 기준)
     """
 
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         self.m = cfg.monthly()
 
-        # Wealth grid
-        W_min = float(getattr(cfg, "hjb_W_min", 0.0))
-        W_max = float(getattr(cfg, "hjb_W_max", 2.0))
-        W_n   = int(getattr(cfg, "hjb_W_grid", 33))
-        self.W_grid = _np.linspace(W_min, W_max, W_n)
-        self.T = int(cfg.horizon_years) * int(cfg.steps_per_year)
+        # --- grids ---
+        W_min = float(getattr(cfg, "hjb_W_min", 0.0) or 0.0)
+        W_max = float(getattr(cfg, "hjb_W_max", 2.0) or 2.0)
+        W_n   = int(getattr(cfg, "hjb_W_grid", 33) or 33)
+        self.W_grid = _np.linspace(W_min, W_max, max(2, W_n))
+        self.T = int(getattr(cfg, "horizon_years", 35)) * int(getattr(cfg, "steps_per_year", 12))
 
-        # ---------- w-actions (중복 제거 + dev 스위치 반영) ----------
-        base_grid = list(getattr(cfg, "hjb_w_grid", [0.0, 0.25, 0.5, 0.75, 1.0]))
-        base_grid = [float(w) for w in base_grid if 0.0 <= float(w) <= float(cfg.w_max)]
-        if not base_grid:
-            base_grid = [0.0, min(0.5, float(cfg.w_max)), float(cfg.w_max)]
-
-        if bool(getattr(cfg, "dev_split_w_grid", False)):
-            if float(getattr(cfg, "lambda_term", 0.0)) > 0.0:
-                wa = [w for w in base_grid if w <= 0.5] or [min(max(base_grid[0], 0.0), float(cfg.w_max))]
-            else:
-                wa = [w for w in base_grid if w >= 0.5] or [min(max(base_grid[-1], 0.0), float(cfg.w_max))]
-        else:
-            wmin = float(getattr(cfg, "w_min_dev", 0.0) or 0.0)
-            wa = [w for w in base_grid if w >= wmin] or [min(max(base_grid[-1], 0.0), float(cfg.w_max))]
-
+        # --- w actions (dedup + filter + clamp to w_max) ---
+        w_max = float(getattr(cfg, "w_max", 1.0) or 1.0)
+        base_w = getattr(cfg, "hjb_w_grid", None)
+        if base_w is None:
+            base_w = [0.0, 0.25, 0.5, 0.75, 1.0]
+        wa = [min(max(float(w), 0.0), w_max) for w in base_w]
+        w_min_dev = float(getattr(cfg, "w_min_dev", 0.0) or 0.0)
+        wa = [w for w in wa if w >= w_min_dev]
+        if not wa:
+            wa = [0.0, min(0.5, w_max), w_max]
         self.w_actions = _np.array(sorted(set(wa)), dtype=float)
 
-        # ---------- q-actions (정확히 5점) ----------
-        # 연 4%를 steps_per_year 기준으로 월 전환해 최대치 근사
-        spm = int(getattr(cfg, "steps_per_year", 12))
-        q4 = 1.0 - (1.0 - 0.04) ** (1.0 / max(spm, 1))
-        self.q_actions = _np.array([0.0, 0.25*q4, 0.5*q4, 0.75*q4, q4], dtype=float)
+        # --- q actions (5-pt grid around 4% rule, with q_floor clamp later) ---
+        spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+        q4 = 1.0 - (1.0 - 0.04) ** (1.0 / max(1, spm))
+        self.q_actions = _np.array([0.0, 0.25 * q4, 0.5 * q4, 0.75 * q4, q4], dtype=float)
 
-    # --- Utility (CRRA γ=3; 필요하면 cfg.crra_gamma로 전환 가능) ---
-    def util(self, c: _np.ndarray) -> _np.ndarray:
-        gamma = 3.0
-        eps = 1e-9
-        if abs(gamma - 1.0) < 1e-12:
-            return _np.log(_np.maximum(c, eps))
-        return (_np.maximum(c, eps) ** (1.0 - gamma) - 1.0) / (1.0 - gamma)
+        # --- preferences (utility scale & gamma for tie-breaking consistency) ---
+        self.gamma = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
+        self.beta  = float(self.m.get("beta_m", 1.0) or 1.0)
 
-    # --- RU-dual terminal penalty helper ---
-    def _cvar_terminal_penalty(
-        self,
-        W: _np.ndarray,
-        F: float,
-        alpha: float,
-        eta: float,
-        lam: float
-    ) -> _np.ndarray:
-        if lam <= 0.0:
+        # --- risk process params (monthly) ---
+        self.mu    = float(self.m.get("mu_m", 0.0) or 0.0)
+        self.rf    = float(self.m.get("rf_m", 0.0) or 0.0)
+        sigma_m = self.m.get("sigma_m", None)
+        if sigma_m is None:
+            # fallback: 연 18%를 월로, 또는 cfg.sigma_annual 사용
+            sig_ann = float(getattr(cfg, "sigma_annual", 0.18) or 0.18)
+            spm = float(getattr(cfg, "steps_per_year", 12) or 12)
+            self.sigma = float(sig_ann) / _np.sqrt(spm)
+        else:
+            self.sigma = float(sigma_m)
+
+        # --- hedge mapping (env 규칙 요약 반영) ---
+        if str(getattr(cfg, "hedge", getattr(cfg, "hedge_on", "off"))).lower() == "on":
+            mode = str(getattr(cfg, "hedge_mode", "sigma")).lower()
+            if mode == "mu":
+                # 기대수익 haircut
+                self.mu = self.mu - float(getattr(cfg, "hedge_cost", 0.0) or 0.0)
+            elif mode == "sigma":
+                k = float(getattr(cfg, "hedge_sigma_k", 0.0) or 0.0)
+                self.sigma = max(0.0, self.sigma * (1.0 - k))
+            elif mode in ("downside", "down"):
+                # 간단 다운사이드 완화: 평균 영향 없고 변동만 소폭 축소
+                k = float(getattr(cfg, "hedge_sigma_k", 0.0) or 0.0)
+                self.sigma = max(0.0, self.sigma * (1.0 - 0.5 * k))
+
+        # --- CVaR terminal ---
+        self.alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
+        self.lam   = float(getattr(cfg, "lambda_term", 0.0) or 0.0)
+        self.F     = float(getattr(cfg, "F_target", 1.0) or 1.0)
+
+        # --- fee (monthly) ---
+        self.phi_m = float(self.m.get("phi_m", 0.0) or 0.0)
+
+        # --- sampling for expectation ---
+        self.Nshock = int(getattr(cfg, "hjb_Nshock", 32) or 32)
+
+        # --- tie-break tolerance ---
+        self.tie_eps = 1e-9
+
+    # --- Terminal CVaR penalty (RU-dual) ---
+    def _cvar_T(self, W: _np.ndarray, eta: float) -> _np.ndarray:
+        if self.lam <= 0.0:
             return _np.zeros_like(W, dtype=float)
-        inv = 1.0 / max(1e-12, (1.0 - alpha))
-        return lam * (eta + inv * _np.maximum(F - W - eta, 0.0))
+        inv = 1.0 / max(1e-12, (1.0 - self.alpha))
+        return self.lam * (eta + inv * _np.maximum(self.F - W - float(eta), 0.0))
+
+    # --- value backup for (W, q, w) ---
+    def _backup_val(self, V_next: _np.ndarray, W: float, q: float, w: float, shocks: _np.ndarray) -> float:
+        # 1) consume
+        c = q * W
+        W_net = max(W - c, 0.0)
+
+        # 2) returns
+        gross = 1.0 + (w * shocks) + ((1.0 - w) * self.rf)
+        W_next = _np.clip(W_net * gross - self.phi_m * W, 0.0, float(self.W_grid[-1]))
+
+        # 3) continuation value (linear interp, MC average)
+        Vn = _interp1d_grid(self.W_grid, V_next, W_next)
+        return float(_crra_u([c], self.gamma)[0] + self.beta * float(Vn.mean()))
 
     def solve(self, seed: Optional[int] = None, rng: Optional[_np.random.Generator] = None) -> Dict[str, Any]:
         """
-        Parameters
-        ----------
-        seed : Optional[int]
-            None 이면 OS 엔트로피 기반 RNG, 정수면 재현 가능.
-        rng  : Optional[np.random.Generator]
-            외부에서 RNG를 넘겨주면 그대로 사용.
-
         Returns
         -------
         dict: { "Pi_w": (T×|W|), "Pi_q": (T×|W|), "eta": float, "W_grid": np.ndarray }
         """
-        # --- RNG 초기화(핵심 수정) ---
         rng_local = rng if rng is not None else _make_rng(seed)
+        shocks = rng_local.normal(loc=self.mu, scale=max(0.0, self.sigma), size=max(1, self.Nshock))
 
-        # 월간 파라미터 (키명 정합성: sigma_m 사용)
-        mu    = float(self.m.get("mu_m", 0.0))
-        rf    = float(self.m.get("rf_m", 0.0))
-        phi   = float(self.m.get("phi_m", 0.0))
-        beta  = float(self.m.get("beta_m", 1.0))
-        # sigma 추정치: 주어지지 않으면 연σ를 월로 환산(보수적 기본값)
-        sigma = float(
-            self.m.get(
-                "sigma_m",
-                float(getattr(self.cfg, "sigma_annual", 0.18)) / (float(getattr(self.cfg, "steps_per_year", 12)) ** 0.5)
-            )
-        )
+        # η 후보 (λ<=0이면 0만)
+        eta_values = tuple(getattr(self.cfg, "hjb_eta_grid", (0.0,))) if (self.lam > 0.0) else (0.0,)
 
-        # --- Hedge를 Solver에도 반영(Env와 동일 규칙) ---
-        if str(getattr(self.cfg, "hedge", getattr(self.cfg, "hedge_on", "off"))).lower() == "on":
-            mode = str(getattr(self.cfg, "hedge_mode", "mu")).lower()
-            if mode == "mu":
-                # 수익률 haircut
-                mu = mu - float(getattr(self.cfg, "hedge_cost", 0.0) or 0.0)
-            elif mode == "sigma":
-                k = float(getattr(self.cfg, "hedge_sigma_k", 0.0) or 0.0)
-                sigma = max(0.0, sigma * (1.0 - k))
+        best_eta = 0.0
+        best_obj = -1e30
+        best_PiW: _np.ndarray | None = None
+        best_PiQ: _np.ndarray | None = None
 
-        # eta-grid: lambda_term<=0이면 탐색 생략
-        lam_term = float(getattr(self.cfg, "lambda_term", 0.0) or 0.0)
-        eta_values = tuple(getattr(self.cfg, "hjb_eta_grid", (0.0,))) if (lam_term > 0.0) else (0.0,)
-
-        # 기대값 근사 샘플
-        Nshock = int(getattr(self.cfg, "hjb_Nshock", 32) or 32)
-        shocks = rng_local.normal(loc=mu, scale=sigma, size=Nshock)  # risky per-period return samples
-
-        best_eta: float = 0.0
-        best_obj: float = -1e18
-        best_policy_w = None
-        best_policy_q = None
-
-        # tail 비율: α=0.95 → 하위 5%
-        alpha = float(getattr(self.cfg, "alpha", 0.95))
-        tail_ratio = max(1e-9, 1.0 - alpha)
-        k_tail = max(1, int(round(tail_ratio * shocks.size)))
-
-        # tie-break tolerance
-        tie_eps = 1e-9
-
-        F = float(getattr(self.cfg, "F_target", 1.0) or 1.0)
+        spm = int(getattr(self.cfg, "steps_per_year", 12) or 12)
+        q_floor = float(getattr(self.cfg, "q_floor", 0.0) or 0.0)
+        w_max   = float(getattr(self.cfg, "w_max", 1.0) or 1.0)
 
         for eta in eta_values:
             V   = _np.zeros((self.T + 1, self.W_grid.size), dtype=float)
             PiW = _np.zeros((self.T,     self.W_grid.size), dtype=float)
             PiQ = _np.zeros((self.T,     self.W_grid.size), dtype=float)
 
-            # ---------- Terminal value with RU-dual penalty ----------
-            pen_T = self._cvar_terminal_penalty(self.W_grid, F, alpha, float(eta), lam_term)
-            V[self.T, :] = -pen_T  # terminal boundary를 음수 보상으로 반영
+            # terminal
+            V[self.T, :] = - self._cvar_T(self.W_grid, float(eta))
 
-            # ---------------------- Backward induction ----------------------
+            # backward
             for t in reversed(range(self.T)):
                 for i, W in enumerate(self.W_grid):
-                    # Floor-aware q_min
-                    q_min = 0.0
+                    # q grid with floor & floor_on(f_min_real)
+                    q_min = q_floor
                     if bool(getattr(self.cfg, "floor_on", False)) and float(getattr(self.cfg, "f_min_real", 0.0)) > 0.0 and W > 0.0:
-                        q_min = min(1.0, float(getattr(self.cfg, "f_min_real")) / W)
+                        q_min = max(q_min, min(1.0, float(getattr(self.cfg, "f_min_real")) / float(W)))
                     q_grid = _np.maximum(self.q_actions, q_min)
 
-                    best_val = -1e18
-                    bw = float(self.w_actions[0])
-                    bq = float(q_grid[0])
+                    best_val = -1e30
+                    bw = float(self.w_actions[0]); bq = float(q_grid[0])
 
                     for w in self.w_actions:
-                        w = float(min(max(w, 0.0), float(self.cfg.w_max)))
+                        w = min(max(float(w), 0.0), w_max)
                         for q in q_grid:
-                            # ---- Transition: clip → consume → returns → fee ----
-                            c = q * W
-                            W_net = W - c
-
-                            # risky/safe mix (using MC samples `shocks`)
-                            gross = 1.0 + (w * shocks) + ((1.0 - w) * rf)
-                            W_next = W_net * gross - phi * W  # fee base=W_t
-                            W_next = _np.clip(W_next, 0.0, float(getattr(self.cfg, "hjb_W_max", self.W_grid[-1])))
-
-                            # Interpolate V_{t+1}(W_next) (vectorized)
-                            idx = _np.clip(_np.searchsorted(self.W_grid, W_next) - 1, 0, self.W_grid.size - 2)
-                            wl = self.W_grid[idx]
-                            wr = self.W_grid[idx + 1]
-                            wgt = _np.where(wr > wl, (W_next - wl) / (wr - wl), 0.0)
-                            Vn = (1.0 - wgt) * V[t + 1, idx] + wgt * V[t + 1, idx + 1]
-
-                            # -------- dev-only penalties (λ 스케일 필수) --------
-                            risk_pen = 0.0
-                            if bool(getattr(self.cfg, "dev_cvar_stage", False)) and (F > 0.0) and (lam_term > 0.0):
-                                # 하위 tail 평균이 F보다 낮으면 페널티
-                                tail = _np.partition(W_next, k_tail - 1)[:k_tail]
-                                loss_tail = max(F - float(tail.mean()), 0.0)
-                                kappa = float(getattr(self.cfg, "dev_cvar_kappa", 0.0) or 0.0)
-                                risk_pen = lam_term * kappa * loss_tail
-
-                            w2_coeff = float(getattr(self.cfg, "dev_w2_penalty", 0.0) or 0.0)
-                            w2_pen = lam_term * w2_coeff * (w ** 2)
-
-                            # Backup
-                            val = self.util(_np.array([c]))[0] + beta * float(Vn.mean()) - risk_pen - w2_pen
-
+                            val = self._backup_val(V[t + 1, :], float(W), float(q), float(w), shocks)
                             # tie-break: 값 동률이면 더 보수적 w(작은 w) 선택
-                            if (val > best_val + tie_eps) or (abs(val - best_val) <= tie_eps and w < bw):
+                            if (val > best_val + self.tie_eps) or (abs(val - best_val) <= self.tie_eps and w < bw):
                                 best_val = float(val)
                                 bw, bq = float(w), float(q)
 
-                    V[t, i]  = best_val
+                    V[t, i]   = best_val
                     PiW[t, i] = bw
                     PiQ[t, i] = bq
 
-            # 초기부(예: W0=1.0) 목적함수로 eta 선택
+            # 초기자산 W≈1.0에서의 값으로 η 선택
             j = int(_np.clip(_np.searchsorted(self.W_grid, 1.0), 0, self.W_grid.size - 1))
             obj = float(V[0, j])
             if obj > best_obj:
                 best_obj = obj
                 best_eta = float(eta)
-                best_policy_w = PiW
-                best_policy_q = PiQ
+                best_PiW = PiW
+                best_PiQ = PiQ
 
-        # Fallbacks (should be rare)
-        if best_policy_w is None or best_policy_q is None:
-            const_w = float(min(max(self.w_actions.mean(), 0.0), float(self.cfg.w_max)))
+        if best_PiW is None or best_PiQ is None:
+            # 드문 fallback: 균등 정책
+            const_w = float(min(max(self.w_actions.mean(), 0.0), w_max))
             const_q = float(self.q_actions[-1])
-            best_policy_w = _np.full((self.T, self.W_grid.size), const_w, dtype=float)
-            best_policy_q = _np.full((self.T, self.W_grid.size), const_q, dtype=float)
+            best_PiW = _np.full((self.T, self.W_grid.size), const_w, dtype=float)
+            best_PiQ = _np.full((self.T, self.W_grid.size), const_q, dtype=float)
 
-        return {"Pi_w": best_policy_w, "Pi_q": best_policy_q, "eta": best_eta, "W_grid": self.W_grid}
+        return {"Pi_w": best_PiW, "Pi_q": best_PiQ, "eta": best_eta, "W_grid": self.W_grid}

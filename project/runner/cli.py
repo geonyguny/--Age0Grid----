@@ -18,25 +18,32 @@ from ..config import (
 from .run import run_once, run_rl
 from .calibrate import calibrate_lambda
 
-# 새 모듈들
+# ETA / CVaR / stdout packing
 from .eta_utils import (
     fmt_hms, parse_hms_to_seconds,
-    eta_db_path, eta_load_db, predict_eta_from_history, eta_record
+    eta_db_path, eta_load_db, predict_eta_from_history, eta_record,
 )
 from .cvar_utils import fixup_metrics_with_cvar
 from .pack_utils import prune_for_stdout, maybe_evaluate_with_es_mode
 
-# YYYY-MM:YYYY-MM, YYYY-MM:, :YYYY-MM 모두 허용
+# (옵션) 구성 해시/버전 정보
+try:
+    from ..utils.config_hash import config_hash as _cfg_hash_fn  # type: ignore
+except Exception:
+    _cfg_hash_fn = None
+try:
+    from ..utils.version_info import get_version_info as _ver_info_fn  # type: ignore
+except Exception:
+    _ver_info_fn = None
+
+# YYYY-MM:YYYY-MM, YYYY-MM:, :YYYY-MM
 _WINDOW_RE = re.compile(r"^(?:\d{4}-\d{2})?:(?:\d{4}-\d{2})?$")
 
 
-# --- helpers ---------------------------------------------------------------
-
+# -------------------------
+# helpers
+# -------------------------
 def _csv_floats(s: str | None) -> List[float] | None:
-    """
-    "0.10,0.20,0.30" -> [0.1, 0.2, 0.3]
-    공백/빈문자/None이면 None 반환.
-    """
     if s is None:
         return None
     s = str(s).strip()
@@ -45,13 +52,27 @@ def _csv_floats(s: str | None) -> List[float] | None:
     out: List[float] = []
     for tok in s.split(","):
         tok = tok.strip()
-        if not tok:
-            continue
-        out.append(float(tok))
-    return out if out else None
+        if tok:
+            out.append(float(tok))
+    return out or None
 
 
-# [ADD] 요약 출력 유틸: EU/EU_per_year/delta_annual/F_target_used 포함
+def _normalize_outputs_path(p: str | None) -> str:
+    base = p or "./outputs"
+    abs_p = os.path.abspath(base)
+    os.makedirs(abs_p, exist_ok=True)
+    return abs_p
+
+
+def _normalize_seeds(seeds_arg: List[int]) -> List[int]:
+    if not isinstance(seeds_arg, list) or len(seeds_arg) == 0:
+        return [0, 1, 2, 3, 4]
+    if len(seeds_arg) == 1:
+        n = int(seeds_arg[0])
+        return list(range(max(n, 1)))
+    return sorted({int(x) for x in seeds_arg})
+
+
 def _print_metrics_summary(metrics: dict) -> None:
     lines = [
         f"EW            : {metrics.get('EW')}",
@@ -60,11 +81,11 @@ def _print_metrics_summary(metrics: dict) -> None:
         f"Ruin          : {metrics.get('Ruin')}",
         f"mean_WT       : {metrics.get('mean_WT')}",
         f"es95_source   : {metrics.get('es95_source')}",
-        # (NEW) EU 리포팅
+        # EU 리포팅
         f"EU            : {metrics.get('EU')}",
         f"EU_per_year   : {metrics.get('EU_per_year')}",
         f"delta_annual  : {metrics.get('delta_annual')}",
-        # (NEW) 손실 기준선 감사
+        # 손실 기준선 감사
         f"F_target_used : {metrics.get('F_target_used')}",
     ]
     print("\n".join([s for s in lines if s is not None]))
@@ -98,13 +119,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hjb_W_grid", type=int, default=None)
     p.add_argument("--hjb_Nshock", type=int, default=None)
     p.add_argument("--hjb_eta_n", type=int, default=None)
-    # (NEW) w-grid / dev w-floor
     p.add_argument("--hjb_w_grid", type=str, default=None,
                    help="Comma-separated w grid for HJB (e.g. '0.10,0.20,0.30,0.40,0.50').")
     p.add_argument("--w_min_dev", type=float, default=None,
                    help="(dev) Minimum risky weight; drop w < w_min_dev from HJB action set.")
 
-    # Hedge (legacy)
+    # Hedge
     p.add_argument("--hedge", choices=["on", "off"], default="off")
     p.add_argument("--hedge_mode", choices=["mu", "sigma", "downside"], default="sigma")
     p.add_argument("--hedge_cost", type=float, default=0.005)
@@ -126,10 +146,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bequest_gamma", type=float, default=1.0)
 
     # CVaR Calibration
-    p.add_argument("--calib", choices=["on", "off"], default="off",
-                   help="on이면 캘리브레이션 모드로 진입(calibrate_lambda).")
-    p.add_argument("--calib_param", choices=["lambda", "F"], default="lambda",
-                   help="캘리브레이션 대상 파라미터 선택.")
+    p.add_argument("--calib", choices=["on", "off"], default="off")
+    p.add_argument("--calib_param", choices=["lambda", "F"], default="lambda")
     p.add_argument("--cvar_target", type=float, default=CVAR_TARGET_DEFAULT)
     p.add_argument("--cvar_tol", type=float, default=CVAR_TOL_DEFAULT)
     p.add_argument("--lambda_min", type=float, default=LAMBDA_MIN_DEFAULT)
@@ -162,11 +180,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # Lite overrides
     p.add_argument("--q_floor", type=float, default=None)
     p.add_argument("--beta", type=float, default=None)
-    # (NEW) Utility reporting
-    p.add_argument("--report_utility", choices=["on", "off"], default="off",
-                   help="소비 흐름의 CRRA 효용(EU)을 계산/리포팅.")
-    p.add_argument("--delta_annual", type=float, default=None,
-                   help="연간 할인인자 δ (예: 0.96). 지정 없으면 무할인(=1).")
+    # Utility reporting
+    p.add_argument("--report_utility", choices=["on", "off"], default="off")
+    p.add_argument("--delta_annual", type=float, default=None)
 
     # Stage-wise CVaR
     p.add_argument("--cvar_stage", choices=["on", "off"], default="off")
@@ -204,7 +220,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # stdout control
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full")
-    # [MODIFY] 기본 metrics_keys에 EU 관련 필드와 감사 필드 추가
     p.add_argument("--metrics_keys", type=str,
                    default="EW,ES95,EL,Ruin,mean_WT,es_mode,EU,EU_per_year,delta_annual,F_target_used")
     p.add_argument("--no_paths", action="store_true")
@@ -212,16 +227,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--return_actor", choices=["on", "off"], default="off")
 
     # ETA
-    p.add_argument("--eta_mode", choices=["off", "history"], default="history",
-                   help="실행 전 예상시간(ETA) 추정 모드. off면 비활성화")
-    p.add_argument("--eta_budget_hms", type=str, default=None,
-                   help="예산 시간(HH:MM:SS). 예측 ETA가 이를 넘으면 실행 중단(기본 hard stop).")
-    p.add_argument("--eta_budget_s", type=float, default=None,
-                   help="예산 시간(초). eta_budget_hms보다 우선.")
-    p.add_argument("--eta_hard_stop", choices=["on", "off"], default="on",
-                   help="on=예산 초과 시 즉시 종료, off=경고만")
-    p.add_argument("--eta_db", type=str, default=None,
-                   help="ETA 히스토리 DB 경로(기본 outputs/.eta_history.json)")
+    p.add_argument("--eta_mode", choices=["off", "history"], default="history")
+    p.add_argument("--eta_budget_hms", type=str, default=None)
+    p.add_argument("--eta_budget_s", type=float, default=None)
+    p.add_argument("--eta_hard_stop", choices=["on", "off"], default="on")
+    p.add_argument("--eta_db", type=str, default=None)
 
     return p
 
@@ -247,29 +257,54 @@ def _validate_args(args) -> None:
         raise SystemExit("method=rule 사용 시 --baseline (4pct|cpb|vpw|kgr) 필수.")
 
 
+def _inject_meta(out: Dict[str, Any], args) -> None:
+    if not isinstance(out, dict):
+        return
+    meta = out.setdefault("meta", {})
+    meta.setdefault("tag", getattr(args, "tag", None))
+    meta.setdefault("method", getattr(args, "method", None))
+    meta.setdefault("asset", getattr(args, "asset", None))
+    meta.setdefault("outputs_abs", getattr(args, "outputs", None))
+    if _cfg_hash_fn:
+        try:
+            meta["config_hash"] = _cfg_hash_fn(vars(args))
+        except Exception:
+            pass
+    if _ver_info_fn:
+        try:
+            vi = _ver_info_fn()
+            if isinstance(vi, dict):
+                meta.update({k: vi.get(k) for k in ("git_commit", "py_ver", "np_ver")})
+        except Exception:
+            pass
+
+
 def main():
     t0 = time.perf_counter()
-
     p = _build_arg_parser()
     args = p.parse_args()
 
-    # --- parse/normalize new options early ---
-    # 문자열로 온 --hjb_w_grid을 리스트[float]로 변환해서 downstream으로 전달
+    # normalize
+    args.outputs = _normalize_outputs_path(getattr(args, "outputs", None))
+    try:
+        args.seeds = _normalize_seeds(list(getattr(args, "seeds", [])))
+    except Exception:
+        args.seeds = [0, 1, 2, 3, 4]
+
     parsed_w_grid = _csv_floats(getattr(args, "hjb_w_grid", None))
     if parsed_w_grid is not None:
-        args.hjb_w_grid = parsed_w_grid  # 타입을 리스트로 고정
+        args.hjb_w_grid = parsed_w_grid
 
     _apply_data_profile_defaults(args)
     _validate_args(args)
 
-    # === ETA: 실행 전 예측 & 예산 검사 ===
+    # ETA budget check (best-effort)
     try:
         if str(getattr(args, "eta_mode", "history")).lower() == "history":
             db = eta_load_db(eta_db_path(args))
             eta_s, src = predict_eta_from_history(args, db)
             if eta_s is not None:
                 print(f"[ETA] ~{fmt_hms(eta_s)} (source={src}) … starting", file=sys.stderr, flush=True)
-
                 budget = getattr(args, "eta_budget_s", None)
                 if budget is None:
                     budget = parse_hms_to_seconds(getattr(args, "eta_budget_hms", None))
@@ -285,7 +320,7 @@ def main():
 
     want_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
 
-    # === 라우팅 ===
+    # routing
     if str(getattr(args, "calib", "off")).lower() == "on":
         out = calibrate_lambda(args)
         if isinstance(out, dict) and "es_mode" not in out:
@@ -298,13 +333,15 @@ def main():
             res = run_once(args)
             out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"), want_paths=want_paths)
 
-    # 메타 필드 보강
+    # meta
     if isinstance(out, dict):
         out.setdefault("tag", getattr(args, "tag", None))
         out.setdefault("method", getattr(args, "method", None))
         out.setdefault("asset", getattr(args, "asset", None))
+        out.setdefault("outputs_abs", getattr(args, "outputs", None))
+        _inject_meta(out, args)
 
-    # ES95(CVaR) 보정
+    # ES95(CVaR) fixup (best-effort)
     try:
         if isinstance(out, dict):
             out = fixup_metrics_with_cvar(args, out)
@@ -312,11 +349,11 @@ def main():
         try:
             if isinstance(out, dict):
                 tgt = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
-                tgt["es95_note"] = f"post-fixup failed: {type("_e").__name__}"
+                tgt["es95_note"] = f"post-fixup failed: {type(_e).__name__}"
         except Exception:
             pass
 
-    # 편의 필드: extras.eval_WT_n
+    # extras: eval_WT_n
     try:
         if isinstance(out, dict) and isinstance(out.get("extra"), dict):
             ew = out["extra"].get("eval_WT")
@@ -325,19 +362,19 @@ def main():
     except Exception:
         pass
 
-    # 전체 실행시간 기록
+    # total time
     elapsed = time.perf_counter() - t0
     if isinstance(out, dict):
         out["time_total_s"] = round(elapsed, 3)
         out["time_total_hms"] = fmt_hms(elapsed)
 
-    # ETA 히스토리 갱신
+    # ETA history
     try:
         eta_record(args, elapsed)
     except Exception:
         pass
 
-    # [NEW] summary 모드: 사람친화 요약 출력 후 종료 (JSON 출력 생략)
+    # summary mode short-circuit
     if str(getattr(args, "print_mode", "full")).lower() == "summary":
         if isinstance(out, dict):
             metrics = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
@@ -346,7 +383,7 @@ def main():
             print("[warn] summary mode but no metrics dict available.")
         return
 
-    # 출력(JSON; full/metrics 경로는 prune_for_stdout가 처리)
+    # stdout (JSON)
     to_print = prune_for_stdout(args, out) if isinstance(out, dict) else out
     print(json.dumps(to_print, ensure_ascii=False))
 

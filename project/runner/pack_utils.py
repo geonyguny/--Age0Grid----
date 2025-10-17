@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
-from project.metrics.es import es95_wealth
+﻿# project/runner/pack_utils.py
+from __future__ import annotations
 from typing import Any, Dict, Iterable, Optional, Tuple, List
+
 from .cvar_utils import maybe_extract_WT
 
-# ---- evaluate ?숈쟻 ?꾪룷??----
+# ---- evaluate 동적 임포트 (있으면 사용) ----
 def _import_evaluate():
     candidates = [
         "project.runner.evaluate",
@@ -21,13 +22,15 @@ def _import_evaluate():
 
 _evaluate = _import_evaluate()  # type: ignore
 
-# ---- n_paths 異붿젙 ----
+
+# ---- n_paths 추정 ----
 def _estimate_n_paths(args, out: Dict[str, Any]) -> Optional[int]:
     try:
         if isinstance(out, dict):
             np_exist = out.get("n_paths")
             if isinstance(np_exist, (int, float)) and int(np_exist) > 0:
                 return int(np_exist)
+
         seeds = getattr(args, "seeds", [])
         if isinstance(seeds, int):
             n_seeds = 1
@@ -35,10 +38,12 @@ def _estimate_n_paths(args, out: Dict[str, Any]) -> Optional[int]:
             n_seeds = max(1, len(seeds))
         else:
             n_seeds = 1
+
         if str(getattr(args, "method", "hjb")).lower() == "rl":
             n_eval = int(getattr(args, "rl_n_paths_eval", 0) or 0)
             if n_eval > 0:
                 return n_eval * n_seeds
+
         n_base = int(getattr(args, "n_paths", 0) or 0)
         if n_base > 0:
             return n_base * n_seeds
@@ -46,11 +51,20 @@ def _estimate_n_paths(args, out: Dict[str, Any]) -> Optional[int]:
         pass
     return None
 
-# ---- stdout 異뺤냼/?붿빟 ----
+
+# ---- stdout 경량화/포맷 ----
 def prune_for_stdout(args, out: Dict[str, Any]) -> Any:
+    """
+    print_mode 에 따라 출력 페이로드를 경량화.
+      - full: 원본 그대로
+      - metrics: 지정된 metrics_keys 만 추출 + 메타(시간/태그/자산/방법/n_paths)
+      - summary: 메트릭 서브셋 + 핵심 메타만
+    또한 --no_paths 인 경우 extra.eval_WT/ruin_flags를 개수 필드로 대체.
+    """
     def _sel_metrics(md: Dict[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
         return {k: md[k] for k in md if k in keys}
 
+    # 큰 배열 제거 옵션
     if getattr(args, "no_paths", False) and isinstance(out, dict):
         out = dict(out)
         extra = out.get("extra")
@@ -61,6 +75,7 @@ def prune_for_stdout(args, out: Dict[str, Any]) -> Any:
                         extra[k + "_n"] = len(extra[k])
                     except Exception:
                         pass
+                    # 실제 배열 제거
                     del extra[k]
             out["extra"] = extra
 
@@ -69,9 +84,12 @@ def prune_for_stdout(args, out: Dict[str, Any]) -> Any:
         return out
 
     metrics = out["metrics"] if isinstance(out, dict) and isinstance(out.get("metrics"), dict) else out
+    # cli.py 기본값이 EU/EU_per_year/delta_annual/F_target_used 포함이므로 그대로 따름
     keys = [s.strip() for s in str(getattr(args, "metrics_keys", "")).split(",") if s.strip()]
 
     n_paths_guess = _estimate_n_paths(args, out)
+
+    # summary용 보조 메타(있으면 표시)
     age0_guess, sex_guess = None, None
     try:
         if isinstance(out, dict):
@@ -120,7 +138,8 @@ def prune_for_stdout(args, out: Dict[str, Any]) -> Any:
 
     return out
 
-# ---- cfg/actor 異붿텧 ----
+
+# ---- cfg/actor 추출 ----
 def try_extract_cfg_actor(res: Any) -> Tuple[Optional[Any], Optional[Any]]:
     if isinstance(res, tuple) and len(res) >= 2:
         return res[0], res[1]
@@ -135,8 +154,14 @@ def try_extract_cfg_actor(res: Any) -> Tuple[Optional[Any], Optional[Any]]:
             return cfg, actor
     return None, None
 
-# ---- ?됯? 寃곌낵 ?⑦궧(+?꾩슂??寃쎈줈 ?ы룊媛) ----
+
+# ---- 필요 시 evaluate 재호출 (경로 포함) ----
 def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False) -> Dict[str, Any]:
+    """
+    run_once/run_rl 의 다양한 반환 포맷을 표준 페이로드로 래핑.
+    want_paths=True 이고 경로가 비어있으며 evaluate 가 임포트되어 있고 (cfg, actor)가 있으면
+    한 번 더 evaluate 를 호출해 경로를 채운다.
+    """
     if isinstance(res, tuple) and len(res) >= 1 and isinstance(res[0], dict):
         pack: Dict[str, Any] = {"metrics": dict(res[0])}
         if len(res) >= 2 and isinstance(res[1], dict):
@@ -148,6 +173,7 @@ def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False
             pack = {"metrics": dict(res["metrics"])}
             if isinstance(res.get("extra"), dict):
                 pack["extra"] = dict(res["extra"])
+            # 메타 필드 복사
             for k in ("asset","method","w_max","fee_annual","lambda_term","alpha","F_target","outputs","tag","n_paths","args"):
                 if k in res:
                     pack[k] = res[k]
@@ -158,12 +184,13 @@ def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False
             if "es_mode" not in pack["metrics"]:
                 pack["metrics"]["es_mode"] = str(es_mode).lower()
     else:
-        pack = {
+        return {
             "result": "ok",
             "note": "evaluate not executed in cli (no evaluate import or unexpected return type).",
             "es_mode": str(es_mode).lower(),
         }
 
+    # 이미 경로가 있으면 재평가 불필요
     have_paths = False
     try:
         wt0 = maybe_extract_WT({"metrics": pack.get("metrics", {}), "extra": pack.get("extra", {})})
@@ -171,11 +198,11 @@ def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False
     except Exception:
         have_paths = False
 
-    if want_paths and not have_paths and _evaluate is not None:
+    if want_paths and (not have_paths) and _evaluate is not None:
         cfg, actor = try_extract_cfg_actor(res)
         if cfg is None:
             cfg, actor = try_extract_cfg_actor(pack)
-        if cfg is not None:
+        if (cfg is not None) and (actor is not None):
             try:
                 m = None
                 try:
@@ -199,7 +226,7 @@ def maybe_evaluate_with_es_mode(res: Any, es_mode: str, want_paths: bool = False
                         pack["extra"] = {}
                     pack["extra"]["eval_WT"] = list(wt_paths)
             except Exception:
+                # 재평가 실패는 조용히 무시 (상위 단계가 후처리)
                 pass
 
     return pack
-

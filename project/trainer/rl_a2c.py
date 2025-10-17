@@ -1,11 +1,14 @@
 ﻿# project/trainer/rl_a2c.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import time, csv, math, os, random, contextlib
 from pathlib import Path
-from typing import Any, Dict, Callable, Optional, Tuple
+from typing import Any, Dict, Callable, Optional, Tuple, List
 
 import numpy as np
 
-# (keep import for compatibility; not strictly used here)
+# Keep import (compat)
 from project.metrics.es import es95_wealth
 
 import torch
@@ -14,6 +17,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Beta
 
+# env import: env/__init__.py 가 RetirementEnv를 re-export 하지 않는 경우엔
+# `from project.env.retirement_env import RetirementEnv` 로 바꿔도 됨.
 from project.env import RetirementEnv
 
 try:
@@ -22,9 +27,10 @@ except Exception:
     pass
 
 
-# ---------- small helpers ----------
-def _to_f(x, default=0.0) -> float:
-    """Python float로 강제 + None/NaN/Inf를 default로 치환"""
+# ─────────────────────────────────────────────────────────
+# Small helpers
+# ─────────────────────────────────────────────────────────
+def _to_f(x, default: float = 0.0) -> float:
     try:
         if x is None:
             return float(default)
@@ -35,8 +41,7 @@ def _to_f(x, default=0.0) -> float:
     except Exception:
         return float(default)
 
-def _sanitize_tensor(x: torch.Tensor, fill=0.0) -> torch.Tensor:
-    """텐서 내 NaN/Inf 치환"""
+def _sanitize_tensor(x: torch.Tensor, fill: float = 0.0) -> torch.Tensor:
     if not torch.is_tensor(x):
         x = torch.as_tensor(x, dtype=torch.float32)
     mask = ~torch.isfinite(x)
@@ -46,8 +51,14 @@ def _sanitize_tensor(x: torch.Tensor, fill=0.0) -> torch.Tensor:
     return x
 
 
-# ---------- Gym-like shim ----------
+# ─────────────────────────────────────────────────────────
+# Gym-like shim for our Env
+# ─────────────────────────────────────────────────────────
 class _GymShim:
+    """
+    RetirementEnv를 관측 벡터 기반의 경량 Gym 인터페이스로 감싸는 어댑터.
+    관측: [t_norm, W/W0, age_norm, pad] (pad는 0)
+    """
     def __init__(self, base_env: RetirementEnv):
         self.base = base_env
 
@@ -57,10 +68,18 @@ class _GymShim:
             W  = _to_f(s.get("W", s.get("W_t", 0.0)), 0.0)
             T  = max(getattr(self.base, "T", 1), 1)
             W0 = _to_f(getattr(self.base, "W0", 1.0), 1.0) or 1.0
-            age = _to_f(s.get("age", 0.0), 0.0)
+            age = _to_f(s.get("age", getattr(self.base, "age_years", 65.0)), 65.0)
             age_norm = age / 120.0
-            return np.array([t/float(T), W/ W0, age_norm, 0.0], dtype=np.float32)
-        return np.asarray(s, dtype=np.float32)
+            return np.array([t/float(T-1 if T > 1 else 1), W/max(W0, 1e-12), age_norm, 0.0], dtype=np.float32)
+        arr = np.asarray(s, dtype=np.float32).ravel()
+        if arr.size >= 2:
+            # s가 [t_norm, W] 인 경우: W를 W/W0로 교정할 수 없으니 그대로 둔다.
+            if arr.size < 4:
+                pad = np.zeros((4-arr.size,), dtype=np.float32)
+                arr = np.concatenate([arr, pad], axis=0)
+        else:
+            arr = np.array([0.0, 1.0, 65.0/120.0, 0.0], dtype=np.float32)
+        return arr.astype(np.float32, copy=False)
 
     def reset(self, seed=None):
         try:
@@ -81,23 +100,27 @@ class _GymShim:
             s_next, r, done, info = out; trunc = False
         else:
             raise RuntimeError(f"Unexpected step() return length: {len(out)}")
-        # 보상 안전화
+
         r = _to_f(r, 0.0)
         obs = self._obs_vec(s_next)
+        # 보장: info에 W_T가 없으면 현 W를 넣어준다(터미널 단계에서 사용)
         if isinstance(info, dict) and "W_T" not in info:
             try:
-                W_T = _to_f(getattr(self.base, "W", None) or (s_next.get("W") if isinstance(s_next, dict) else 0.0), 0.0)
-                info["W_T"] = W_T
+                wt = _to_f(getattr(self.base, "W", None) or (s_next.get("W") if isinstance(s_next, dict) else None), 0.0)
+                info["W_T"] = wt
             except Exception:
                 pass
         return obs, float(r), bool(done), bool(trunc), info
 
     def close(self):
         if hasattr(self.base, "close"):
-            self.base.close()
+            with contextlib.suppress(Exception):
+                self.base.close()
 
 
-# ---------- Utility ----------
+# ─────────────────────────────────────────────────────────
+# Utility (CRRA)
+# ─────────────────────────────────────────────────────────
 def u_crra(c: float, gamma: float = 3.0, eps: float = 1e-8) -> float:
     c = max(float(c), 0.0) + eps
     if abs(gamma - 1.0) < 1e-9:
@@ -105,23 +128,25 @@ def u_crra(c: float, gamma: float = 3.0, eps: float = 1e-8) -> float:
     return (c ** (1.0 - gamma) - 1.0) / (1.0 - gamma)
 
 
-# ---------- Policy ----------
+# ─────────────────────────────────────────────────────────
+# Policy network
+# ─────────────────────────────────────────────────────────
 class BetaHead(nn.Module):
-    def __init__(self, in_dim):
+    def __init__(self, in_dim: int):
         super().__init__()
         self.fc_a = nn.Linear(in_dim, 1)
         self.fc_b = nn.Linear(in_dim, 1)
         nn.init.xavier_uniform_(self.fc_a.weight); nn.init.zeros_(self.fc_a.bias)
         nn.init.xavier_uniform_(self.fc_b.weight); nn.init.zeros_(self.fc_b.bias)
 
-    def forward(self, h):
+    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         alpha = F.softplus(self.fc_a(h)) + 1.001
         beta  = F.softplus(self.fc_b(h)) + 1.001
         return alpha, beta
 
 
 class PolicyNet(nn.Module):
-    def __init__(self, obs_dim, hidden=128):
+    def __init__(self, obs_dim: int, hidden: int = 128):
         super().__init__()
         self.backbone = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
@@ -132,14 +157,14 @@ class PolicyNet(nn.Module):
         self.v_head  = nn.Linear(hidden, 1)
         nn.init.xavier_uniform_(self.v_head.weight); nn.init.zeros_(self.v_head.bias)
 
-    def forward(self, obs):
+    def forward(self, obs: torch.Tensor):
         h = self.backbone(obs)
         a_q, b_q = self.head_q(h)
         a_w, b_w = self.head_w(h)
         v = self.v_head(h).squeeze(-1)
         return (a_q, b_q), (a_w, b_w), v
 
-    def act(self, obs, cfg, eval_mode=False):
+    def act(self, obs: torch.Tensor, cfg: Any, eval_mode: bool = False):
         (a_q, b_q), (a_w, b_w), v = self.forward(obs)
         dist_q = Beta(a_q, b_q); dist_w = Beta(a_w, b_w)
         if eval_mode:
@@ -149,7 +174,6 @@ class PolicyNet(nn.Module):
             raw_q = dist_q.rsample().clamp(1e-4, 1-1e-4)
             raw_w = dist_w.rsample().clamp(1e-4, 1-1e-4)
 
-        # map to constraints
         q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
         w_max   = float(getattr(cfg, "w_max", 1.0) or 1.0)
         q_cap   = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
@@ -157,7 +181,6 @@ class PolicyNet(nn.Module):
         q = q_floor + (1.0 - q_floor) * raw_q
         w = w_max * raw_w
 
-        # q_cap both in train & eval
         if q_cap > 0.0:
             q = torch.minimum(q, torch.as_tensor(q_cap, dtype=q.dtype, device=q.device))
 
@@ -166,19 +189,14 @@ class PolicyNet(nn.Module):
         return q.squeeze(-1), w.squeeze(-1), logp.squeeze(-1), ent, v, (dist_q, dist_w)
 
 
-# ---------- GAE ----------
+# ─────────────────────────────────────────────────────────
+# GAE (safe)
+# ─────────────────────────────────────────────────────────
 def compute_gae(rews: torch.Tensor,
                 vals: torch.Tensor,
                 dones: torch.Tensor,
                 gamma: float,
                 lam: float):
-    """
-    Safe GAE:
-      - rews, vals: shape [T]
-      - dones: bool or {0,1} tensor of shape [T]
-      - bootstrap with 0 for v_{T}
-    """
-    # squeeze to [T]
     if rews.ndim > 1: rews = rews.squeeze(-1)
     if vals.ndim > 1: vals = vals.squeeze(-1)
     if dones.ndim > 1: dones = dones.squeeze(-1)
@@ -187,14 +205,11 @@ def compute_gae(rews: torch.Tensor,
     device = rews.device
     dtype  = rews.dtype
 
-    # v_{T} = 0 (no bootstrap from critic) → append one zero
     vals_ext = torch.cat([vals, torch.zeros(1, device=device, dtype=dtype)], dim=0)
 
-    # nonterminal mask as float
     if dones.dtype == torch.bool:
         dones_f = dones.float()
     else:
-        # assume already 0/1 floats
         dones_f = dones.to(dtype)
 
     adv = torch.zeros(T, device=device, dtype=dtype)
@@ -210,64 +225,70 @@ def compute_gae(rews: torch.Tensor,
     return adv, ret
 
 
-# ---------- Dual CVaR ----------
+# ─────────────────────────────────────────────────────────
+# Dual CVaR (terminal / stage-wise)
+# ─────────────────────────────────────────────────────────
 class DualCVaR:
-    def __init__(self, alpha=0.95, eta_init=0.0, tau=0.3):
+    def __init__(self, alpha: float = 0.95, eta_init: float = 0.0, tau: float = 0.3):
         self.alpha = alpha; self.eta = eta_init; self.tau = tau
-    def update_eta_with_batch(self, L_batch):
-        if len(L_batch) == 0:
+    def update_eta_with_batch(self, L_batch: List[float] | np.ndarray):
+        if L_batch is None or len(L_batch) == 0:
             return
-        q_alpha = np.quantile(L_batch, self.alpha)
+        q_alpha = np.quantile(np.asarray(L_batch, dtype=float), self.alpha)
         self.eta = (1.0 - self.tau) * self.eta + self.tau * float(q_alpha)
-    def terminal_penalty(self, L):
-        return self.eta + max(L - self.eta, 0.0) / (1.0 - self.alpha)
+    def terminal_penalty(self, L: float) -> float:
+        return self.eta + max(L - self.eta, 0.0) / max(1e-12, (1.0 - self.alpha))
 
 
-# ---------- Dual CVaR (stage-wise for consumption shortfall) ----------
 class DualCVaRStage:
-    def __init__(self, alpha=0.95, eta_init=0.0, tau=0.3):
+    def __init__(self, alpha: float = 0.95, eta_init: float = 0.0, tau: float = 0.3):
         self.alpha = alpha; self.eta = eta_init; self.tau = tau
-    def update_eta_with_batch(self, Ls):
-        if len(Ls) == 0:
+    def update_eta_with_batch(self, Ls: List[float] | np.ndarray):
+        if Ls is None or len(Ls) == 0:
             return
-        q_alpha = np.quantile(Ls, self.alpha)
+        q_alpha = np.quantile(np.asarray(Ls, dtype=float), self.alpha)
         self.eta = (1.0 - self.tau) * self.eta + self.tau * float(q_alpha)
-    def penalty(self, L):
-        return self.eta + max(L - self.eta, 0.0) / (1.0 - self.alpha)
+    def penalty(self, L: float) -> float:
+        return self.eta + max(L - self.eta, 0.0) / max(1e-12, (1.0 - self.alpha))
 
 
-# ---------- Teacher policy ----------
+# ─────────────────────────────────────────────────────────
+# Teacher policy (warm start)
+# ─────────────────────────────────────────────────────────
 def teacher_action(cfg):
-    # 4% rule monthly, w≈0.6 (clip to w_max)
-    q4_m = 1.0 - (1.0 - 0.04) ** (1.0 / cfg.steps_per_year)
+    # 4% rule monthly
+    spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+    q4_m = 1.0 - (1.0 - 0.04) ** (1.0 / spm)
     q_cap = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
     q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
-    w_teacher = min(0.60, float(getattr(cfg, "w_max", 1.0)))
+    w_teacher = min(0.60, float(getattr(cfg, "w_max", 1.0) or 1.0))
     q_teacher = q4_m
     if q_cap > 0.0: q_teacher = min(q_teacher, q_cap)
     q_teacher = max(q_teacher, q_floor)
     return float(q_teacher), float(w_teacher)
 
 
-# ---------- Rollout ----------
+# ─────────────────────────────────────────────────────────
+# Rollout
+# ─────────────────────────────────────────────────────────
 def rollout(env, policy, cfg, steps, gamma, lam, device,
             cvar_hook, lw_scale, survive_bonus, teacher_eps,
             stage_cvar: Optional[DualCVaRStage] = None, cstar_mode: str = "annuity"):
     obs_list, act_q, act_w, logp_list, ent_list, val_list, rew_list, done_list = ([] for _ in range(8))
-    stage_L_list = []  # for stage-wise CVaR eta update
+    stage_L_list: List[float] = []  # for stage-wise CVaR eta update
     obs, _ = env.reset(seed=None)
 
     q_cap = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
     q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
     w_max   = float(getattr(cfg, "w_max", 1.0) or 1.0)
-    gamma_crra = float(getattr(cfg, "crra_gamma", 3.0))
-    u_scale    = float(getattr(cfg, "u_scale", 0.0))
+    gamma_crra = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
+    u_scale    = float(getattr(cfg, "u_scale", 0.0) or 0.0)
 
     for _ in range(steps):
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         q, w, logp, ent, v, (dist_q, dist_w) = policy.act(obs_t, cfg, eval_mode=False)
 
-        # teacher forcing (on-policy logp for teacher action)
+        # teacher forcing
         if random.random() < max(0.0, min(1.0, float(teacher_eps))):
             tq, tw = teacher_action(cfg)
             if q_cap > 0.0: tq = min(tq, q_cap)
@@ -286,30 +307,38 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
 
         obs2, c_t, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
 
-        # reward shaping (안전화 포함)
+        # reward shaping
         rew = 0.0
-        # utility of consumption
         if u_scale != 0.0:
             rew += u_scale * u_crra(_to_f(c_t, 0.0), gamma=gamma_crra)
 
         # stage-wise CVaR on consumption shortfall
-        if (stage_cvar is not None) and (getattr(cfg, "cvar_stage_on", False)):
-            mode = str(cstar_mode or "annuity")
-            if mode == "fixed":
-                c_star = float(getattr(cfg, "cstar_m", 0.04/12)) * 1.0
-                c_star = float(c_star) * float(obs[1])  # obs[1]=W/W0
-            elif mode == "vpw":
-                m = cfg.monthly(); g = m['g_m']; Nm = env.base.T - env.base.t
-                a = (1.0 - (1.0+g)**(-Nm))/g if g > 0 else max(Nm, 1)
-                q_m = min(1.0, 1.0 / a)
-                c_star = q_m * float(obs[1])
-            else:
-                c_star = float(cfg.monthly()['p_m']) * float(obs[1])
-            L_t = max(c_star - _to_f(c_t, 0.0), 0.0)
-            stage_L_list.append(L_t)
-            lam_s = float(getattr(cfg, "lambda_stage", 0.0) or 0.0)
-            if lam_s > 0.0:
-                rew -= lam_s * stage_cvar.penalty(L_t)
+        if stage_cvar is not None:
+            # cfg.cvar_stage == "on" 혹은 cvar_stage_on True 둘 다 허용
+            stage_on = (str(getattr(cfg, "cvar_stage", "off")).lower() == "on") or bool(getattr(cfg, "cvar_stage_on", False))
+            if stage_on:
+                mode = str(cstar_mode or "annuity").lower()
+                try:
+                    if mode == "fixed":
+                        c_star_m = float(getattr(cfg, "cstar_m", 0.04/12) or 0.04/12)
+                        c_star = c_star_m * float(obs[1])  # obs[1] ≈ W/W0 (스케일 상수로 사용)
+                    elif mode == "vpw":
+                        # 단순 근사 VPW (이 값들은 환경/구성에 따라 의미부여용)
+                        Nm = int(getattr(env.base, "T", 1)) - int(getattr(env.base, "t", 0))
+                        g = float(getattr(getattr(cfg, "monthly", lambda: {"g_m": 0.0})(), "get", lambda *_: 0.0)("g_m"))
+                        a = (1.0 - (1.0+g)**(-Nm))/g if g > 0 else max(Nm, 1)
+                        q_m = min(1.0, 1.0 / a)
+                        c_star = q_m * float(obs[1])
+                    else:
+                        p_m = float(getattr(getattr(cfg, "monthly", lambda: {"p_m": 0.04/12})(), "get", lambda *_: 0.04/12)("p_m"))
+                        c_star = p_m * float(obs[1])
+                except Exception:
+                    c_star = 0.0
+                L_t = max(c_star - _to_f(c_t, 0.0), 0.0)
+                stage_L_list.append(L_t)
+                lam_s = float(getattr(cfg, "lambda_stage", 0.0) or 0.0)
+                if lam_s > 0.0:
+                    rew -= lam_s * stage_cvar.penalty(L_t)
 
         if not (done or trunc) and survive_bonus != 0.0:
             rew += float(survive_bonus)
@@ -340,7 +369,7 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
     rews  = torch.stack(rew_list)
     dones = torch.tensor(done_list, device=rews.device, dtype=torch.float32)
 
-    # ---- final sanitization before GAE ----
+    # final sanitization before GAE
     rews = _sanitize_tensor(rews, 0.0).float()
     val  = _sanitize_tensor(val,  0.0).float()
 
@@ -354,9 +383,11 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
     }
 
 
-# ---------- Mean-policy eval (returns W_T) ----------
-def evaluate_mean_policy(make_env_fn, policy, cfg, n_paths=300, device="cpu") -> Dict[str, Any]:
-    Ws = []
+# ─────────────────────────────────────────────────────────
+# Mean-policy evaluation (returns W_T samples)
+# ─────────────────────────────────────────────────────────
+def evaluate_mean_policy(make_env_fn, policy: PolicyNet, cfg, n_paths=300, device="cpu") -> Dict[str, Any]:
+    Ws: List[float] = []
     with torch.no_grad():
         for _ in range(n_paths):
             env = make_env_fn()
@@ -364,25 +395,32 @@ def evaluate_mean_policy(make_env_fn, policy, cfg, n_paths=300, device="cpu") ->
             done = False; trunc = False
             while not (done or trunc):
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                q, w, _, _, _, _ = policy.act(obs_t, cfg, eval_mode=True)
+                q, w, *_ = policy.act(obs_t, cfg, eval_mode=True)
                 obs, r, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
             W_T = info.get("W_T", None)
             if W_T is None and hasattr(env, "W"):
                 W_T = float(env.W)
-            Ws.append(float(W_T)); env.close()
-    Ws = np.array(Ws, dtype=np.float64)
-    EW = float(Ws.mean())
+            Ws.append(float(_to_f(W_T, 0.0)))
+            env.close()
+    Ws = np.asarray(Ws, dtype=np.float64)
+    EW = float(np.mean(Ws)) if Ws.size > 0 else 0.0
+
     F_t = float(getattr(cfg, "F_target", 1.0) or 1.0)
     L = np.maximum(F_t - Ws, 0.0)
-    k = max(1, int(0.05 * len(L)))
-    tail_idx = np.argsort(L)[-k:]
-    ES95_loss = float(np.mean(L[tail_idx]))
-    Ruin = float((Ws <= 0.0).mean())
+    k = max(1, int(0.05 * max(0, L.size)))
+    if k > 0 and L.size >= k:
+        tail_idx = np.argsort(L)[-k:]
+        ES95_loss = float(np.mean(L[tail_idx]))
+    else:
+        ES95_loss = float(np.mean(L)) if L.size > 0 else 0.0
+    Ruin = float(np.mean(Ws <= 0.0)) if Ws.size > 0 else 0.0
     return {"EW": EW, "ES95": ES95_loss, "Ruin": Ruin, "mean_WT": EW, "eval_WT": Ws.tolist()}
 
 
-# ---------- XAI helpers ----------
-def make_policy_heatmaps(policy, cfg, outputs, device="cpu"):
+# ─────────────────────────────────────────────────────────
+# XAI helpers (best-effort; ignore failures)
+# ─────────────────────────────────────────────────────────
+def make_policy_heatmaps(policy: PolicyNet, cfg, outputs, device="cpu"):
     import matplotlib.pyplot as plt
     out = Path(outputs) / "xai"; out.mkdir(parents=True, exist_ok=True)
     W_grid = np.linspace(0.1, 2.0, 81, dtype=np.float32)
@@ -395,7 +433,7 @@ def make_policy_heatmaps(policy, cfg, outputs, device="cpu"):
             t_norm = ti / (Tn-1)
             for j, wv in enumerate(W_grid):
                 obs = np.array([t_norm, wv, 65.0/120.0, 0.0], dtype=np.float32)
-                q_m, w_m, _, _, _, _ = policy.act(torch.tensor(obs).unsqueeze(0).to(device), cfg, eval_mode=True)
+                q_m, w_m, *_ = policy.act(torch.tensor(obs).unsqueeze(0).to(device), cfg, eval_mode=True)
                 Q[ti, j] = float(q_m.item()); Wp[ti, j] = float(w_m.item())
     for name, A in [("Pi_q_heatmap.png", Q), ("Pi_w_heatmap.png", Wp)]:
         plt.figure()
@@ -407,8 +445,7 @@ def make_policy_heatmaps(policy, cfg, outputs, device="cpu"):
         plt.tight_layout()
         plt.savefig(out / name); plt.close()
 
-
-def collect_occupancy(make_env_fn, policy, cfg, outputs, n_paths=300, device="cpu"):
+def collect_occupancy(make_env_fn, policy: PolicyNet, cfg, outputs, n_paths=300, device="cpu"):
     import matplotlib.pyplot as plt
     out = Path(outputs) / "xai"; out.mkdir(parents=True, exist_ok=True)
     hist = np.zeros((50, 50), dtype=np.int32)
@@ -423,7 +460,7 @@ def collect_occupancy(make_env_fn, policy, cfg, outputs, n_paths=300, device="cp
                 j = min(49, max(0, int((Wn/2.0)*50)))  # W in [0,2]
                 hist[i, j] += 1
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                q, w, _, _, _, _ = policy.act(obs_t, cfg, eval_mode=True)
+                q, w, *_ = policy.act(obs_t, cfg, eval_mode=True)
                 obs, r, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
             env.close()
     plt.figure()
@@ -431,11 +468,10 @@ def collect_occupancy(make_env_fn, policy, cfg, outputs, n_paths=300, device="cp
     plt.colorbar(); plt.title("Occupancy (t_norm vs W/W0)")
     plt.tight_layout(); plt.savefig(out / "occupancy.png"); plt.close()
 
-
-def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device="cpu"):
+def replay_tail_paths(make_env_fn, policy: PolicyNet, cfg, outputs, k=8, device="cpu"):
     import matplotlib.pyplot as plt
     out = Path(outputs) / "xai"; out.mkdir(parents=True, exist_ok=True)
-    paths = []
+    paths: List[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
     with torch.no_grad():
         for _ in range(200):
             env = make_env_fn()
@@ -445,14 +481,14 @@ def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device
             while not (done or trunc):
                 Wts.append(float(obs[1]))
                 obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                q, w, _, _, _, _ = policy.act(obs_t, cfg, eval_mode=True)
+                q, w, *_ = policy.act(obs_t, cfg, eval_mode=True)
                 qs.append(float(q.item())); ws.append(float(w.item()))
                 obs, r, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
-            WT = info.get("W_T", float("nan"))
+            WT = _to_f(info.get("W_T", getattr(env, "W", 0.0)), 0.0)
             paths.append((WT, np.array(Wts), np.array(qs), np.array(ws)))
             env.close()
     paths.sort(key=lambda x: x[0])
-    sel = paths[:k]
+    sel = paths[:max(1, int(k))]
     for idx, (WT, Wts, qs, ws) in enumerate(sel):
         t = np.arange(len(Wts))
         plt.figure(); plt.plot(t, Wts); plt.title(f"tail path {idx} WT={WT:.3f}"); plt.tight_layout()
@@ -463,8 +499,10 @@ def replay_tail_paths(make_env_fn, policy, cfg, outputs, k=8, alpha=0.05, device
         plt.savefig(out / f"tail_{idx}_w.png"); plt.close()
 
 
-# ---------- CSV logger ----------
-def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
+# ─────────────────────────────────────────────────────────
+# Trainer-local CSV logger
+# ─────────────────────────────────────────────────────────
+def append_metrics_csv(outputs_dir: str, fields: Dict[str, Any]):
     out_logs = Path(outputs_dir) / "_logs"; out_logs.mkdir(parents=True, exist_ok=True)
     dest = out_logs / "metrics.csv"; write_header = (not dest.exists())
     safe = {k: v for k, v in fields.items()
@@ -476,7 +514,9 @@ def append_metrics_csv(outputs_dir, fields: Dict[str, Any]):
         w.writerow(safe)
 
 
-# ---------- Actor adapter (policy -> (q,w)) ----------
+# ─────────────────────────────────────────────────────────
+# Actor adapter (policy -> (q,w))
+# ─────────────────────────────────────────────────────────
 def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> Callable[[Dict[str, Any]], Tuple[float, float]]:
     T_ref = int(getattr(cfg, "T", 0) or getattr(cfg, "horizon_years", 35) * getattr(cfg, "steps_per_year", 12))
     T_ref = max(T_ref, 1)
@@ -517,14 +557,16 @@ def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> 
     return actor
 
 
-# ---------- Entrypoint ----------
+# ─────────────────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────────────────
 def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_epoch=2048,
              lr=3e-4, gamma=None, gae_lambda=0.95, entropy_coef=0.01, value_coef=0.5,
              max_grad_norm=0.5, device=None) -> Dict[str, Any]:
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ★ robust gamma: cfg.beta가 None/비정상이어도 안전하게 float로 고정
+    # robust gamma: cfg.beta가 None/비정상이어도 안전 고정
     beta_cfg = getattr(cfg, "beta", 0.996)
     try:
         gamma = float(gamma if gamma is not None else (beta_cfg if beta_cfg is not None else 0.996))
@@ -534,12 +576,12 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     def _make_env_local():
         return _GymShim(RetirementEnv(cfg))
 
-    # CVaR dual
-    cvar = DualCVaR(alpha=getattr(cfg, "alpha", 0.95), eta_init=0.0, tau=0.3)
+    # CVaR dual (terminal)
+    cvar = DualCVaR(alpha=float(getattr(cfg, "alpha", 0.95) or 0.95), eta_init=0.0, tau=0.3)
     lambda_term = float(getattr(cfg, "lambda_term", 0.0) or 0.0)
     F_target    = float(getattr(cfg, "F_target", 1.0) or 1.0)
 
-    def cvar_hook(info):
+    def cvar_hook(info: Dict[str, Any]) -> float:
         if lambda_term == 0.0:
             return 0.0
         W_T = info.get("W_T", None)
@@ -548,10 +590,10 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         L = max(F_target - float(W_T), 0.0)
         return - lambda_term * cvar.terminal_penalty(L)
 
-    # Stage-wise CVaR
-    stage_on = bool(getattr(cfg, "cvar_stage_on", False))
-    stage_cvar = DualCVaRStage(alpha=getattr(cfg, "alpha_stage", 0.95), eta_init=0.0, tau=0.3) if stage_on else None
-    cstar_mode = str(getattr(cfg, "cstar_mode", "annuity"))
+    # Stage-wise CVaR (consumption) — cli의 --cvar_stage on/off 와 호환
+    stage_flag = (str(getattr(cfg, "cvar_stage", "off")).lower() == "on") or bool(getattr(cfg, "cvar_stage_on", False))
+    stage_cvar = DualCVaRStage(alpha=float(getattr(cfg, "alpha_stage", 0.95) or 0.95), eta_init=0.0, tau=0.3) if stage_flag else None
+    cstar_mode = str(getattr(cfg, "cstar_mode", "annuity") or "annuity").lower()
 
     # shaping params
     lw_scale       = float(getattr(cfg, "lw_scale", 0.0) or 0.0)
@@ -568,24 +610,26 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
 
     train_t0 = time.perf_counter()
     best_epoch = None
-    for epoch in range(rl_epochs):
+    for epoch in range(int(rl_epochs)):
         eps = teacher_eps0 * (teacher_decay ** epoch)
-        batch = rollout(_make_env_local(), policy, cfg, steps_per_epoch, gamma, gae_lambda,
+        batch = rollout(_make_env_local(), policy, cfg, int(steps_per_epoch), float(gamma), float(gae_lambda),
                         device, cvar_hook, lw_scale, survive_bonus, eps,
                         stage_cvar=stage_cvar, cstar_mode=cstar_mode)
+
+        # normalize adv
         adv = (batch["adv"] - batch["adv"].mean()) / (batch["adv"].std() + 1e-8)
         pi_loss = -(batch["logp"] * adv).mean()
         v_loss  = 0.5 * ((batch["val"] - batch["ret"])**2).mean()
         ent_b   = batch["ent"].mean()
-        loss = pi_loss + value_coef * v_loss - entropy_coef * ent_b
+        loss = pi_loss + float(value_coef) * v_loss - float(entropy_coef) * ent_b
 
         optim_all.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+        nn.utils.clip_grad_norm_(policy.parameters(), float(max_grad_norm))
         optim_all.step()
 
         # update eta using small mean-policy rollouts (terminal CVaR)
-        Ws_tmp = []
+        Ws_tmp: List[float] = []
         for _ in range(8):
             env = _make_env_local()
             obs, _ = env.reset(seed=None)
@@ -593,25 +637,25 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
             with torch.no_grad():
                 while not (done or trunc):
                     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    q, w, _, _, _, _ = policy.act(obs_t, cfg, eval_mode=True)
+                    q, w, *_ = policy.act(obs_t, cfg, eval_mode=True)
                     obs, r, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
             W_T = info.get("W_T", None)
             if W_T is None and hasattr(env, "W"):
                 W_T = float(env.W)
-            Ws_tmp.append(float(W_T)); env.close()
+            Ws_tmp.append(float(_to_f(W_T, 0.0))); env.close()
         if lambda_term > 0.0 and len(Ws_tmp) > 0:
-            Ls = np.maximum(F_target - np.array(Ws_tmp, dtype=np.float64), 0.0)
+            Ls = np.maximum(F_target - np.asarray(Ws_tmp, dtype=np.float64), 0.0)
             cvar.update_eta_with_batch(Ls)
 
         # stage-wise CVaR eta update
-        if stage_on and stage_cvar is not None:
+        if stage_cvar is not None:
             stage_cvar.update_eta_with_batch(batch.get("stage_L", []))
 
     train_t1 = time.perf_counter()
 
     # evaluation (mean-policy)
     eval_t0 = time.perf_counter()
-    metrics_mp = evaluate_mean_policy(_make_env_local, policy, cfg, n_paths=n_paths_eval, device=device)
+    metrics_mp = evaluate_mean_policy(_make_env_local, policy, cfg, n_paths=int(n_paths_eval), device=device)
     eval_t1 = time.perf_counter()
 
     # ---- save checkpoint with minimal hints for later evaluation ----
@@ -622,7 +666,7 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         os.makedirs(out_dir, exist_ok=True)
         ckpt_path = os.path.join(out_dir, "policy.pt")
 
-        # arch inference from actual module
+        # arch inference
         try:
             first = policy.backbone[0]
             obs_dim_save = int(first.in_features)
@@ -663,39 +707,40 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     except Exception:
         ckpt_path = None
 
-    # XAI (optional, best-effort)
+    # XAI (optional)
     if bool(getattr(cfg, "xai_on", True)):
-        try:
+        with contextlib.suppress(Exception):
             make_policy_heatmaps(policy, cfg, outputs, device=device)
             collect_occupancy(_make_env_local, policy, cfg, outputs, n_paths=200, device=device)
             replay_tail_paths(_make_env_local, policy, cfg, outputs, k=6, device=device)
-        except Exception:
-            pass
 
-    # fields to append in trainer-local CSV (safe types only)
+    # trainer-local CSV (best-effort)
     ts = time.strftime("%y%m%dT%H%M%S")
     fields_csv = dict(
         ts=ts, asset=getattr(cfg, "asset", "US"), method="rl", baseline="",
         es_mode="loss", F_target=F_target, w_max=getattr(cfg, "w_max", 1.0),
         hedge_on=getattr(cfg, "hedge_on", False), hedge_mode=getattr(cfg, "hedge_mode", ""),
         hedge_sigma_k=getattr(cfg, "hedge_sigma_k", 0.0), lambda_term=lambda_term,
-        fee_annual=getattr(cfg, "phi_adval", 0.0), floor_on=getattr(cfg, "floor_on", False),
+        fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", 0.0)),
+        floor_on=getattr(cfg, "floor_on", False),
         f_min_real=getattr(cfg, "f_min_real", 0.0),
-        EW=metrics_mp["EW"], ES95=metrics_mp["ES95"], Ruin=metrics_mp["Ruin"], mean_WT=metrics_mp["mean_WT"],
-        seeds=" ".join(map(str, seed_list)), n_paths_eval=n_paths_eval, outputs=str(outputs),
+        EW=metrics_mp.get("EW"), ES95=metrics_mp.get("ES95"),
+        Ruin=metrics_mp.get("Ruin"), mean_WT=metrics_mp.get("mean_WT"),
+        seeds=" ".join(map(str, seed_list)) if seed_list else "",
+        n_paths_eval=int(n_paths_eval), outputs=str(outputs),
         mortality_on=getattr(cfg, "mortality_on", False),
         market_mode=getattr(cfg, "market_mode", "iid"),
-        cvar_stage_on=getattr(cfg, "cvar_stage_on", False),
+        cvar_stage_on=stage_flag,
     )
     append_metrics_csv(outputs, fields_csv)
 
     actor = make_actor_from_policy(policy, cfg, device=device)
 
     return {
-        "EW": metrics_mp["EW"],
-        "ES95": metrics_mp["ES95"],
-        "Ruin": metrics_mp["Ruin"],
-        "mean_WT": metrics_mp["mean_WT"],
+        "EW": metrics_mp.get("EW"),
+        "ES95": metrics_mp.get("ES95"),
+        "Ruin": metrics_mp.get("Ruin"),
+        "mean_WT": metrics_mp.get("mean_WT"),
         "best_epoch": best_epoch,
         "train_time_s": float(train_t1 - train_t0),
         "eval_time_s": float(eval_t1 - eval_t0),

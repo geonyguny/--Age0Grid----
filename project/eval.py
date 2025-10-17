@@ -12,7 +12,8 @@ from typing import Callable, Tuple, Optional, Dict, Any, Union, List
 import numpy as _np
 import pandas as pd
 
-from .env import RetirementEnv
+# ✅ env 패키지 내부 파일 직접 임포트 (init 노출 이슈 방지)
+from .env.retirement_env import RetirementEnv
 
 
 # =========================
@@ -150,7 +151,7 @@ def run_episode(
         W_hist.append(float(env.W))
         C_hist.append(float((info or {}).get("consumption", 0.0)))
 
-        # ruin (separate from death)
+        # ruin (separate from death) — env가 W<=0에서 done 처리하므로 조기 파산 트래킹만 분리
         if env.W <= 0.0 and not done:
             early_hit = True
 

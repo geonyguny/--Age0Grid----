@@ -1,6 +1,5 @@
 ﻿# project/runner/run.py
 from __future__ import annotations
-from project.metrics.es import es95_wealth
 
 import contextlib
 import os
@@ -16,13 +15,11 @@ from .actors import build_actor
 from .annuity_wiring import setup_annuity_overlay
 from .io_utils import ensure_dir, slim_args, do_autosave
 from .logging_filters import silence_stdio
-
-# market CSV loader
 from ..data.loader import load_market_csv
-
-# ??HOTFIX 0-2: 濡쒖뺄 濡ㅼ븘?껋뿉?쒕룄 ?됯?? ?숈씪??Env ?ъ슜(?곹깭 ?ㅼ????꾨뱶 ?듭씪)
-# from ..env import RetirementEnv
 from ..env.retirement_env import RetirementEnv  # type: ignore
+
+# ✅ metrics.csv 기록
+from ..utils.logging_io import write_metrics_csv
 
 
 # --------------------------
@@ -42,19 +39,16 @@ def _fmt_hms(sec: float) -> str:
 # Helpers: parsing mix / hedge
 # --------------------------
 def _parse_alpha_mix(args) -> Tuple[float, float, float]:
-    """
-    慣 ?뚯떛: --alpha_mix "a,b,c" or 媛쒕퀎 --alpha_kr/us/au.
-    ?⑹씠 1???꾨땲硫??먮룞 ?뺢퇋?? 誘몄?????(1/3,1/3,1/3).
-    """
+    """--alpha_mix 'a,b,c' 또는 --alpha_kr/us/au. 없으면 1/3,1/3,1/3."""
     def _as_float(x, default=None):
         try:
             return float(x)
         except Exception:
             return default
 
-    if hasattr(args, "alpha_mix") and args.alpha_mix:
+    if getattr(args, "alpha_mix", None):
         raw = str(args.alpha_mix).replace(" ", "")
-        parts = raw.split(",")
+        parts = [p for p in raw.split(",") if p != ""]
         if len(parts) == 3:
             kr = _as_float(parts[0], 1 / 3)
             us = _as_float(parts[1], 1 / 3)
@@ -70,16 +64,12 @@ def _parse_alpha_mix(args) -> Tuple[float, float, float]:
 
     s = kr + us + au
     if s <= 0:
-        kr = us = au = 1 / 3
-        s = 1.0
+        return (1/3, 1/3, 1/3)
     return (kr / s, us / s, au / s)
 
 
 def _get_fx_hedge_params(args) -> Tuple[float, float]:
-    """
-    h_FX ??[0,1], ???섑뿤吏鍮꾩슜(湲곕낯 0.002=0.2%)
-    CLI???놁쑝硫??띿꽦???놁쓣 ???덉쑝??議곗슜??湲곕낯媛??ъ슜.
-    """
+    """h_FX∈[0,1], fx_hedge_cost 연율(기본 0.002)."""
     h = getattr(args, "h_FX", getattr(args, "h_fx", None))
     try:
         h = float(h)
@@ -91,7 +81,7 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
     try:
         fx_cost_annual = float(fx_cost_annual)
     except Exception:
-        fx_cost_annual = 0.002  # 0.2%p/??
+        fx_cost_annual = 0.002
     return h, fx_cost_annual
 
 
@@ -99,11 +89,7 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
 # Data wiring (with mix & FX hedge)
 # --------------------------
 def _wire_market_data(cfg: SimConfig, args) -> None:
-    """
-    market_mode=bootstrap ??寃쎌슦 CSV 濡쒕뜑瑜??듯빐
-    ?먯떆 ?쒓퀎?댁쓣 cfg??二쇱엯. (硫?곗옄???쇳빀 + ?섑뿤吏 諛섏쁺)
-    """
-    # eval/plot?먯꽌 李몄“???뚮옒洹몃룄 cfg??怨좎젙 二쇱엯
+    """bootstrap이면 CSV를 로드하여 cfg에 시계열/파라미터를 주입."""
     setattr(cfg, "bands", getattr(args, "bands", "on"))
     setattr(cfg, "data_window", getattr(args, "data_window", None))
     setattr(cfg, "use_real_rf", getattr(args, "use_real_rf", "on"))
@@ -114,19 +100,18 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     market_csv = getattr(args, "market_csv", None)
     if not market_csv:
         raise SystemExit(
-            "market_mode=bootstrap ?댁?留?--market_csv 媛 吏?뺣릺吏 ?딆븯?듬땲?? "
-            "?먮뒗 --data_profile(dev|full)???ъ슜?섏꽭??"
+            "market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full)이 필요합니다."
         )
 
     abs_csv = os.path.abspath(market_csv)
     if not os.path.exists(abs_csv):
         cwd = os.getcwd()
         raise SystemExit(
-            "market_csv ?뚯씪??李얠쓣 ???놁뒿?덈떎.\n"
+            "market_csv 파일을 찾을 수 없습니다.\n"
             f"  asked: {market_csv}\n"
             f"  abs:   {abs_csv}\n"
             f"  cwd:   {cwd}\n"
-            "?뚰듃: ?ㅼ젣 ?뚯씪 寃쎈줈瑜?吏?뺥븯嫄곕굹 --data_profile dev|full ???ъ슜?섏꽭??"
+            "힌트: 경로/파일명을 확인하거나 --data_profile dev|full 사용"
         )
 
     blob = load_market_csv(
@@ -137,7 +122,6 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         cache=True,
     )
 
-    # ---- 媛쒕퀎 ?쒓퀎??異붿텧 ----
     ret_kr = blob.get("ret_kr_eq")
     ret_us_l = blob.get("ret_us_eq_krw")
     ret_au = blob.get("ret_gold_krw")
@@ -145,11 +129,8 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     rf_nom = blob.get("rf_nom")
     dates = blob.get("dates")
     cpi = blob.get("cpi")
-
-    # (媛???? FX ?붿닔?듬쪧
     ret_fx = blob.get("ret_fx") or blob.get("ret_fx_usdkrw") or None
 
-    # ---- ?섑뿤吏 泥섎━ (US) ----
     import numpy as np
     steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
     h_fx, fx_cost_ann = _get_fx_hedge_params(args)
@@ -174,12 +155,9 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
 
         lens = [x.shape[0] for x in [kr, us, au] if isinstance(x, np.ndarray)]
         T = min(lens) if len(lens) >= 1 else 0
-        if isinstance(kr, np.ndarray):
-            kr = kr[:T]
-        if isinstance(us, np.ndarray):
-            us = us[:T]
-        if isinstance(au, np.ndarray):
-            au = au[:T]
+        if isinstance(kr, np.ndarray): kr = kr[:T]
+        if isinstance(us, np.ndarray): us = us[:T]
+        if isinstance(au, np.ndarray): au = au[:T]
         mixed = a_kr * kr + a_us * us + a_au * au
 
         setattr(cfg, "alpha_mix", (a_kr, a_us, a_au))
@@ -189,12 +167,7 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     setattr(cfg, "data_dates", dates)
     setattr(cfg, "data_cpi", cpi)
     setattr(cfg, "data_ret_series", mixed)
-
-    if getattr(args, "use_real_rf", "on") == "on":
-        setattr(cfg, "data_rf_series", rf_real)
-    else:
-        setattr(cfg, "data_rf_series", rf_nom)
-
+    setattr(cfg, "data_rf_series", rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom)
     setattr(cfg, "data_ret_kr_eq", ret_kr)
     setattr(cfg, "data_ret_us_eq_krw", ret_us_l)
     setattr(cfg, "data_ret_gold_krw", ret_au)
@@ -217,10 +190,7 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
 
 
 def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
-    """
-    ?ㅼ뼇???뺥깭??policy/agent瑜?(q,w) 諛섑솚 actor(state)->(float,float) 濡??섑븨.
-    state??dict/ndarray 紐⑤몢 ?덉슜 (?뺤콉???먰븯???뺥깭瑜?洹몃?濡??꾨떖).
-    """
+    """policy/agent를 (q,w) 반환 actor(state)로 어댑트."""
     if policy_like is None:
         raise RuntimeError("policy_like is None")
 
@@ -246,9 +216,9 @@ def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
     return _actor
 
 
-# --- evaluate 寃곌낵 ?뺢퇋???좏떥 ---
+# --- evaluate 출력 표준화 ---
 def _normalize_evaluate_output(ret, es_mode: str):
-    """evaluate 諛섑솚??(metrics: dict, extras: dict)濡??뺢퇋??"""
+    """evaluate 반환을 (metrics, extras)로 정규화."""
     metrics, extras = {}, {}
 
     if isinstance(ret, dict):
@@ -261,17 +231,16 @@ def _normalize_evaluate_output(ret, es_mode: str):
         if len(ret) > 2:
             extras["_rest"] = ret[2:]
     else:
-        metrics = {"note": "unexpected evaluate return type", "type": str(type(ret)),
-  'es95_source': es95_source
-}
+        metrics = {"note": "unexpected evaluate return type", "type": str(type(ret))}
 
     if "es_mode" not in metrics:
         metrics["es_mode"] = str(es_mode).lower()
+    metrics.setdefault("es95_source", "computed_in_evaluate")
     return metrics, extras
 
 
 def _call_evaluate(cfg, actor, es_mode: str):
-    """return_paths 吏??鍮꾩???紐⑤몢 ?덉쟾 ?몄텧."""
+    """return_paths 지원 유무에 맞춰 evaluate 호출."""
     try:
         ret = evaluate(cfg, actor, es_mode=str(es_mode).lower(), return_paths=True)
     except TypeError:
@@ -280,15 +249,10 @@ def _call_evaluate(cfg, actor, es_mode: str):
 
 
 # ==========================
-# ?덉쟾??寃쎈줈 ?ы룊媛(濡쒖뺄 濡ㅼ븘??
+# 상태 어댑팅
 # ==========================
 def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: Any) -> _np.ndarray:
-    """
-    ??HOTFIX 0-1: ?뺤콉???꾨떖???곹깭瑜???긽 ndarray([t_norm, W]) 濡?媛뺤젣.
-    - dict: {"t": step_index, "W": wealth} 媛????[t_norm, W]
-    - ndarray: 洹몃?濡?float 諛곗뿴濡?媛뺤젣 罹먯뒪??
-    - 湲고?: [0.0, env.W] ?대갚
-    """
+    """dict/ndarray 상태를 최소 2특징 [t_norm, W]로 정규화."""
     if isinstance(raw_obs, dict):
         T = int(getattr(env, "T", 1) or 1)
         t_idx = float(raw_obs.get("t", 0.0))
@@ -299,40 +263,35 @@ def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: An
         arr = _np.asarray(raw_obs, dtype=float).ravel()
         if arr.size >= 2:
             return arr[:2]
-        # 愿痢≪씠 1李⑥썝留??⑤떎硫?W??env.W 濡?蹂닿컯
         W_now = float(getattr(env, "W", 0.0))
         return _np.asarray([float(arr[0]) if arr.size >= 1 else 0.0, W_now], dtype=float)
-    # 湲고? ?대갚
     return _np.asarray([0.0, float(getattr(env, "W", 0.0))], dtype=float)
 
 
 def _rollout_terminal_wealths(cfg: SimConfig,
                               actor: Callable[[Any], tuple[float, float]],
                               n_paths: int) -> List[float]:
-    """
-    evaluate媛 寃쎈줈瑜???二쇨굅?? ?ㅼ뭡??蹂듭젣 ?섏떖 ??諛⑹뼱?곸쑝濡?吏곸젒 寃쎈줈 ?섑뵆.
-    - ?숈씪 Env ?ъ슜(?곹깭 ?ㅼ????꾨뱶 ?숈씪)
-    - seed瑜??섍린吏 ?딄퀬 reset()留?諛섎났 ???대? path_counter/RNG濡?寃쎈줈 ?ㅼ뼇??
-    - ?곹깭????긽 ndarray([t_norm, W])濡??뺤콉???꾨떖
-    """
+    """빠른 로컬 롤아웃으로 eval_WT 대체/보강."""
     env = RetirementEnv(cfg)
     WTs: List[float] = []
     n_paths = int(max(1, n_paths))
 
     for _ in range(n_paths):
-        env.reset()  # seed ?몄옄 誘몄쟾????寃쎈줈 ?ㅼ뼇?붾뒗 Env ?대????꾩엫
+        env.reset()
         done = False
-        while not done:
+        truncated = False
+        while not (done or truncated):
             raw = env._obs() if hasattr(env, "_obs") else None
             state_nd = _as_ndarray_state(raw, env)
             q, w = actor(state_nd)
-            _, _, done, _, _ = env.step(q, w)
+            # 키워드 인자로 호출(다형성 안전)
+            _, _, done, truncated, _ = env.step(q=q, w=w)
         WTs.append(float(getattr(env, "W", 0.0)))
     return WTs
 
 
 def _looks_degenerate_wt(xs) -> bool:
-    """寃쎈줈 諛곗뿴???녾굅?? ?꾨? ?숈씪/嫄곗쓽 ?숈씪?섎㈃ True."""
+    """WT 분포가 단일값/퇴화하면 True."""
     try:
         arr = _np.asarray(xs, dtype=float).ravel()
         if arr.size <= 1:
@@ -342,50 +301,34 @@ def _looks_degenerate_wt(xs) -> bool:
         return True
 
 
+# ==========================
+# HJB/RULE 공통 실행
+# ==========================
 def run_once(args) -> Dict[str, Any]:
     t_all_0 = time.perf_counter()
 
-    quiet_ctx = (
-        silence_stdio(also_stderr=True)
-        if getattr(args, "quiet", "on") == "on"
-        else contextlib.nullcontext()
-    )
+    quiet_ctx = silence_stdio(also_stderr=True) if str(getattr(args, "quiet", "on")).lower() == "on" else contextlib.nullcontext()
     with quiet_ctx:
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
         time_make_cfg = time.perf_counter() - t0
 
         ensure_dir(args.outputs)
-
-        # tag ??cfg 二쇱엯 (autosave?먯꽌 ?ъ슜)
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
-        t1 = time.perf_counter()
-        _wire_market_data(cfg, args)
-        time_wire_data = time.perf_counter() - t1
-
+        t1 = time.perf_counter(); _wire_market_data(cfg, args); time_wire_data = time.perf_counter() - t1
         t2 = time.perf_counter()
-        ann_enabled = (
-            str(getattr(args, "ann_on", "off")).lower() == "on"
-            and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0
-        )
-        if ann_enabled:
-            setup_annuity_overlay(cfg, args)
+        ann_enabled = (str(getattr(args, "ann_on", "off")).lower() == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
+        if ann_enabled: setup_annuity_overlay(cfg, args)
         time_annuity = time.perf_counter() - t2
 
-        t3 = time.perf_counter()
-        actor = build_actor(cfg, args)
-        time_build_actor = time.perf_counter() - t3
+        t3 = time.perf_counter(); actor = build_actor(cfg, args); time_build_actor = time.perf_counter() - t3
+        t4 = time.perf_counter(); m, extras = _call_evaluate(cfg, actor, es_mode=args.es_mode); time_eval = time.perf_counter() - t4
 
-        t4 = time.perf_counter()
-        m, extras = _call_evaluate(cfg, actor, es_mode=args.es_mode)
-        time_eval = time.perf_counter() - t4
-
-    # ---- 諛⑹뼱???꾩쿂由? eval_WT 蹂댁젙 ----
+    # eval_WT 보강
     extras = extras or {}
     need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
-
     wt_from_eval = extras.get("eval_WT", None)
     if (not isinstance(wt_from_eval, (list, tuple))) or _looks_degenerate_wt(wt_from_eval):
         if need_paths:
@@ -400,24 +343,18 @@ def run_once(args) -> Dict[str, Any]:
             except Exception as _e:
                 extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
 
-    # --- 硫뷀듃由?蹂묓빀: ?곌툑 ?뚯깮 ?뚮씪誘명꽣????긽 湲곕줉(誘몄꽕????0.0) ---
+    # annuity 메타(없으면 0.0)
     if isinstance(m, dict):
         y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
         a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
         P_val = float(getattr(cfg, "ann_P", 0.0) or 0.0)
-        m.update(
-            {
-                "y_ann": y_ann if (y_ann != 0.0) else 0.0,
-                "ann_a_factor": a_fac if (a_fac != 0.0) else 0.0,
-                "a_factor": a_fac if (a_fac != 0.0) else 0.0,
-                "P": P_val if (P_val != 0.0) else 0.0,
-            }
-        )
+        m.update({"y_ann": y_ann if y_ann != 0.0 else 0.0,
+                  "ann_a_factor": a_fac if a_fac != 0.0 else 0.0,
+                  "a_factor": a_fac if a_fac != 0.0 else 0.0,
+                  "P": P_val if P_val != 0.0 else 0.0})
 
-    # 珥??됯? 寃쎈줈 ??蹂닿퀬??
     n_paths_total = len(extras.get("eval_WT", [])) or (
-        getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0))
-        * len(getattr(cfg, "seeds", []))
+        getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) * len(getattr(cfg, "seeds", []))
     )
 
     time_total = time.perf_counter() - t_all_0
@@ -444,11 +381,25 @@ def run_once(args) -> Dict[str, Any]:
         es_mode=args.es_mode,
         n_paths=int(n_paths_total),
         args=slim_args(args),
-        extra=extras,  # 寃쎈줈 ??遺媛?뺣낫 (CSV?먮뒗 ???????
+        extra=extras,
         timing=timing,
         time_total_s=timing["total_s"],
         time_total_hms=timing["total_hms"],
     )
+
+    # ✅ metrics.csv 기록 (항상)
+    metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
+    meta = {
+        "tag": getattr(args, "tag", None),
+        "method": args.method,
+        "asset": getattr(cfg, "asset", None),
+        "outputs_abs": os.path.abspath(args.outputs),
+        "time_total_hms": timing["total_hms"],
+    }
+    try:
+        write_metrics_csv(metrics_csv, args, out, meta=meta)
+    except Exception:
+        pass
 
     if getattr(args, "autosave", "off") == "on":
         do_autosave(m, cfg, args, out)
@@ -456,30 +407,25 @@ def run_once(args) -> Dict[str, Any]:
     return out
 
 
+# ==========================
+# RL
+# ==========================
 def _maybe_load_actor_from_ckpt(
     ckpt_path: Optional[str],
     cfg_hint: Optional[Any],
 ) -> Optional[Callable[[Any], tuple[float, float]]]:
-    """
-    trainer媛 actor/policy瑜?吏곸젒 ??二쇰뒗 寃쎌슦 ckpt?먯꽌 濡쒕뵫 ?쒕룄.
-    ?곗꽑 project/trainer/policy_io.load_policy_as_actor(ckpt, cfg_hint)瑜??쒕룄?섍퀬
-    ?ㅽ뙣 ??怨쇨굅/???濡쒕뜑?ㅼ쓣 ?쒖감?곸쑝濡??쒕룄.
-    """
+    """체크포인트에서 actor 로드(가능한 모든 로더 시도)."""
     if not ckpt_path:
         return None
 
-    # 理쒖떊 濡쒕뜑 ?곗꽑 (cfg ?뚰듃 ?꾨떖)
     try:
         from ..trainer.policy_io import load_policy_as_actor  # type: ignore
-        t0 = time.perf_counter()
-        actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)  # ???쒓렇?덉쿂
-        _ = time.perf_counter() - t0
+        actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)
         if callable(actor):
             return actor
     except Exception:
         pass
 
-    # 援щ쾭???泥?濡쒕뜑 ?꾨낫
     loaders = [
         ("..trainer.policy_io", "load_policy_as_actor"),
         ("..trainer.policy_io", "load_actor"),
@@ -493,10 +439,10 @@ def _maybe_load_actor_from_ckpt(
             modobj = importlib.import_module(mod, package=__package__)
             loader = getattr(modobj, attr)
             try:
-                policy_like = loader(ckpt_path, cfg_hint)  # cfg_hint 吏??濡쒕뜑
+                policy_like = loader(ckpt_path, cfg_hint)  # cfg_hint 지원
             except TypeError:
-                policy_like = loader(ckpt_path)  # 援ы삎 ?쒓렇?덉쿂
-            return _to_actor(policy_like)  # actor/policy-like 紐⑤몢 吏??
+                policy_like = loader(ckpt_path)
+            return _to_actor(policy_like)
         except Exception:
             continue
     return None
@@ -505,27 +451,19 @@ def _maybe_load_actor_from_ckpt(
 def run_rl(args):
     t_all_0 = time.perf_counter()
 
-    # RL???숈씪?섍쾶 cfg 二쇱엯 ??trainer ?대? Env ?앹꽦 ???ㅻ뜲?댄꽣 ?ъ슜
     t0 = time.perf_counter()
     cfg: SimConfig = make_cfg(args)
     time_make_cfg = time.perf_counter() - t0
 
     ensure_dir(args.outputs)
-
     if getattr(args, "tag", None) is not None:
         setattr(cfg, "tag", args.tag)
 
-    t1 = time.perf_counter()
-    _wire_market_data(cfg, args)
-    time_wire_data = time.perf_counter() - t1
+    t1 = time.perf_counter(); _wire_market_data(cfg, args); time_wire_data = time.perf_counter() - t1
 
-    ann_enabled = (
-        str(getattr(args, "ann_on", "off")).lower() == "on"
-        and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0
-    )
+    ann_enabled = (str(getattr(args, "ann_on", "off")).lower() == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
     t2 = time.perf_counter()
-    if ann_enabled:
-        setup_annuity_overlay(cfg, args)
+    if ann_enabled: setup_annuity_overlay(cfg, args)
     time_annuity = time.perf_counter() - t2
 
     try:
@@ -578,13 +516,7 @@ def run_rl(args):
     if actor is not None:
         try:
             metrics_dict, extras_dict = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
-            metrics_dict.update(
-                {
-                    "best_epoch": best_epoch,
-                    "train_time_s": train_time_s,
-                    "eval_time_s": eval_time_s,
-                }
-            )
+            metrics_dict.update({"best_epoch": best_epoch, "train_time_s": train_time_s, "eval_time_s": eval_time_s})
             metrics_dict.setdefault("es95_source", "computed_in_evaluate")
         except Exception as e:
             metrics_dict = {
@@ -634,8 +566,7 @@ def run_rl(args):
         F_target=getattr(cfg, "F_target", None),
         es_mode=getattr(args, "es_mode", "wealth"),
         n_paths=n_paths_total,
-        args=slim_args(args)
-        | {
+        args=slim_args(args) | {
             "rl_q_cap": getattr(args, "rl_q_cap", None),
             "teacher_eps0": getattr(args, "teacher_eps0", None),
             "teacher_decay": getattr(args, "teacher_decay", None),
@@ -647,14 +578,27 @@ def run_rl(args):
             "h_FX": getattr(cfg, "h_FX", None),
         },
         ckpt_path=ckpt_path,
-        extra=extras_dict,   # ?ш린 ?덉뿉 eval_WT ??寃쎈줈 ?뺣낫媛 ?ы븿?????덉쓬
+        extra=extras_dict,
         timing=timing,
         time_total_s=timing["total_s"],
         time_total_hms=timing["total_hms"],
     )
 
+    # ✅ metrics.csv 기록 (항상)
+    metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
+    meta = {
+        "tag": getattr(args, "tag", None),
+        "method": "rl",
+        "asset": getattr(cfg, "asset", None),
+        "outputs_abs": os.path.abspath(args.outputs),
+        "time_total_hms": timing["total_hms"],
+    }
+    try:
+        write_metrics_csv(metrics_csv, args, out, meta=meta)
+    except Exception:
+        pass
+
     if getattr(args, "autosave", "off") == "on":
         do_autosave(out.get("metrics") or {}, cfg, args, out)
 
     return out
-

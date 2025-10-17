@@ -6,6 +6,7 @@ import argparse
 import os
 import pandas as pd
 import numpy as np
+
 from project.metrics.es import es95_wealth
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -28,7 +29,7 @@ def parse_args():
     ap.add_argument("--in", dest="inp", required=True, help="metrics.csv 寃쎈줈")
     ap.add_argument("--outdir", default="outputs/paper_main/reports", help="由ы룷??異쒕젰 ?대뜑")
     ap.add_argument("--alpha", type=float, default=0.95, help="ES ?좊ː?섏? ?쒓린(湲곕줉??")
-    ap.add_argument("--topn", type=int, default=20, help="Top N ?섏씠?쇱씠??)
+    ap.add_argument("--topn", type=int, default=20, help="Top N ?섏씠?쇱씠??")
     ap.add_argument("--es_cap", type=float, default=None, help="ES95 ?곹븳(?꾪꽣)")
     return ap.parse_args()
 
