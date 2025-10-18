@@ -86,6 +86,55 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
 
 
 # --------------------------
+# Market meta injection
+# --------------------------
+def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
+    """cfg/meta/args의 시장 관련 정보를 out/metrics/meta에 주입."""
+    if not isinstance(out_dict, dict):
+        return
+    # 1) 확보
+    market_mode = str(getattr(cfg, "market_mode", "iid") or "iid").lower()
+    bootstrap_block = int(getattr(cfg, "bootstrap_block", 24) or 24)
+    use_real_rf = str(getattr(cfg, "use_real_rf", "on") or "on").lower()
+    data_window = getattr(cfg, "data_window", None)
+    market_meta_from_cfg = getattr(cfg, "meta", {}).get("market", {}) if getattr(cfg, "meta", None) else {}
+    market_csv = getattr(args, "market_csv", None)
+    data_profile = getattr(args, "data_profile", None)
+
+    # 2) out.meta 보강
+    meta = out_dict.setdefault("meta", {})
+    meta_market = dict(market_meta_from_cfg) if isinstance(market_meta_from_cfg, dict) else {}
+    meta_market.update({
+        "mode": market_mode,
+        "bootstrap_block": bootstrap_block,
+        "use_real_rf": use_real_rf,
+        "data_window": data_window or "",
+        "market_csv": os.path.abspath(market_csv) if market_csv else "",
+        "data_profile": data_profile or "",
+    })
+    meta["market"] = meta_market
+    out_dict["meta"] = meta
+
+    # 3) metrics 보강(평탄화된 칼럼으로 — metrics.csv 유도)
+    metrics = out_dict.get("metrics")
+    if isinstance(metrics, dict):
+        metrics.setdefault("market_mode", market_mode)
+        metrics.setdefault("bootstrap_block", bootstrap_block)
+        metrics.setdefault("use_real_rf", use_real_rf)
+        metrics.setdefault("data_window", data_window or "")
+        metrics.setdefault("market_csv", meta_market["market_csv"])
+        metrics.setdefault("data_profile", data_profile or "")
+
+    # 4) 조용하지 않으면 한 줄 출력
+    if str(getattr(args, "quiet", "on")).lower() != "on":
+        try:
+            print(f"[market] mode={market_mode}, block={bootstrap_block}, use_real_rf={use_real_rf}, "
+                  f"window='{data_window or ''}', profile='{data_profile or ''}', csv='{market_csv or ''}'")
+        except Exception:
+            pass
+
+
+# --------------------------
 # Data wiring (with mix & FX hedge)
 # --------------------------
 def _wire_market_data(cfg: SimConfig, args) -> None:
@@ -387,6 +436,9 @@ def run_once(args) -> Dict[str, Any]:
         time_total_hms=timing["total_hms"],
     )
 
+    # 🔗 시장 메타/플래그 주입
+    _inject_market_meta(cfg, args, out)
+
     # ✅ metrics.csv 기록 (항상)
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
@@ -395,6 +447,11 @@ def run_once(args) -> Dict[str, Any]:
         "asset": getattr(cfg, "asset", None),
         "outputs_abs": os.path.abspath(args.outputs),
         "time_total_hms": timing["total_hms"],
+        # 일부 시장 메타 요약
+        "market_mode": getattr(cfg, "market_mode", None),
+        "bootstrap_block": getattr(cfg, "bootstrap_block", None),
+        "use_real_rf": getattr(cfg, "use_real_rf", None),
+        "data_window": getattr(cfg, "data_window", None),
     }
     try:
         write_metrics_csv(metrics_csv, args, out, meta=meta)
@@ -584,6 +641,9 @@ def run_rl(args):
         time_total_hms=timing["total_hms"],
     )
 
+    # 🔗 시장 메타/플래그 주입
+    _inject_market_meta(cfg, args, out)
+
     # ✅ metrics.csv 기록 (항상)
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
@@ -592,6 +652,11 @@ def run_rl(args):
         "asset": getattr(cfg, "asset", None),
         "outputs_abs": os.path.abspath(args.outputs),
         "time_total_hms": timing["total_hms"],
+        # 일부 시장 메타 요약
+        "market_mode": getattr(cfg, "market_mode", None),
+        "bootstrap_block": getattr(cfg, "bootstrap_block", None),
+        "use_real_rf": getattr(cfg, "use_real_rf", None),
+        "data_window": getattr(cfg, "data_window", None),
     }
     try:
         write_metrics_csv(metrics_csv, args, out, meta=meta)

@@ -5,6 +5,9 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# NEW: schema validator
+from project.data.schema_checks import assert_market_csv_valid
+
 REQUIRED_MIN = ["date", "ret_kr_eq", "cpi_kr", "rf_kr_nom"]
 _WINDOW_RE = re.compile(r"^(?:\d{4}-\d{2})?:(?:\d{4}-\d{2})?$")
 
@@ -107,9 +110,15 @@ def load_market_csv(
       - 수익률은 0.01 = +1%
       - CPI는 지수/률 모두 허용(자동 판별)
       - KRW 환산: (1+r_usd)*(1+fx) - 1
+      - use_real_rf: "on"이면 rf_real ≈ rf_nom - cpi_rate, "off"이면 rf_real = rf_nom 유지
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"market_csv not found: {path}")
+
+    # 0) 스키마 사전 검증(파일 단위) — 에러 시 명확한 메시지로 실패
+    #    기본 required_cols: ['risky_nom','tbill_nom','cpi']지만
+    #    본 파이프라인의 v1 필수는 REQUIRED_MIN로도 재체크한다.
+    assert_market_csv_valid(path, required_cols=["ret_kr_eq", "cpi_kr", "rf_kr_nom"], date_col="date")
 
     cache_dir = os.path.join(os.path.dirname(path), "_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -127,7 +136,7 @@ def load_market_csv(
     df = pd.read_csv(path)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 필수 헤더 확인
+    # 필수 헤더 확인(로더 층에서도 재확인)
     for c in REQUIRED_MIN:
         if c not in df.columns:
             raise ValueError(f"CSV 누락컬럼: '{c}' (필수: {REQUIRED_MIN})")
@@ -172,11 +181,16 @@ def load_market_csv(
     cpi_col  = _as_float_col(df, "cpi_kr")
     cpi_rate = _to_monthly_rate_like(cpi_col)  # CPI 월간률
     rf_nom   = _as_float_col(df, "rf_kr_nom")
+
+    # use_real_rf 스위치: on → 실질 근사, off → 명목 그대로
+    use_real_flag = str(use_real_rf).lower().strip() in ("on", "true", "1", "yes", "y")
     if "rf_kr_real" in df.columns:
-        rf_real = _as_float_col(df, "rf_kr_real")
+        rf_real_src = _as_float_col(df, "rf_kr_real")
+        rf_real = rf_real_src if use_real_flag else rf_nom
     else:
-        # 실질 근사: rf_real ≈ rf_nom - cpi_rate  (log 근사 X, 단순 차감)
-        rf_real = np.nan_to_num(rf_nom, nan=0.0) - np.nan_to_num(cpi_rate, nan=0.0)
+        # 실질 근사: rf_real ≈ rf_nom - cpi_rate (log 근사 X, 단순 차감)
+        approx_real = np.nan_to_num(rf_nom, nan=0.0) - np.nan_to_num(cpi_rate, nan=0.0)
+        rf_real = approx_real if use_real_flag else rf_nom
 
     # --- 자산 선택 (레거시 호환용 ret_asset) ---
     asset_u = str(asset).upper().strip()
@@ -202,8 +216,8 @@ def load_market_csv(
         "ret_gold_krw": np.nan_to_num(ret_gold_krw, nan=0.0).astype(float),
         "rf_nom": np.nan_to_num(rf_nom, nan=0.0).astype(float),
         "rf_real": np.nan_to_num(rf_real, nan=0.0).astype(float),
-        "cpi": np.nan_to_num(cpi_col, nan=0.0).astype(float),      # 원본 CPI 열(지수/률 혼재 가능)
-        "cpi_rate": np.nan_to_num(cpi_rate, nan=0.0).astype(float),# CPI 월간률
+        "cpi": np.nan_to_num(cpi_col, nan=0.0).astype(float),       # 원본 CPI 열(지수/률 혼재 가능)
+        "cpi_rate": np.nan_to_num(cpi_rate, nan=0.0).astype(float), # CPI 월간률
         "ret_fx": (np.nan_to_num(fx_ret, nan=0.0).astype(float) if fx_ret is not None
                    else np.full(len(df), np.nan, dtype=float)),
         "ret_fx_usdkrw": (np.nan_to_num(fx_ret, nan=0.0).astype(float) if fx_ret is not None

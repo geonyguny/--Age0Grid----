@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any, Iterable, Sequence, Tuple
 import numpy as _np
+import re as _re
 
 from ..config import SimConfig, ASSET_PRESETS
 from .helpers import auto_eta_grid
@@ -9,6 +10,8 @@ from .helpers import auto_eta_grid
 # -------------------------
 # small helpers
 # -------------------------
+_WINDOW_RE = _re.compile(r"^(?:\d{4}-\d{2})?:(?:\d{4}-\d{2})?$")
+
 def _get(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
@@ -86,6 +89,51 @@ def _choose_n_paths_eval(args, default_val: int = 100) -> int:
     if n <= 0:
         n = default_val
     return int(n)
+
+def _norm_onoff(x: Any, default: str = "off") -> str:
+    s = str(x if x is not None else default).strip().lower()
+    if s in ("on", "true", "1", "yes", "y"):  return "on"
+    if s in ("off", "false", "0", "no", "n"): return "off"
+    # 알 수 없는 입력은 기본값으로 폴백
+    return default
+
+def _validate_data_window(win: Any) -> str | None:
+    if win is None or str(win).strip() == "":
+        return None
+    s = str(win).strip()
+    if not _WINDOW_RE.match(s):
+        raise ValueError(f"--data_window 형식 오류: '{win}' (예: 1999-01:2024-12, '1999-01:', ':2024-12')")
+    return s
+
+def _normalize_market_flags(cfg: SimConfig) -> None:
+    # market_mode
+    mode_raw = str(getattr(cfg, "market_mode", "iid") or "iid").strip().lower()
+    if mode_raw not in ("iid", "bootstrap"):
+        raise ValueError(f"[cfg] market_mode must be 'iid' or 'bootstrap' (got '{mode_raw}')")
+    cfg.market_mode = mode_raw
+
+    # bootstrap_block
+    bb = int(getattr(cfg, "bootstrap_block", 24) or 24)
+    if bb <= 0:
+        bb = 24
+    cfg.bootstrap_block = bb
+
+    # use_real_rf
+    cfg.use_real_rf = _norm_onoff(getattr(cfg, "use_real_rf", "on"), default="on")
+
+    # data_window
+    cfg.data_window = _validate_data_window(getattr(cfg, "data_window", None))
+
+    # cfg.meta.market 주입(리포팅/로깅용)
+    meta = getattr(cfg, "meta", {}) or {}
+    meta_market = {
+        "mode": cfg.market_mode,
+        "bootstrap_block": cfg.bootstrap_block,
+        "use_real_rf": cfg.use_real_rf,
+        "data_window": cfg.data_window or "",
+    }
+    meta["market"] = meta_market
+    cfg.meta = meta
 
 # -------------------------
 # build
@@ -208,5 +256,8 @@ def make_cfg(args) -> SimConfig:
 
     # 8) ETA grid 자동 구성
     auto_eta_grid(cfg, requested_n=_get(args, "hjb_eta_n", None))
+
+    # 9) 시장 플래그/윈도 검증 및 메타 주입
+    _normalize_market_flags(cfg)
 
     return cfg

@@ -31,7 +31,8 @@ CSV_FIELDS = [
     "best_epoch", "train_time_s", "eval_time_s",
     "y_ann", "a_factor", "P",
     "fee_annual", "w_max", "horizon_years",
-    "market_mode", "market_csv", "data_window", "use_real_rf",
+    # market/meta
+    "market_mode", "bootstrap_block", "market_csv", "data_window", "use_real_rf", "data_profile",
     "bands", "outputs",
     "seeds", "n_paths",
     # RL 파라미터
@@ -41,9 +42,13 @@ CSV_FIELDS = [
     "survive_bonus", "u_scale", "lw_scale",
     # Hedge / mortality / annuity
     "hedge", "hedge_mode", "hedge_sigma_k", "hedge_cost", "hedge_tx",
-    "mortality", "ann_on", "ann_alpha", "ann_L", "ann_d", "ann_index",
+    "mortality", "mort_table", "age0", "sex",
+    "ann_on", "ann_alpha", "ann_L", "ann_d", "ann_index",
+    "bequest_kappa", "bequest_gamma",
     # 산출물
     "ckpt_path",
+    # (옵션) 사망 통계
+    "death_count", "death_rate",
 ]
 
 
@@ -139,10 +144,13 @@ def append_metrics_csv(path: str, payload: Dict[str, Any]) -> None:
         "w_max": payload.get("w_max"),
         "horizon_years": payload.get("horizon_years"),
 
-        "market_mode": (args.get("market_mode") if isinstance(args, dict) else None),
-        "market_csv": (args.get("market_csv") if isinstance(args, dict) else None),
-        "data_window": (args.get("data_window") if isinstance(args, dict) else None),
-        "use_real_rf": (args.get("use_real_rf") if isinstance(args, dict) else None),
+        # market/meta
+        "market_mode": metrics.get("market_mode") or (args.get("market_mode") if isinstance(args, dict) else None),
+        "bootstrap_block": metrics.get("bootstrap_block") or (args.get("bootstrap_block") if isinstance(args, dict) else None),
+        "market_csv": metrics.get("market_csv") or (args.get("market_csv") if isinstance(args, dict) else None),
+        "data_window": metrics.get("data_window") or (args.get("data_window") if isinstance(args, dict) else None),
+        "use_real_rf": metrics.get("use_real_rf") or (args.get("use_real_rf") if isinstance(args, dict) else None),
+        "data_profile": metrics.get("data_profile") or (args.get("data_profile") if isinstance(args, dict) else None),
 
         "bands": (args.get("bands") if isinstance(args, dict) else None),
         "outputs": (args.get("outputs") if isinstance(args, dict) else None),
@@ -172,14 +180,24 @@ def append_metrics_csv(path: str, payload: Dict[str, Any]) -> None:
         "hedge_cost": (args.get("hedge_cost") if isinstance(args, dict) else None),
         "hedge_tx": (args.get("hedge_tx") if isinstance(args, dict) else None),
 
+        # mortality/annuity
         "mortality": (args.get("mortality") if isinstance(args, dict) else None),
+        "mort_table": (args.get("mort_table") if isinstance(args, dict) else None),
+        "age0": (args.get("age0") if isinstance(args, dict) else None),
+        "sex": (args.get("sex") if isinstance(args, dict) else None),
         "ann_on": (args.get("ann_on") if isinstance(args, dict) else None),
         "ann_alpha": (args.get("ann_alpha") if isinstance(args, dict) else None),
         "ann_L": (args.get("ann_L") if isinstance(args, dict) else None),
         "ann_d": (args.get("ann_d") if isinstance(args, dict) else None),
         "ann_index": (args.get("ann_index") if isinstance(args, dict) else None),
+        "bequest_kappa": (args.get("bequest_kappa") if isinstance(args, dict) else None),
+        "bequest_gamma": (args.get("bequest_gamma") if isinstance(args, dict) else None),
 
         "ckpt_path": payload.get("ckpt_path"),
+
+        # (옵션) 사망 통계(있으면 기록)
+        "death_count": metrics.get("death_count"),
+        "death_rate": metrics.get("death_rate"),
     }
 
     # 직렬화 안전 변환

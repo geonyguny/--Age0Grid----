@@ -289,38 +289,83 @@ def plot_risk_return(df_rep: pd.DataFrame, baselines: list[str], hjb_EW: float, 
     save_fig(fig, os.path.join(OR, "fig_risk_return.png"))
 
 
-def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|None):
-    fig, ax = plt.subplots(figsize=(8,4))
-    fig_path = os.path.join(OR, "fig_ruin_bar.png")
+def _compute_frontier(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    단순 프런티어(ES 오름차순 정렬 후 EW의 상향 누적 최대점).
+    입력은 ES95_avg/EW_avg가 있는 df (rule/HJB/RL 혼합 가능).
+    """
+    d = df.dropna(subset=["ES95_avg", "EW_avg"]).copy()
+    if len(d) == 0:
+        return d
+    d = d.sort_values("ES95_avg")  # 위험(작을수록 좋음) 기준
+    ew_best = []
+    cur_max = -np.inf
+    for x in d["EW_avg"].values:
+        cur_max = max(cur_max, x)
+        ew_best.append(cur_max)
+    d["_ew_cummax"] = ew_best
+    # 프런티어 점(해당 위험수준에서 EW가 누적 최대를 갱신한 점들만 남김)
+    d_front = d.loc[d["EW_avg"] >= d["_ew_cummax"] - 1e-12].copy()
+    d_front = d_front.drop(columns=["_ew_cummax"])
+    return d_front
 
-    w_order = ["w_0", "w_0_3", "w_0_5", "w_0_7", "w_1", "NA"]
-    d_rule = df_rep.query("method=='rule' and w_fixed!='NA'").copy()
 
-    if len(d_rule) > 0 and "Ruin_avg" in d_rule.columns:
-        pivot = d_rule.pivot_table(
-            index="w_fixed", columns="baseline", values="Ruin_avg", aggfunc="first", observed=False
-        )
-        exist = [w for w in w_order if w in pivot.index]
-        if len(exist) > 0:
-            pivot = pivot.reindex(index=exist)
-            pivot.plot(kind="bar", ax=ax)
+def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|None):
+    """
+    EW–ES frontier(규범적 효율면). rule/HJB/RL을 색/마커로 구분.
+    - HJB/RL은 단일점 또는 소수 점일 수 있음.
+    - rule은 w_fixed 라벨을 함께 표시.
+    """
+    fig, ax = plt.subplots(figsize=(7,6))
 
-            all_zero = np.all(np.nan_to_num(pivot.to_numpy(), nan=0.0) == 0.0)
-            if all_zero:
-                annotate_center(ax, "No Ruin Observed (all runs had Ruin = 0)", sub_hint)
-        else:
-            ax.set_xticks(range(len(w_order))); ax.set_xticklabels(w_order, rotation=90)
-            annotate_center(ax, "No Data Available (no rule rows after filtering)", sub_hint)
+    # 방법별 색/마커(고정 색 지정은 피함; 기본 팔레트 사용)
+    styles = {
+        "rule": dict(marker="o", linestyle="none", alpha=0.85),
+        "hjb":  dict(marker="*", linestyle="none", s=120),
+        "rl":   dict(marker="^", linestyle="none"),
+    }
+
+    # 전체 점
+    any_points = False
+    for m in ["rule", "hjb", "rl"]:
+        d = df_rep.loc[df_rep["method"].str.lower() == m].dropna(subset=["ES95_avg","EW_avg"]).copy()
+        if len(d) == 0:
+            continue
+        any_points = True
+        if m == "rule":
+            ax.scatter(d["ES95_avg"], d["EW_avg"], label="rule", **{k:v for k,v in styles["rule"].items() if k!="s"})
+            # 라벨(가독성 위해 소형)
+            for _, r in d.iterrows():
+                lbl = str(r.get("w_fixed","")).replace("w_","").replace("_",".")
+                if lbl and lbl != "NA":
+                    ax.annotate(lbl, (r["ES95_avg"], r["EW_avg"]), fontsize=7, alpha=0.7)
+        elif m == "hjb":
+            ax.scatter(d["ES95_avg"], d["EW_avg"], label="HJB", **styles["hjb"])
+        elif m == "rl":
+            ax.scatter(d["ES95_avg"], d["EW_avg"], label="RL", **styles["rl"])
+
+    # 프런티어(모든 방법 합산 후 계산)
+    d_all = df_rep.dropna(subset=["ES95_avg","EW_avg"]).copy()
+    if len(d_all) > 0:
+        fr = _compute_frontier(d_all)
     else:
-        ax.set_xticks(range(len(w_order))); ax.set_xticklabels(w_order, rotation=90)
-        annotate_center(ax, "No Data Available (no rule rows)", sub_hint)
+        fr = pd.DataFrame(columns=["ES95_avg","EW_avg"])
 
-    ax.set_ylabel("Ruin Probability"); ax.set_title("Ruin by w_fixed and baseline"); ax.set_xlabel("w_fixed")
-    ax.set_ylim(bottom=0)
-    fig.tight_layout()
-    if center_msg:
-        annotate_center(ax, center_msg, sub_hint)
-    save_fig(fig, fig_path)
+    if len(fr) == 0 or not any_points:
+        overlay_message(fig, ax, "EW–ES Frontier",
+                        "No data to visualize" if not any_points else "Single-point result (frontier undefined)",
+                        sub_hint, keep_axes=True)
+    else:
+        fr = fr.sort_values("ES95_avg")
+        ax.plot(fr["ES95_avg"], fr["EW_avg"], linewidth=2.0, label="Frontier")
+        ax.set_xlabel("ES95 (lower better)"); ax.set_ylabel("EW (higher better)")
+        ax.set_title("EW–ES Frontier")
+        ax.legend()
+        fig.tight_layout()
+        if center_msg:
+            annotate_center(ax, center_msg, sub_hint)
+
+    save_fig(fig, os.path.join(OR, "fig_frontier_EW_ES.png"))
 
 # ─────────────────────────────────────────────────────────
 # E) LaTeX 테이블
@@ -338,7 +383,7 @@ def save_latex_table(df_rep: pd.DataFrame, OR: str):
 # ─────────────────────────────────────────────────────────
 # F) overlay 문구 자동 생성 (가능하면 요약)
 # ─────────────────────────────────────────────────────────
-def build_auto_center_msg(df_rep: pd.DataFrame, or_name: str) -> str:
+def build_auto_center_msg(df_rep: pd.DataFrame, or_name: str, market_hint: str = "") -> str:
     # 대표값들 추출
     mset = sorted([m for m in df_rep["method"].dropna().astype(str).str.upper().unique() if m])
     bset = sorted([b for b in df_rep["baseline"].dropna().astype(str).unique() if b])
@@ -348,7 +393,29 @@ def build_auto_center_msg(df_rep: pd.DataFrame, or_name: str) -> str:
     if mset: parts.append(f"Method={','.join(mset)}")
     if bset: parts.append(f"Baseline={','.join(bset)}")
     if wvals: parts.append(f"w={','.join([v.replace('w_','').replace('_','.') for v in wvals])}")
+    if market_hint: parts.append(market_hint)
     return "\n".join(parts)
+
+def market_meta_hint(df_cln: pd.DataFrame) -> str:
+    """
+    night_summary_clean.csv 안의 메타(가능하면) 요약 문자열 생성.
+    우선순위: market_mode/use_real_rf/data_window/bootstrap_block.
+    """
+    cols = [c for c in df_cln.columns]
+    def _first(col):
+        if col in cols and df_cln[col].notna().any():
+            return str(df_cln[col].dropna().iloc[0])
+        return ""
+    mode = _first("market_mode")
+    use_real = _first("use_real_rf")
+    win = _first("data_window")
+    blk = _first("bootstrap_block")
+    pieces = []
+    if mode: pieces.append(f"mode={mode}")
+    if blk:  pieces.append(f"block={blk}")
+    if use_real: pieces.append(f"use_real_rf={use_real}")
+    if win:  pieces.append(f"window={win}")
+    return (" | " + ", ".join(pieces)) if pieces else ""
 
 # ─────────────────────────────────────────────────────────
 # G) main
@@ -362,6 +429,10 @@ def main():
                     help="중앙 오버레이에 강제로 표시할 커스텀 텍스트(줄바꿈 \\n 가능). 비우면 자동 요약.")
     ap.add_argument("--keep_axes_on_empty", choices=["on","off"], default="on",
                     help="데이터 부족/단일점일 때도 축을 유지할지 (요청 반영; 기본 on)")
+    ap.add_argument("--frontier", choices=["on","off"], default="on",
+                    help="EW–ES 프런티어 그림 생성 여부 (기본 on)")
+    ap.add_argument("--save_md", choices=["on","off"], default="on",
+                    help="간단 요약 .md 저장 (기본 on)")
     args = ap.parse_args()
 
     OR, used_latest = resolve_outroot(args.outroot)
@@ -374,11 +445,13 @@ def main():
     df_rep, baselines, hjb_EW, hjb_ES = normalize_labels(df_rep)
 
     or_name = pathlib.Path(OR).name
-    sub_hint = f"OutRoot={or_name}"
+    mkt_hint = market_meta_hint(df_cln)
+    sub_hint = f"OutRoot={or_name}{mkt_hint}"
 
     # 중앙 오버레이 문구
     if args.overlay == "on":
-        center_msg = args.overlay_text.strip() if args.overlay_text else build_auto_center_msg(df_rep, or_name)
+        base_msg = args.overlay_text.strip()
+        center_msg = base_msg if base_msg else build_auto_center_msg(df_rep, or_name, market_hint=mkt_hint.strip(" |"))
     else:
         center_msg = None
 
@@ -386,15 +459,43 @@ def main():
     plot_ew_vs_w(df_rep, baselines, hjb_EW, OR, sub_hint, center_msg)
     plot_es_vs_w(df_rep, baselines, hjb_ES, OR, sub_hint, center_msg)
     plot_risk_return(df_rep, baselines, hjb_EW, hjb_ES, OR, sub_hint, center_msg)
-    plot_ruin_bar(df_rep, OR, sub_hint, center_msg)
+    if args.frontier == "on":
+        plot_frontier(df_rep, OR, sub_hint, center_msg)
 
     # LaTeX
     latex_path = save_latex_table(df_rep, OR)
 
+    # (선택) 요약 .md
+    if args.save_md == "on":
+        md_path = os.path.join(OR, "report_quick.md")
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(f"# Quick Report — {or_name}\n\n")
+                f.write(f"- Market: {mkt_hint.strip(' |') or 'N/A'}\n")
+                # 대표 결과(있으면) 간단 첨부
+                try:
+                    hjb = df_rep.loc[df_rep["method"].str.lower()=="hjb"].head(1)
+                    rl = df_rep.loc[df_rep["method"].str.lower()=="rl"].head(1)
+                    if len(hjb):
+                        f.write(f"- HJB: EW={hjb['EW_avg'].iloc[0]:.4f}, ES95={hjb['ES95_avg'].iloc[0]:.4f}\n")
+                    if len(rl):
+                        f.write(f"- RL : EW={rl['EW_avg'].iloc[0]:.4f}, ES95={rl['ES95_avg'].iloc[0]:.4f}\n")
+                except Exception:
+                    pass
+                f.write("\n## Artifacts\n")
+                for fn in ["fig_EW_vs_w_fixed.png","fig_ES95_vs_w_fixed.png","fig_risk_return.png","fig_frontier_EW_ES.png","fig_ruin_bar.png","table_summary.tex"]:
+                    p = os.path.join(OR, fn)
+                    if os.path.exists(p):
+                        f.write(f"- {fn}\n")
+        except Exception as e:
+            print(f"[report_md] skipped: {e}")
+
     # 로그 요약
     print("Saved under OR:")
-    for fn in ["fig_EW_vs_w_fixed.png","fig_ES95_vs_w_fixed.png","fig_risk_return.png","fig_ruin_bar.png","table_summary.tex"]:
-        print(" -", os.path.join(OR, fn))
+    for fn in ["fig_EW_vs_w_fixed.png","fig_ES95_vs_w_fixed.png","fig_risk_return.png","fig_frontier_EW_ES.png","fig_ruin_bar.png","table_summary.tex","report_quick.md"]:
+        p = os.path.join(OR, fn)
+        if os.path.exists(p):
+            print(" -", p)
 
 if __name__ == "__main__":
     main()
