@@ -223,7 +223,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--metrics_keys", type=str,
                    default="EW,ES95,EL,Ruin,mean_WT,es_mode,EU,EU_per_year,delta_annual,F_target_used")
     p.add_argument("--no_paths", action="store_true")
-
+    p.add_argument("--validate", choices=["on","off"], default="off")
     p.add_argument("--return_actor", choices=["on", "off"], default="off")
 
     # ETA
@@ -367,6 +367,16 @@ def main():
     if isinstance(out, dict):
         out["time_total_s"] = round(elapsed, 3)
         out["time_total_hms"] = fmt_hms(elapsed)
+
+    # Validation (simple)
+    try:
+        if str(getattr(args, "validate","off")).lower()=="on" and isinstance(out, dict):
+            from .validate.checks import basic_checks
+            tgt = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
+            vres = basic_checks(tgt, hjb_ref=None)
+            out.setdefault("validation", vres)
+    except Exception:
+        pass
 
     # ETA history
     try:

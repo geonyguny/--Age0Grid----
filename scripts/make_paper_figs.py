@@ -1,4 +1,4 @@
-# scripts/make_paper_figs.py
+# scripts/make_paper_figs.py plot_ruin_bar(...) 함수를 다시 넣기
 import os, sys, math, argparse, pathlib
 import pandas as pd
 import numpy as np
@@ -367,6 +367,80 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
 
     save_fig(fig, os.path.join(OR, "fig_frontier_EW_ES.png"))
 
+def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str | None):
+    """
+    Ruin 확률 막대그래프:
+      - method=='rule'인 항목만 대상으로 baseline별로 w_fixed 카테고리를 나란히(bar) 표시
+      - HJB가 있으면 HJB의 Ruin_avg를 수평선으로 참고선 표시
+    저장: <OR>/fig_ruin_bar.png
+    """
+    # 룰 데이터만 추출
+    d_rule = df_rep.loc[df_rep["method"].str.lower() == "rule"].copy()
+    d_rule = d_rule.loc[d_rule["w_fixed"].astype(str) != "NA"]
+    d_rule = d_rule.dropna(subset=["Ruin_avg"])
+
+    # 데이터 가드
+    if d_rule.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        overlay_message(fig, ax, "Ruin (by baseline & w_fixed)", "No data to visualize", sub_hint, keep_axes=True)
+        save_fig(fig, os.path.join(OR, "fig_ruin_bar.png"))
+        return
+
+    # 카테고리 정렬(라인 플롯들과 동일한 순서)
+    w_order = ["w_0", "w_0_3", "w_0_5", "w_0_7", "w_1"]
+    d_rule["w_fixed"] = pd.Categorical(d_rule["w_fixed"].astype(str), categories=w_order, ordered=True)
+
+    # baseline 목록
+    baselines = [b for b in d_rule["baseline"].dropna().unique().tolist() if b != ""]
+    if not baselines:
+        baselines = ["rule"]
+
+    # 피벗: index=w_fixed, columns=baseline, values=Ruin_avg
+    pv = d_rule.pivot_table(index="w_fixed", columns="baseline", values="Ruin_avg", aggfunc="mean")
+    pv = pv.reindex(w_order)
+    pv = pv.dropna(how="all")
+    if pv.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        overlay_message(fig, ax, "Ruin (by baseline & w_fixed)", "No data to visualize", sub_hint, keep_axes=True)
+        save_fig(fig, os.path.join(OR, "fig_ruin_bar.png"))
+        return
+
+    # 그리기
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(pv.index))
+    cols = list(pv.columns)
+    nb = max(len(cols), 1)
+    width = min(0.8 / nb, 0.22)
+
+    lines_y = []
+    for i, c in enumerate(cols):
+        y = pv[c].to_numpy(dtype=float)
+        offset = (i - (nb - 1) / 2.0) * width
+        ax.bar(x + offset, y, width=width, label=str(c))
+        lines_y.append(y[~np.isnan(y)])
+
+    # HJB Ruin 참고선(있으면)
+    try:
+        hjb = df_rep.loc[df_rep["method"].str.lower() == "hjb"].head(1)
+        if len(hjb) and pd.notna(hjb["Ruin_avg"].iloc[0]):
+            ax.axhline(float(hjb["Ruin_avg"].iloc[0]), linestyle="--", alpha=0.8, label="HJB")
+    except Exception:
+        pass
+
+    # 축/레이블
+    ax.set_xticks(x, [str(ix).replace("w_", "").replace("_", ".") for ix in pv.index])
+    ax.set_xlabel("w_fixed")
+    ax.set_ylabel("Ruin probability (avg)")
+    ax.set_title("Ruin (by baseline & w_fixed)")
+    ax.legend()
+    fig.tight_layout()
+
+    # 중앙 오버레이(요청 시)
+    if center_msg:
+        annotate_center(ax, center_msg, sub_hint)
+
+    save_fig(fig, os.path.join(OR, "fig_ruin_bar.png"))
+
 # ─────────────────────────────────────────────────────────
 # E) LaTeX 테이블
 # ─────────────────────────────────────────────────────────
@@ -461,6 +535,9 @@ def main():
     plot_risk_return(df_rep, baselines, hjb_EW, hjb_ES, OR, sub_hint, center_msg)
     if args.frontier == "on":
         plot_frontier(df_rep, OR, sub_hint, center_msg)
+
+    # Ruin 막대그래프
+    plot_ruin_bar(df_rep, OR, sub_hint, center_msg)
 
     # LaTeX
     latex_path = save_latex_table(df_rep, OR)

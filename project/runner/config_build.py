@@ -1,6 +1,6 @@
 # project/runner/config_build.py
 from __future__ import annotations
-from typing import Any, Iterable, Sequence, Tuple
+from typing import Any, Iterable, Tuple
 import numpy as _np
 import re as _re
 
@@ -26,16 +26,17 @@ def _normalize_hjb_w_grid(cfg: SimConfig, raw) -> None:
     """
     HJB의 W-격자 정규화 (cfg.hjb_w_grid ← tuple<float>).
       - int: 0..w_max 균등분할
-      - Iterable: 클립/정렬/중복제거
+      - Iterable(list/tuple/ndarray): 클립/정렬/중복제거
       - None/빈값: 8개 기본격자
     """
     w_max = float(getattr(cfg, "w_max", 1.0) or 1.0)
+    w_max = float(max(0.0, min(1.0, w_max)))  # 안전 클립
     if raw is None or (isinstance(raw, (list, tuple)) and len(raw) == 0):
         grid = _np.linspace(0.0, w_max, 8)
     elif isinstance(raw, int):
         n_w = max(2, int(raw))
         grid = _np.linspace(0.0, w_max, n_w)
-    elif isinstance(raw, Iterable):
+    elif isinstance(raw, _np.ndarray) or (isinstance(raw, Iterable) and not isinstance(raw, (str, bytes))):
         arr = _np.asarray(list(raw), dtype=float)
         if arr.size < 2:
             arr = _np.linspace(0.0, w_max, 8)
@@ -52,7 +53,7 @@ def _set_fee_fields(cfg: SimConfig, args) -> None:
     phi_adval vs fee_annual 정합성:
       - 둘 다 제공 → phi_adval 우선
       - 하나만 제공 → 둘 다 동일값으로 세팅
-      - 미제공 → 기존/기본 0.004 유지
+      - 미제공 → 기본 0.004 유지
     """
     fee_annual = _get(args, "fee_annual", None)
     phi_adval  = _get(args, "phi_adval", None)
@@ -77,11 +78,11 @@ def _set_q_floor_monthly(cfg: SimConfig, args) -> None:
         cfg.q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
         cfg.q_floor_annual = float(_get(cfg, "q_floor_annual", 0.0) or 0.0)
         return
-    qf_ann = float(qf_ann)
-    qf_ann = max(0.0, min(0.999999, qf_ann))
+    qf_ann = float(max(0.0, min(0.999999, float(qf_ann))))
     qf_m = 1.0 - (1.0 - qf_ann) ** (1.0 / spm)
     cfg.q_floor = float(qf_m)
     cfg.q_floor_annual = float(qf_ann)
+    # make_cfg는 보통 quiet 컨텍스트에서 호출됨(출력 묵음)
     print(f"[cfg] q_floor_annual={qf_ann:.6f} → q_floor_monthly={qf_m:.6f} (steps_per_year={spm})")
 
 def _choose_n_paths_eval(args, default_val: int = 100) -> int:
@@ -94,7 +95,6 @@ def _norm_onoff(x: Any, default: str = "off") -> str:
     s = str(x if x is not None else default).strip().lower()
     if s in ("on", "true", "1", "yes", "y"):  return "on"
     if s in ("off", "false", "0", "no", "n"): return "off"
-    # 알 수 없는 입력은 기본값으로 폴백
     return default
 
 def _validate_data_window(win: Any) -> str | None:
@@ -134,6 +134,18 @@ def _normalize_market_flags(cfg: SimConfig) -> None:
     }
     meta["market"] = meta_market
     cfg.meta = meta
+
+def _clip_weights(cfg: SimConfig) -> None:
+    """w_max/w_fixed의 합리 범위 강제 및 일관성 보장."""
+    w_max = float(getattr(cfg, "w_max", 1.0) or 1.0)
+    w_max = float(max(0.0, min(1.0, w_max)))
+    cfg.w_max = w_max
+    if hasattr(cfg, "w_fixed") and cfg.w_fixed is not None:
+        try:
+            wf = float(cfg.w_fixed)
+            cfg.w_fixed = float(max(0.0, min(w_max, wf)))
+        except Exception:
+            cfg.w_fixed = None
 
 # -------------------------
 # build
@@ -259,5 +271,8 @@ def make_cfg(args) -> SimConfig:
 
     # 9) 시장 플래그/윈도 검증 및 메타 주입
     _normalize_market_flags(cfg)
+
+    # 10) 가중치 일관성(경계)
+    _clip_weights(cfg)
 
     return cfg

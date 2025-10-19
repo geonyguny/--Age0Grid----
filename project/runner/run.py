@@ -35,6 +35,17 @@ def _fmt_hms(sec: float) -> str:
         return "00:00:00"
 
 
+def _onoff(v: Any, default: str = "on") -> str:
+    s = str(v).strip().lower() if v is not None else default
+    if s in ("on", "off"):
+        return s
+    if s in ("true", "1", "y", "yes"):
+        return "on"
+    if s in ("false", "0", "n", "no"):
+        return "off"
+    return default
+
+
 # --------------------------
 # Helpers: parsing mix / hedge
 # --------------------------
@@ -95,7 +106,7 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
     # 1) 확보
     market_mode = str(getattr(cfg, "market_mode", "iid") or "iid").lower()
     bootstrap_block = int(getattr(cfg, "bootstrap_block", 24) or 24)
-    use_real_rf = str(getattr(cfg, "use_real_rf", "on") or "on").lower()
+    use_real_rf = _onoff(getattr(cfg, "use_real_rf", "on"), default="on")
     data_window = getattr(cfg, "data_window", None)
     market_meta_from_cfg = getattr(cfg, "meta", {}).get("market", {}) if getattr(cfg, "meta", None) else {}
     market_csv = getattr(args, "market_csv", None)
@@ -126,7 +137,7 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
         metrics.setdefault("data_profile", data_profile or "")
 
     # 4) 조용하지 않으면 한 줄 출력
-    if str(getattr(args, "quiet", "on")).lower() != "on":
+    if _onoff(getattr(args, "quiet", "on")) != "on":
         try:
             print(f"[market] mode={market_mode}, block={bootstrap_block}, use_real_rf={use_real_rf}, "
                   f"window='{data_window or ''}', profile='{data_profile or ''}', csv='{market_csv or ''}'")
@@ -141,7 +152,7 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     """bootstrap이면 CSV를 로드하여 cfg에 시계열/파라미터를 주입."""
     setattr(cfg, "bands", getattr(args, "bands", "on"))
     setattr(cfg, "data_window", getattr(args, "data_window", None))
-    setattr(cfg, "use_real_rf", getattr(args, "use_real_rf", "on"))
+    setattr(cfg, "use_real_rf", _onoff(getattr(args, "use_real_rf", "on")))
 
     if getattr(cfg, "market_mode", "iid") != "bootstrap":
         return
@@ -216,15 +227,15 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     setattr(cfg, "data_dates", dates)
     setattr(cfg, "data_cpi", cpi)
     setattr(cfg, "data_ret_series", mixed)
-    setattr(cfg, "data_rf_series", rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom)
+    setattr(cfg, "data_rf_series", rf_real if _onoff(getattr(args, "use_real_rf", "on")) == "on" else rf_nom)
     setattr(cfg, "data_ret_kr_eq", ret_kr)
     setattr(cfg, "data_ret_us_eq_krw", ret_us_l)
     setattr(cfg, "data_ret_gold_krw", ret_au)
 
-    if str(getattr(args, "quiet", "on")).lower() != "on":
+    if _onoff(getattr(args, "quiet", "on")) != "on":
         try:
             ret_mean = float(_np.nanmean(mixed)) if mixed is not None else float("nan")
-            rf_series = rf_real if getattr(args, "use_real_rf", "on") == "on" else rf_nom
+            rf_series = rf_real if _onoff(getattr(args, "use_real_rf", "on")) == "on" else rf_nom
             rf_mean = float(_np.nanmean(rf_series)) if rf_series is not None else float("nan")
             a = getattr(cfg, "alpha_mix", None)
             a_str = f"alpha={a}" if a is not None else "alpha=legacy"
@@ -356,7 +367,7 @@ def _looks_degenerate_wt(xs) -> bool:
 def run_once(args) -> Dict[str, Any]:
     t_all_0 = time.perf_counter()
 
-    quiet_ctx = silence_stdio(also_stderr=True) if str(getattr(args, "quiet", "on")).lower() == "on" else contextlib.nullcontext()
+    quiet_ctx = silence_stdio(also_stderr=True) if _onoff(getattr(args, "quiet", "on")) == "on" else contextlib.nullcontext()
     with quiet_ctx:
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
@@ -368,12 +379,12 @@ def run_once(args) -> Dict[str, Any]:
 
         t1 = time.perf_counter(); _wire_market_data(cfg, args); time_wire_data = time.perf_counter() - t1
         t2 = time.perf_counter()
-        ann_enabled = (str(getattr(args, "ann_on", "off")).lower() == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
+        ann_enabled = (_onoff(getattr(args, "ann_on", "off")) == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
         if ann_enabled: setup_annuity_overlay(cfg, args)
         time_annuity = time.perf_counter() - t2
 
         t3 = time.perf_counter(); actor = build_actor(cfg, args); time_build_actor = time.perf_counter() - t3
-        t4 = time.perf_counter(); m, extras = _call_evaluate(cfg, actor, es_mode=args.es_mode); time_eval = time.perf_counter() - t4
+        t4 = time.perf_counter(); m, extras = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth")); time_eval = time.perf_counter() - t4
 
     # eval_WT 보강
     extras = extras or {}
@@ -403,7 +414,7 @@ def run_once(args) -> Dict[str, Any]:
                   "P": P_val if P_val != 0.0 else 0.0})
 
     n_paths_total = len(extras.get("eval_WT", [])) or (
-        getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) * len(getattr(cfg, "seeds", []))
+        (getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) or 0) * max(1, len(getattr(cfg, "seeds", [])))
     )
 
     time_total = time.perf_counter() - t_all_0
@@ -419,7 +430,7 @@ def run_once(args) -> Dict[str, Any]:
 
     out = dict(
         asset=getattr(cfg, "asset", None),
-        method=args.method,
+        method=getattr(args, "method", ""),
         baseline=getattr(args, "baseline", ""),
         metrics=m,
         w_max=getattr(cfg, "w_max", None),
@@ -427,7 +438,7 @@ def run_once(args) -> Dict[str, Any]:
         lambda_term=getattr(cfg, "lambda_term", None),
         alpha=getattr(cfg, "alpha", None),
         F_target=getattr(cfg, "F_target", None),
-        es_mode=args.es_mode,
+        es_mode=getattr(args, "es_mode", "wealth"),
         n_paths=int(n_paths_total),
         args=slim_args(args),
         extra=extras,
@@ -443,7 +454,7 @@ def run_once(args) -> Dict[str, Any]:
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
         "tag": getattr(args, "tag", None),
-        "method": args.method,
+        "method": out["method"],
         "asset": getattr(cfg, "asset", None),
         "outputs_abs": os.path.abspath(args.outputs),
         "time_total_hms": timing["total_hms"],
@@ -458,7 +469,7 @@ def run_once(args) -> Dict[str, Any]:
     except Exception:
         pass
 
-    if getattr(args, "autosave", "off") == "on":
+    if _onoff(getattr(args, "autosave", "off")) == "on":
         do_autosave(m, cfg, args, out)
 
     return out
@@ -518,7 +529,7 @@ def run_rl(args):
 
     t1 = time.perf_counter(); _wire_market_data(cfg, args); time_wire_data = time.perf_counter() - t1
 
-    ann_enabled = (str(getattr(args, "ann_on", "off")).lower() == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
+    ann_enabled = (_onoff(getattr(args, "ann_on", "off")) == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
     t2 = time.perf_counter()
     if ann_enabled: setup_annuity_overlay(cfg, args)
     time_annuity = time.perf_counter() - t2
@@ -561,9 +572,9 @@ def run_rl(args):
         actor = _maybe_load_actor_from_ckpt(ckpt_path, cfg_hint=cfg)
     time_actor_load = time.perf_counter() - t4
 
-    n_paths_total = int(getattr(args, "rl_n_paths_eval", 0)) * len(getattr(args, "seeds", []))
+    n_paths_total = int(getattr(args, "rl_n_paths_eval", 0)) * max(1, len(getattr(args, "seeds", [])))
 
-    if actor is not None and str(getattr(args, "return_actor", "off")).lower() == "on":
+    if actor is not None and _onoff(getattr(args, "return_actor", "off")) == "on":
         return (cfg, actor)
 
     metrics_dict: Dict[str, Any]
@@ -663,7 +674,7 @@ def run_rl(args):
     except Exception:
         pass
 
-    if getattr(args, "autosave", "off") == "on":
+    if _onoff(getattr(args, "autosave", "off")) == "on":
         do_autosave(out.get("metrics") or {}, cfg, args, out)
 
     return out
