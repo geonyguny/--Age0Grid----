@@ -1,10 +1,16 @@
-# scripts/make_paper_figs.py plot_ruin_bar(...) 함수를 다시 넣기
+# scripts/make_paper_figs.py
 import os, sys, math, argparse, pathlib
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless 안전
 import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────────────────
+# 전역 플래그 (args에서 설정)
+# ─────────────────────────────────────────────────────────
+KEEP_AXES_ON_EMPTY = True   # --keep_axes_on_empty 반영
+SAVE_PDF = False            # paper_style on이면 자동 True
 
 # ─────────────────────────────────────────────────────────
 # A) 공통 유틸: OutRoot 해석 + 데이터 가드 + 메시지 오버레이
@@ -100,9 +106,18 @@ def overlay_message(fig, ax, title: str, msg: str, sub: str = "", keep_axes: boo
         fig.tight_layout()
 
 
-def save_fig(fig, path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=300, bbox_inches="tight")
+def save_fig(fig, path_png: str):
+    """
+    PNG 저장(+ paper_style 켜져 있으면 PDF도 같은 이름으로 저장).
+    """
+    os.makedirs(os.path.dirname(path_png), exist_ok=True)
+    fig.savefig(path_png, dpi=300, bbox_inches="tight")
+    if SAVE_PDF:
+        root, _ = os.path.splitext(path_png)
+        try:
+            fig.savefig(root + ".pdf", bbox_inches="tight")
+        except Exception:
+            pass
     plt.close(fig)
 
 # ─────────────────────────────────────────────────────────
@@ -203,7 +218,7 @@ def plot_ew_vs_w(df_rep: pd.DataFrame, baselines: list[str], hjb_EW: float, OR: 
     if is_empty or is_single:
         overlay_message(fig, ax, "EW vs w_fixed",
                         "Single-point result (identical samples)" if is_single else "No data to visualize",
-                        sub_hint, keep_axes=True)
+                        sub_hint, keep_axes=KEEP_AXES_ON_EMPTY)
     else:
         ax.set_xlabel("w_fixed"); ax.set_ylabel("EW (avg)"); ax.set_title("EW vs w_fixed")
         ax.legend(); fig.tight_layout()
@@ -238,7 +253,7 @@ def plot_es_vs_w(df_rep: pd.DataFrame, baselines: list[str], hjb_ES: float, OR: 
     if is_empty or is_single:
         overlay_message(fig, ax, "ES95 vs w_fixed",
                         "Single-point result (identical samples)" if is_single else "No data to visualize",
-                        sub_hint, keep_axes=True)
+                        sub_hint, keep_axes=KEEP_AXES_ON_EMPTY)
     else:
         ax.set_xlabel("w_fixed"); ax.set_ylabel("ES95 (avg, lower is better)"); ax.set_title("ES95 vs w_fixed")
         ax.legend(); fig.tight_layout()
@@ -279,7 +294,7 @@ def plot_risk_return(df_rep: pd.DataFrame, baselines: list[str], hjb_EW: float, 
     if P.shape[0] == 0 or (np.nanmax(P, axis=0) - np.nanmin(P, axis=0) < 1e-12).all():
         overlay_message(fig, ax, "Risk–Return",
                         "Single-point result (identical samples)" if P.shape[0] > 0 else "No data to visualize",
-                        sub_hint, keep_axes=True)
+                        sub_hint, keep_axes=KEEP_AXES_ON_EMPTY)
     else:
         ax.set_xlabel("ES95 (lower better)"); ax.set_ylabel("EW (higher better)"); ax.set_title("Risk–Return")
         ax.legend(); fig.tight_layout()
@@ -318,11 +333,11 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
     """
     fig, ax = plt.subplots(figsize=(7,6))
 
-    # 방법별 색/마커(고정 색 지정은 피함; 기본 팔레트 사용)
+    # 방법별 스타일 (linestyle 제거: scatter에는 불필요/오류 원인)
     styles = {
-        "rule": dict(marker="o", linestyle="none", alpha=0.85),
-        "hjb":  dict(marker="*", linestyle="none", s=120),
-        "rl":   dict(marker="^", linestyle="none"),
+        "rule": dict(marker="o", alpha=0.85, s=35),
+        "hjb":  dict(marker="*", s=120),
+        "rl":   dict(marker="^", s=45),
     }
 
     # 전체 점
@@ -333,7 +348,7 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
             continue
         any_points = True
         if m == "rule":
-            ax.scatter(d["ES95_avg"], d["EW_avg"], label="rule", **{k:v for k,v in styles["rule"].items() if k!="s"})
+            ax.scatter(d["ES95_avg"], d["EW_avg"], label="rule", **styles["rule"])
             # 라벨(가독성 위해 소형)
             for _, r in d.iterrows():
                 lbl = str(r.get("w_fixed","")).replace("w_","").replace("_",".")
@@ -354,7 +369,7 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
     if len(fr) == 0 or not any_points:
         overlay_message(fig, ax, "EW–ES Frontier",
                         "No data to visualize" if not any_points else "Single-point result (frontier undefined)",
-                        sub_hint, keep_axes=True)
+                        sub_hint, keep_axes=KEEP_AXES_ON_EMPTY)
     else:
         fr = fr.sort_values("ES95_avg")
         ax.plot(fr["ES95_avg"], fr["EW_avg"], linewidth=2.0, label="Frontier")
@@ -367,72 +382,141 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
 
     save_fig(fig, os.path.join(OR, "fig_frontier_EW_ES.png"))
 
+
 def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str | None):
     """
-    Ruin 확률 막대그래프:
-      - method=='rule'인 항목만 대상으로 baseline별로 w_fixed 카테고리를 나란히(bar) 표시
-      - HJB가 있으면 HJB의 Ruin_avg를 수평선으로 참고선 표시
-    저장: <OR>/fig_ruin_bar.png
+    Ruin 확률 막대그래프 (논문용 품질 + 라벨 위치 안전화):
+      - method=='rule' 대상, baseline별 w_fixed 병렬 막대
+      - HJB 있으면 수평선 + 텍스트 라벨
+      - 퍼센트 축/라벨, hatch 패턴, 데이터 라벨
+      - 라벨 y좌표를 축 스팬 비율로 계산하여 bbox_inches='tight' 안전화
     """
-    # 룰 데이터만 추출
+    from matplotlib.ticker import PercentFormatter, AutoMinorLocator
+
+    # 1) 룰 데이터 필터링/가드
     d_rule = df_rep.loc[df_rep["method"].str.lower() == "rule"].copy()
     d_rule = d_rule.loc[d_rule["w_fixed"].astype(str) != "NA"]
     d_rule = d_rule.dropna(subset=["Ruin_avg"])
 
-    # 데이터 가드
     if d_rule.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        overlay_message(fig, ax, "Ruin (by baseline & w_fixed)", "No data to visualize", sub_hint, keep_axes=True)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        overlay_message(fig, ax, "Ruin (by baseline & w_fixed)", "No data to visualize", sub_hint, keep_axes=KEEP_AXES_ON_EMPTY)
         save_fig(fig, os.path.join(OR, "fig_ruin_bar.png"))
         return
 
-    # 카테고리 정렬(라인 플롯들과 동일한 순서)
+    # 2) 카테고리 순서 고정
     w_order = ["w_0", "w_0_3", "w_0_5", "w_0_7", "w_1"]
     d_rule["w_fixed"] = pd.Categorical(d_rule["w_fixed"].astype(str), categories=w_order, ordered=True)
 
-    # baseline 목록
+    # baseline 목록(없으면 단일 "rule")
     baselines = [b for b in d_rule["baseline"].dropna().unique().tolist() if b != ""]
     if not baselines:
         baselines = ["rule"]
 
-    # 피벗: index=w_fixed, columns=baseline, values=Ruin_avg
-    pv = d_rule.pivot_table(index="w_fixed", columns="baseline", values="Ruin_avg", aggfunc="mean")
+    # 3) 피벗 (FutureWarning 방지: observed=False 명시)
+    pv = d_rule.pivot_table(index="w_fixed", columns="baseline", values="Ruin_avg", aggfunc="mean", observed=False)
     pv = pv.reindex(w_order)
     pv = pv.dropna(how="all")
     if pv.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        overlay_message(fig, ax, "Ruin (by baseline & w_fixed)", "No data to visualize", sub_hint, keep_axes=True)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        overlay_message(fig, ax, "Ruin (by baseline & w_fixed)", "No data to visualize", sub_hint, keep_axes=KEEP_AXES_ON_EMPTY)
         save_fig(fig, os.path.join(OR, "fig_ruin_bar.png"))
         return
 
-    # 그리기
-    fig, ax = plt.subplots(figsize=(9, 5))
+    # 4) 도화
+    fig, ax = plt.subplots(figsize=(9.5, 5.3))
     x = np.arange(len(pv.index))
     cols = list(pv.columns)
     nb = max(len(cols), 1)
     width = min(0.8 / nb, 0.22)
 
-    lines_y = []
+    # 5) 확률 스케일 여부
+    vals_all = pv.to_numpy(dtype=float)
+    finite_vals = vals_all[np.isfinite(vals_all)]
+    treat_as_prob = finite_vals.size > 0 and np.nanmax(finite_vals) <= 1.0 + 1e-12
+
+    # 6) 스타일
+    hatches = ["/", "\\\\", "xx", "--", "++", "..", "oo", "**"]
+    edge_kwargs = dict(edgecolor="0.25", linewidth=0.6)
+
+    # 7) 먼저 막대를 그린 뒤, y-limits 결정
+    bar_groups = []
     for i, c in enumerate(cols):
         y = pv[c].to_numpy(dtype=float)
         offset = (i - (nb - 1) / 2.0) * width
-        ax.bar(x + offset, y, width=width, label=str(c))
-        lines_y.append(y[~np.isnan(y)])
+        bars = ax.bar(x + offset, y, width=width, label=str(c),
+                      hatch=hatches[i % len(hatches)], **edge_kwargs)
+        bar_groups.append((x + offset, y, bars))
 
-    # HJB Ruin 참고선(있으면)
+    # HJB 참고선 값 (y-limit 계산에 반영)
+    hjb_val = None
     try:
         hjb = df_rep.loc[df_rep["method"].str.lower() == "hjb"].head(1)
         if len(hjb) and pd.notna(hjb["Ruin_avg"].iloc[0]):
-            ax.axhline(float(hjb["Ruin_avg"].iloc[0]), linestyle="--", alpha=0.8, label="HJB")
+            hjb_val = float(hjb["Ruin_avg"].iloc[0])
     except Exception:
         pass
 
-    # 축/레이블
+    # y-limit 결정 (여유 15%)
+    if treat_as_prob:
+        ymax = np.nanmax(finite_vals) if finite_vals.size else 0.0
+        if hjb_val is not None:
+            ymax = np.nanmax([ymax, hjb_val])
+        y0, y1 = 0.0, min(1.0, max(1e-6, ymax) * 1.15)
+    else:
+        ymax = np.nanmax(finite_vals) if finite_vals.size else 1.0
+        if hjb_val is not None:
+            ymax = np.nanmax([ymax, hjb_val])
+        y0, y1 = 0.0, max(1e-6, ymax) * 1.15
+    ax.set_ylim(y0, y1)
+
+    # 8) 안전한 라벨 배치 (축 스팬 비율 사용 + 상단 clamp)
+    span = y1 - y0
+    lift = 0.035 * span                      # 막대 꼭대기 위 3.5%만 올림
+    y_cap = y0 + 0.98 * span                 # 축 상단 98% 이내로 제한
+
+    for (xs, ys, bars) in bar_groups:
+        for bx, vy in zip(xs, ys):
+            if not np.isfinite(vy):
+                continue
+            ytext = min(vy + lift, y_cap)    # 상단 넘지 않게 clamp
+            label = f"{vy*100:.1f}%" if treat_as_prob else f"{vy:.2f}"
+            ax.text(bx, ytext, label, ha="center", va="bottom", fontsize=8, color="0.25")
+
+    # 9) HJB 참고선 + 라벨 (축 안쪽으로 위치)
+    if hjb_val is not None and np.isfinite(hjb_val):
+        ax.axhline(hjb_val, linestyle="--", linewidth=1.2, alpha=0.9, label="HJB", color="0.35")
+        lbl = f"HJB: {hjb_val*100:.1f}%" if treat_as_prob else f"HJB: {hjb_val:.2f}"
+        ax.text(0.995, min(0.92, max(0.06, (hjb_val - y0) / max(span, 1e-9))), lbl,
+                transform=ax.transAxes, ha="right", va="center", fontsize=9, color="0.35")
+
+    # 10) 축/레이블/격자/스파인/범례
     ax.set_xticks(x, [str(ix).replace("w_", "").replace("_", ".") for ix in pv.index])
     ax.set_xlabel("w_fixed")
-    ax.set_ylabel("Ruin probability (avg)")
     ax.set_title("Ruin (by baseline & w_fixed)")
-    ax.legend()
+
+    if treat_as_prob:
+        from matplotlib.ticker import PercentFormatter
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    else:
+        ax.set_ylabel("Ruin probability (avg)")
+
+    from matplotlib.ticker import AutoMinorLocator
+    ax.yaxis.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.35)
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.yaxis.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.20)
+    ax.xaxis.grid(False)
+
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["left"].set_linewidth(0.8)
+    ax.spines["bottom"].set_linewidth(0.8)
+
+    ncol = min(len(cols), 4)
+    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.12), ncol=ncol, frameon=False)
+    for t in leg.get_texts():
+        t.set_fontsize(9)
+
     fig.tight_layout()
 
     # 중앙 오버레이(요청 시)
@@ -446,7 +530,6 @@ def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str 
 # ─────────────────────────────────────────────────────────
 def save_latex_table(df_rep: pd.DataFrame, OR: str):
     latex_path = os.path.join(OR, "table_summary.tex")
-    # 열 순서가 너무 길면 요약형으로 기본 정렬만 유지
     try:
         df_rep.to_latex(latex_path, index=False, float_format="%.6f")
     except Exception:
@@ -458,7 +541,6 @@ def save_latex_table(df_rep: pd.DataFrame, OR: str):
 # F) overlay 문구 자동 생성 (가능하면 요약)
 # ─────────────────────────────────────────────────────────
 def build_auto_center_msg(df_rep: pd.DataFrame, or_name: str, market_hint: str = "") -> str:
-    # 대표값들 추출
     mset = sorted([m for m in df_rep["method"].dropna().astype(str).str.upper().unique() if m])
     bset = sorted([b for b in df_rep["baseline"].dropna().astype(str).unique() if b])
     wvals = sorted([w for w in df_rep["w_fixed"].dropna().astype(str).unique() if w and w != "NA"],
@@ -471,10 +553,6 @@ def build_auto_center_msg(df_rep: pd.DataFrame, or_name: str, market_hint: str =
     return "\n".join(parts)
 
 def market_meta_hint(df_cln: pd.DataFrame) -> str:
-    """
-    night_summary_clean.csv 안의 메타(가능하면) 요약 문자열 생성.
-    우선순위: market_mode/use_real_rf/data_window/bootstrap_block.
-    """
     cols = [c for c in df_cln.columns]
     def _first(col):
         if col in cols and df_cln[col].notna().any():
@@ -495,6 +573,8 @@ def market_meta_hint(df_cln: pd.DataFrame) -> str:
 # G) main
 # ─────────────────────────────────────────────────────────
 def main():
+    global KEEP_AXES_ON_EMPTY, SAVE_PDF
+
     ap = argparse.ArgumentParser(description="Generate paper figures from night_summary_* under a given OR.")
     ap.add_argument("outroot", nargs="?", help="outputs/night_YYYYMMDD_HHMM folder. If omitted, uses latest night_* (WARN).")
     ap.add_argument("--overlay", choices=["on","off"], default="on",
@@ -502,18 +582,40 @@ def main():
     ap.add_argument("--overlay_text", type=str, default="",
                     help="중앙 오버레이에 강제로 표시할 커스텀 텍스트(줄바꿈 \\n 가능). 비우면 자동 요약.")
     ap.add_argument("--keep_axes_on_empty", choices=["on","off"], default="on",
-                    help="데이터 부족/단일점일 때도 축을 유지할지 (요청 반영; 기본 on)")
+                    help="데이터 부족/단일점일 때도 축을 유지할지 (기본 on)")
     ap.add_argument("--frontier", choices=["on","off"], default="on",
                     help="EW–ES 프런티어 그림 생성 여부 (기본 on)")
     ap.add_argument("--save_md", choices=["on","off"], default="on",
                     help="간단 요약 .md 저장 (기본 on)")
+    ap.add_argument("--paper_style", choices=["on","off"], default="off",
+                    help="논문 도판용 스타일 적용 여부 (기본 off)")
     args = ap.parse_args()
+
+    # keep_axes_on_empty 전역 적용
+    KEEP_AXES_ON_EMPTY = (args.keep_axes_on_empty == "on")
 
     OR, used_latest = resolve_outroot(args.outroot)
     print(f"[OR] {OR}")
     if used_latest:
         print("[WARN] outroot not provided or invalid → using latest night_* folder under parent. "
               "To avoid mixing sessions, prefer passing the exact OR from night_run.ps1.")
+
+    # paper_style 적용(런타임 import)
+    center_msg_forced_none = False
+    if args.paper_style == "on":
+        try:
+            import importlib.util
+            style_path = os.path.join(os.path.dirname(__file__), "fig_style_paper.py")
+            spec = importlib.util.spec_from_file_location("fig_style_paper", style_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore
+            mod.apply_paper_style()
+            SAVE_PDF = True
+            center_msg_forced_none = True  # 논문용에서는 overlay 비활성 권장
+            print("[INFO] paper_style applied; PDF export enabled; overlay will be disabled.")
+        except Exception as e:
+            print(f"[WARN] paper_style 적용 실패: {e}")
+            SAVE_PDF = False
 
     df_rep, df_cln = load_data(OR)
     df_rep, baselines, hjb_EW, hjb_ES = normalize_labels(df_rep)
@@ -523,11 +625,11 @@ def main():
     sub_hint = f"OutRoot={or_name}{mkt_hint}"
 
     # 중앙 오버레이 문구
-    if args.overlay == "on":
+    if center_msg_forced_none or args.overlay == "off":
+        center_msg = None
+    else:
         base_msg = args.overlay_text.strip()
         center_msg = base_msg if base_msg else build_auto_center_msg(df_rep, or_name, market_hint=mkt_hint.strip(" |"))
-    else:
-        center_msg = None
 
     # 플롯들
     plot_ew_vs_w(df_rep, baselines, hjb_EW, OR, sub_hint, center_msg)

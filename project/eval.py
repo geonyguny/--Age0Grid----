@@ -15,6 +15,38 @@ import pandas as pd
 # ✅ env 패키지 내부 파일 직접 임포트 (init 노출 이슈 방지)
 from .env.retirement_env import RetirementEnv
 
+# ✅ EU 계산 유틸 (행동편향 반영)
+try:
+    from .eval.utility import (
+        crra_u as _crra_u,                         # backward-compat shim
+        monthly_discount_from_annual,
+        path_expected_utility,
+    )
+except Exception:
+    # 안전 폴백(유틸 모듈이 없을 경우): 기존 구현과 동등
+    def _crra_u(c: float, gamma: float) -> float:
+        c = max(float(c), 1e-12)
+        if abs(float(gamma) - 1.0) < 1e-12:
+            return float(_np.log(c))
+        return float((c ** (1.0 - float(gamma)) - 1.0) / (1.0 - float(gamma)))
+
+    def monthly_discount_from_annual(delta_annual: Optional[float], spm: int) -> float:
+        if delta_annual is None:
+            return 1.0
+        try:
+            d = float(delta_annual)
+            d = max(1e-12, min(1.0, d))
+            return float(d ** (1.0 / float(max(1, spm))))
+        except Exception:
+            return 1.0
+
+    def path_expected_utility(c_hist, *, gamma: float, u_scale: float, delta_m: float, bh_spec=None) -> float:
+        eu = 0.0
+        for t_idx, c_t in enumerate(_np.asarray(c_hist, dtype=float)):
+            if _np.isfinite(c_t):
+                eu += (delta_m ** t_idx) * (u_scale * _crra_u(float(c_t), gamma))
+        return float(eu)
+
 
 # =========================
 # Constants (CSV header)
@@ -97,14 +129,6 @@ def _clean_finite(a: _np.ndarray) -> tuple[_np.ndarray, int, int]:
     arr = _np.asarray(a, dtype=float)
     mask = _np.isfinite(arr)
     return arr[mask], int(arr.size), int((~mask).sum())
-
-
-def _crra_u(c: float, gamma: float) -> float:
-    """CRRA 효용 (c>0). gamma≈1이면 로그 효용으로 처리."""
-    c = max(float(c), 1e-12)
-    if abs(float(gamma) - 1.0) < 1e-12:
-        return float(_np.log(c))
-    return float((c ** (1.0 - float(gamma)) - 1.0) / (1.0 - float(gamma)))
 
 
 def _stderr(msg: str) -> None:
@@ -306,23 +330,16 @@ def evaluate(
     # CLI와 호환: n_paths(일반) / rl_n_paths_eval(RL)
     n_eval = int(getattr(cfg, "n_paths", getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1)) or 1))
 
+    # --- Utility/EU settings (behavioral spec 읽기) ---
     report_utility = str(getattr(cfg, "report_utility", "off")).lower() == "on"
     gamma = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
     u_scale = float(getattr(cfg, "u_scale", 1.0) or 1.0)
     delta_ann = getattr(cfg, "delta_annual", None)
     spm = int(getattr(env, "steps_per_year", 12) or 12)
+    delta_m = monthly_discount_from_annual(delta_ann, spm)
 
-    # delta_annual이 주어졌을 때만 월 할인율로 변환(정합성 보장)
-    if delta_ann is None:
-        delta_m = 1.0
-    else:
-        try:
-            delta_ann_f = float(delta_ann)
-            # 0<delta≤1 범위로 클리핑(수치적 안전)
-            delta_ann_f = max(1e-12, min(1.0, delta_ann_f))
-            delta_m = float(delta_ann_f ** (1.0 / float(spm)))
-        except Exception:
-            delta_m = 1.0
+    # 효용-레이어 행동편향 스펙(있을 수 있음)
+    bh_spec = getattr(cfg, "behavioral_spec", None)
 
     for sd in seeds:
         base = int(sd) * 100_000
@@ -343,10 +360,13 @@ def evaluate(
             # EU on the consumption stream (optional, robust)
             if report_utility:
                 try:
-                    eu = 0.0
-                    for t_idx, c_t in enumerate(_np.asarray(C_hist, dtype=float)):
-                        if _np.isfinite(c_t):
-                            eu += (delta_m ** t_idx) * (u_scale * _crra_u(c_t, gamma))
+                    eu = path_expected_utility(
+                        C_hist,
+                        gamma=gamma,
+                        u_scale=u_scale,
+                        delta_m=delta_m,
+                        bh_spec=bh_spec,
+                    )
                     path_EU.append(float(eu))
                 except Exception:
                     # EU 계산 실패는 메트릭의 필수 항목이 아니므로 무음 처리

@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Callable, Tuple, List, Union
 
 import numpy as _np
 
-from ..eval import evaluate
+from ..eval import evaluate, save_metrics_autocsv  # ← 백업 CSV 기록 루틴 함께 임포트
 from ..config import SimConfig
 from .config_build import make_cfg
 from .actors import build_actor
@@ -18,8 +18,24 @@ from .logging_filters import silence_stdio
 from ..data.loader import load_market_csv
 from ..env.retirement_env import RetirementEnv  # type: ignore
 
-# ✅ metrics.csv 기록
+# ✅ metrics.csv 기록 (주 기록 루트)
 from ..utils.logging_io import write_metrics_csv
+
+# ✅ 효용-레이어 행동편향(있으면 사용, 없으면 안전 폴백)
+try:
+    from ..policy.behavioral import parse_behavioral_from_args as _parse_bh, describe as _bh_describe  # type: ignore
+except Exception:
+    _parse_bh = None
+    def _bh_describe(_spec) -> Dict[str, Any]:  # type: ignore
+        try:
+            return {
+                "bh_on": bool(getattr(_spec, "on", False)),
+                "lambda_loss": float(getattr(_spec, "lambda_loss", 1.0)),
+                "beta": float(getattr(_spec, "beta", 1.0)),
+                "habit_phi": float(getattr(_spec, "habit_phi", 0.0)),
+            }
+        except Exception:
+            return {"bh_on": False, "lambda_loss": 1.0, "beta": 1.0, "habit_phi": 0.0}
 
 
 # --------------------------
@@ -371,6 +387,15 @@ def run_once(args) -> Dict[str, Any]:
     with quiet_ctx:
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
+
+        # ✅ 효용-레이어 행동편향 스펙 주입(있으면)
+        bh_spec = None
+        if _parse_bh is not None:
+            try:
+                bh_spec = _parse_bh(args)
+                setattr(cfg, "behavioral_spec", bh_spec)
+            except Exception:
+                setattr(cfg, "behavioral_spec", None)
         time_make_cfg = time.perf_counter() - t0
 
         ensure_dir(args.outputs)
@@ -413,6 +438,13 @@ def run_once(args) -> Dict[str, Any]:
                   "a_factor": a_fac if a_fac != 0.0 else 0.0,
                   "P": P_val if P_val != 0.0 else 0.0})
 
+        # ✅ 행동편향 요약 메트릭(있으면)
+        if bh_spec is not None:
+            try:
+                m.update(_bh_describe(bh_spec))
+            except Exception:
+                pass
+
     n_paths_total = len(extras.get("eval_WT", [])) or (
         (getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) or 0) * max(1, len(getattr(cfg, "seeds", [])))
     )
@@ -450,6 +482,17 @@ def run_once(args) -> Dict[str, Any]:
     # 🔗 시장 메타/플래그 주입
     _inject_market_meta(cfg, args, out)
 
+    # ✅ meta에 행동편향 기록
+    meta_bh = None
+    if bh_spec is not None:
+        try:
+            meta_bh = _bh_describe(bh_spec)
+        except Exception:
+            meta_bh = None
+    out.setdefault("meta", {})
+    if meta_bh:
+        out["meta"]["behavioral"] = meta_bh
+
     # ✅ metrics.csv 기록 (항상)
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
@@ -464,8 +507,20 @@ def run_once(args) -> Dict[str, Any]:
         "use_real_rf": getattr(cfg, "use_real_rf", None),
         "data_window": getattr(cfg, "data_window", None),
     }
+    # 행동편향 요약도 CSV에 함께 남김(있으면)
+    if meta_bh:
+        meta.update({f"bh_{k}": v for k, v in meta_bh.items()})
+
     try:
         write_metrics_csv(metrics_csv, args, out, meta=meta)
+    except Exception:
+        pass
+
+    # 🔁 백업 기록 루틴(항상 시도: 헤더 자동 보정 & tag 보장)
+    try:
+        setattr(cfg, "method", getattr(args, "method", ""))
+        setattr(cfg, "es_mode", getattr(args, "es_mode", "wealth"))
+        save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
     except Exception:
         pass
 
@@ -521,6 +576,16 @@ def run_rl(args):
 
     t0 = time.perf_counter()
     cfg: SimConfig = make_cfg(args)
+
+    # ✅ 효용-레이어 행동편향 스펙 주입(있으면)
+    bh_spec = None
+    if _parse_bh is not None:
+        try:
+            bh_spec = _parse_bh(args)
+            setattr(cfg, "behavioral_spec", bh_spec)
+        except Exception:
+            setattr(cfg, "behavioral_spec", None)
+
     time_make_cfg = time.perf_counter() - t0
 
     ensure_dir(args.outputs)
@@ -655,6 +720,14 @@ def run_rl(args):
     # 🔗 시장 메타/플래그 주입
     _inject_market_meta(cfg, args, out)
 
+    # ✅ meta에 행동편향 기록
+    if bh_spec is not None:
+        try:
+            out.setdefault("meta", {})
+            out["meta"]["behavioral"] = _bh_describe(bh_spec)
+        except Exception:
+            pass
+
     # ✅ metrics.csv 기록 (항상)
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
@@ -669,8 +742,22 @@ def run_rl(args):
         "use_real_rf": getattr(cfg, "use_real_rf", None),
         "data_window": getattr(cfg, "data_window", None),
     }
+    if bh_spec is not None:
+        try:
+            meta.update({f"bh_{k}": v for k, v in _bh_describe(bh_spec).items()})
+        except Exception:
+            pass
+
     try:
         write_metrics_csv(metrics_csv, args, out, meta=meta)
+    except Exception:
+        pass
+
+    # 🔁 백업 기록 루틴(항상 시도)
+    try:
+        setattr(cfg, "method", "rl")
+        setattr(cfg, "es_mode", getattr(args, "es_mode", "wealth"))
+        save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
     except Exception:
         pass
 

@@ -1,6 +1,7 @@
 ﻿# project/runner/pack_utils.py
 from __future__ import annotations
 from typing import Any, Dict, Iterable, Optional, Tuple, List
+from ..eval import save_metrics_autocsv  # ← 추가: CSV 기록 백업용
 
 from .cvar_utils import maybe_extract_WT
 

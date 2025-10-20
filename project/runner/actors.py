@@ -14,6 +14,16 @@ from ..policy.kgr_rule import (
     KGRLiteConfig, kgr_lite_init, kgr_lite_update_yearly, kgr_lite_policy_step,
 )
 
+# 행동편향(action-layer) 래퍼: 있으면 사용, 없으면 no-op
+try:
+    from ..policy.behavioral_bias import make_bias_wrapper  # type: ignore
+except Exception:
+    def make_bias_wrapper(_args, _env):  # type: ignore
+        def _noop(actor: Callable[[Any], Tuple[float, float]]) -> Callable[[Any], Tuple[float, float]]:
+            return actor
+        return _noop
+
+
 # --------------------------
 # Adapters & Safety
 # --------------------------
@@ -179,7 +189,6 @@ def rule_actor_kgr(cfg: SimConfig, env: RetirementEnv, *, quiet: bool) -> Callab
 
         q_annual = float(out.get("q_t", q_floor_ann))
         q_m = 1.0 - (1.0 - q_annual) ** (1.0 / steps_per_year)
-        # 최종 클립은 공통 함수로
         return _clip_action(q_m, float(getattr(kgr_cfg, "w_fixed", w_fixed)), cfg)
     return actor
 
@@ -307,9 +316,15 @@ def build_rl_actor(cfg: SimConfig, _args):
 def build_actor(cfg: SimConfig, args):
     env = RetirementEnv(cfg)  # 일부 룰 정책이 참조
     if args.method == "rule":
-        return build_rule_actor(cfg, args, env)
-    if args.method == "hjb":
-        return build_hjb_actor(cfg, args, env)
-    if args.method == "rl":
-        return build_rl_actor(cfg, args)
-    raise SystemExit("Unknown method")
+        base_actor = build_rule_actor(cfg, args, env)
+    elif args.method == "hjb":
+        base_actor = build_hjb_actor(cfg, args, env)
+    elif args.method == "rl":
+        base_actor = build_rl_actor(cfg, args)
+    else:
+        raise SystemExit("Unknown method")
+
+    # (선택) 행동편향(action-layer) 래퍼 적용
+    # behavioral_bias.py가 존재하고 --bias_on on 등일 때만 효과가 있음
+    wrapper = make_bias_wrapper(args, env)
+    return wrapper(base_actor)

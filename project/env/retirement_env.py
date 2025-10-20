@@ -8,6 +8,20 @@ import math
 import numpy as np
 import pandas as pd
 
+# ===== (옵션) 행동편향: 효용-레이어 훅 =====
+# cfg.behavioral_spec 에서 on/beta/loss_aversion/habit_phi 등을 읽어 보상에 반영
+try:
+    from ..policy.behavioral import (
+        BehavioralSpec,  # type: ignore
+        distort_utility, habit_utility,  # type: ignore
+    )
+except Exception:
+    BehavioralSpec = None  # type: ignore
+    def distort_utility(u: float, *, ref: float = 0.0, spec=None) -> float:  # type: ignore
+        return float(u)
+    def habit_utility(u: float, prev_u: float, *, spec=None) -> float:  # type: ignore
+        return float(u)
+
 # ---------- helpers ----------
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
@@ -23,7 +37,6 @@ def _to_monthly_rate_like(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=float)
     if x.size == 0:
         return x
-    # 지수/율 구분 휴리스틱
     is_index_like = (np.nanmax(x) > 5.0) or (np.nanmedian(np.abs(x)) > 0.2)
     if is_index_like and x.size >= 2:
         r = np.empty_like(x, dtype=float)
@@ -102,6 +115,11 @@ class RetirementEnv:
       market_mode='bootstrap'일 때 블록부트스트랩, 'iid'면 파라메트릭 IID.
 
     step() 반환: (obs, reward, done, trunc, info)
+
+    변경 요약(리팩터링):
+      • [ANN] init_annuity에 r_f_real_annual를 옵션 전달, 외생소득 y_ann은 c = y_ann + q*W_start로 처리(기존 유지)
+      • [Behavioral/Utility] cfg.behavioral_spec가 있으면 distort_utility/habit_utility로 보상 변환
+      • [Bias Signals] info에 recent_ret/recent_vol 제공(액션-레이어 편향 모듈이 참조)
     """
 
     # --- cfg/kwargs 통합 접근자 ---
@@ -174,6 +192,10 @@ class RetirementEnv:
         self.mort_table_df: Optional[pd.DataFrame] = None
         self.r_f_real_annual: Optional[float] = None
         self._init_mortality_if_any(cfg, kwargs)
+
+        # --- (옵션) 행동편향 사양 입력(효용-레이어) ---
+        self._bh_spec = getattr(cfg, "behavioral_spec", None)
+        self._prev_u_for_habit = 0.0  # 습관효용용 이전 효용(왜곡 후)
 
         # --- seeding / RNG ---
         seeds = self._get(cfg, kwargs, "seeds", [0]) or [0]
@@ -275,12 +297,18 @@ class RetirementEnv:
             return
         try:
             cfg = AnnuityConfig(on=True, alpha=self.ann_alpha, L=self.ann_L, d=self.ann_d, index=self.ann_index)
-            W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table)
+            # r_f_real_annual이 있으면 전달 (함수 시그니처가 허용하면)
+            try:
+                W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table, self.r_f_real_annual)  # type: ignore[misc]
+            except TypeError:
+                # 구버전 시그니처 호환
+                W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table)  # type: ignore[misc]
+
             self.W = float(W_after)
-            self.y_ann = float(st.y_ann)
-            self.ann_purchased = bool(st.purchased)
-            self.ann_P = float(st.P)
-            self.ann_a_factor = float(st.a_factor)
+            self.y_ann = float(getattr(st, "y_ann", 0.0))
+            self.ann_purchased = bool(getattr(st, "purchased", True))
+            self.ann_P = float(getattr(st, "P", 0.0))
+            self.ann_a_factor = float(getattr(st, "a_factor", 0.0))
         except Exception:
             pass  # 실패 시 조용히 무시
 
@@ -313,6 +341,9 @@ class RetirementEnv:
         self.ann_purchased = False
         self.ann_P = 0.0
         self.ann_a_factor = 0.0
+
+        # (효용-레이어) 이전 효용 초기화
+        self._prev_u_for_habit = 0.0
 
         # 경로 생성
         if self.market_mode == "bootstrap":
@@ -383,14 +414,12 @@ class RetirementEnv:
           - step(q, w)
           - step([q, w]) / step((q, w)) / step(np.array([q, w]))
         Returns: (obs, reward, done, trunc, info)
-        변경점 요약:
-          - clipping → consumption → returns(+hedge) → fee
-          - floor_on: q_min=max(q_floor_base, f_min_real/W)
-          - 헤지 비용은 hedge_active=True 스텝에만 1회 차감
-          - fee는 본 스텝 시작 자산(W_t) 기준 월차감 (정책 규약)
-          - 매 스텝 후 is_new_year / cpi_yoy 갱신
-          - [ANN] c = y_ann + q*W (연금은 외부 유입)
-          - 모든 입력/중간값 NaN/Inf 방호
+
+        처리 순서:
+          clipping → consumption → returns(+hedge) → fee
+          floor_on: q_min=max(q_floor_base, f_min_real/W)
+          [ANN] c = y_ann + q*W_start (연금소득은 외생 유입)
+          효용-레이어 편향(있으면) → 보상 변환
         """
         # ---- parse (q, w) ----
         if len(args) == 1 and not kwargs:
@@ -449,10 +478,21 @@ class RetirementEnv:
         fee   = _safe_float(fee_m * W_start, 0.0)
         self.W = max(_safe_float(W_before_fee - fee, 0.0), 0.0)
 
-        # 보상(효용 + 생존)
-        reward = _safe_float(getattr(self, "u_scale", 0.0), 0.0) * _crra_u(
-            c, _safe_float(getattr(self, "crra_gamma", 3.0), 3.0)
-        ) + _safe_float(getattr(self, "survive_bonus", 0.0), 0.0)
+        # ----- 효용 및 보상 (효용-레이어 행동편향 반영) -----
+        base_u = _crra_u(c, _safe_float(getattr(self, "crra_gamma", 3.0), 3.0))
+        u_eff = base_u
+        spec = getattr(self, "_bh_spec", None)
+        if spec is not None and getattr(spec, "on", False):
+            try:
+                u1 = distort_utility(base_u, ref=0.0, spec=spec)
+                u2 = habit_utility(u1, self._prev_u_for_habit, spec=spec)
+                self._prev_u_for_habit = float(u1)
+                u_eff = float(u2)
+            except Exception:
+                # 실패 시 원래 효용 사용
+                u_eff = base_u
+        reward = _safe_float(getattr(self, "u_scale", 0.0), 0.0) * _safe_float(u_eff, base_u) \
+                 + _safe_float(getattr(self, "survive_bonus", 0.0), 0.0)
 
         # advance time ------------------------------------------------------
         self.t += 1
@@ -471,6 +511,15 @@ class RetirementEnv:
             self.cpi_yoy = 0.0
 
         done = (self.t >= self.T) or (self.W <= 0.0)
+
+        # ----- Bias 신호(액션-레이어 편향 모듈용) -----
+        # 최근 1개월 수익률, 최근 12개월 변동성
+        recent_ret = float(r_risky_raw)
+        if self.t >= 12:
+            win = _nan_guard_arr(self.path_risky[self.t-12:self.t], fill=0.0)
+            recent_vol = float(np.std(win))
+        else:
+            recent_vol = 0.0
 
         # 진단 플래그 (정합성 체크)
         flip_neg_to_pos = (r_risky_raw < 0.0 and r_risky_eff >= 0.0)
@@ -500,6 +549,8 @@ class RetirementEnv:
             "is_new_year": bool(self.is_new_year),
             "age_years": float(self.age_years),
             "life_table": bool(self.life_table is not None),
+            "recent_ret": recent_ret,
+            "recent_vol": recent_vol,
             "FlipNegToPos": bool(flip_neg_to_pos),
             "UpDriftRate": bool(up_drift),
         }

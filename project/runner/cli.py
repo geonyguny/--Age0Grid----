@@ -26,6 +26,13 @@ from .eta_utils import (
 from .cvar_utils import fixup_metrics_with_cvar
 from .pack_utils import prune_for_stdout, maybe_evaluate_with_es_mode
 
+# Behavioral spec echo (메타 기록용)
+try:
+    from ..policy.behavioral import parse_behavioral_from_args, describe as _bh_describe  # type: ignore
+except Exception:
+    parse_behavioral_from_args = None  # type: ignore
+    _bh_describe = None  # type: ignore
+
 # (옵션) 구성 해시/버전 정보
 try:
     from ..utils.config_hash import config_hash as _cfg_hash_fn  # type: ignore
@@ -177,10 +184,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--crra_gamma", type=float, default=3.0)
     p.add_argument("--u_scale", type=float, default=0.0)
 
-    # Lite overrides
+    # Lite overrides / Utility reporting
     p.add_argument("--q_floor", type=float, default=None)
-    p.add_argument("--beta", type=float, default=None)
-    # Utility reporting
+    p.add_argument("--beta", type=float, default=None,
+                   help="(utility present-bias) 0<beta<=1 권장. 효용층 현재편향 강도.")
     p.add_argument("--report_utility", choices=["on", "off"], default="off")
     p.add_argument("--delta_annual", type=float, default=None)
 
@@ -218,6 +225,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--h_FX", type=float, default=None)
     p.add_argument("--fx_hedge_cost", type=float, default=None)
 
+    # Behavioral (utility-layer)
+    p.add_argument("--bh_on", choices=["on", "off"], default="off",
+                   help="효용 기반 편향 토글(손실가중/현재편향/습관효용 등).")
+    p.add_argument("--la_k", type=float, default=1.0,
+                   help="손실가중 λ (권장 >=1.0).")
+    p.add_argument("--habit_phi", type=float, default=0.0,
+                   help="습관효용 가중 φ (보통 0~1).")
+
+    # Behavioral Bias (action-layer)
+    p.add_argument("--bias_on", choices=["on", "off"], default="off",
+                   help="행동 출력 편향(행동/결정 레이어 후처리) 토글.")
+    p.add_argument("--bias_loss_aversion", type=float, default=0.0,
+                   help="최근 손실 신호에서 w 축소 강도 (>=0).")
+    p.add_argument("--bias_prob_gamma", type=float, default=1.0,
+                   help="확률 왜곡 γ (>0, 1이면 중립; <1이면 꼬리 과대평가).")
+    p.add_argument("--bias_myopia", type=float, default=0.0,
+                   help="근시 편향 강도: q를 약간 상향 (>=0).")
+    p.add_argument("--bias_w_floor", type=float, default=0.0,
+                   help="행동층 risky 최소비중 하한 (0~1).")
+    p.add_argument("--bias_w_cap_shock", type=float, default=0.0,
+                   help="변동성 신호 기반 추가 w 캡 강도 (>=0).")
+
     # stdout control
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full")
     p.add_argument("--metrics_keys", type=str,
@@ -246,15 +275,70 @@ def _apply_data_profile_defaults(args) -> None:
 
 
 def _validate_args(args) -> None:
+    # data_window 형식
     if args.data_window is not None:
         s = str(args.data_window).strip()
         if s and not _WINDOW_RE.match(s):
             raise SystemExit(f"--data_window 형식 오류: '{args.data_window}'. 예: 2005-01:2020-12 또는 '2005-01:' / ':2020-12'")
+    # bootstrap 입력
     if args.method in ("hjb", "rule", "rl") and args.market_mode == "bootstrap":
         if not args.market_csv and not args.data_profile:
             raise SystemExit("market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full) 필요.")
+    # rule baseline 필수
     if args.method == "rule" and not args.baseline:
         raise SystemExit("method=rule 사용 시 --baseline (4pct|cpb|vpw|kgr) 필수.")
+
+    # --- Behavioral (utility-layer) sanity checks (경고 위주) ---
+    def _warn(msg: str):
+        print(f"[warn] {msg}", file=sys.stderr, flush=True)
+
+    # beta: 권장 0<β<=1
+    if args.beta is not None:
+        try:
+            b = float(args.beta)
+            if not (0.0 < b <= 1.0):
+                _warn(f"--beta 권장범위 벗어남 (got {b}). 보통 0<beta<=1.")
+        except Exception:
+            _warn("--beta 파싱 실패")
+
+    # la_k: 권장 >=1.0
+    try:
+        if float(args.la_k) < 0.0:
+            _warn(f"--la_k 음수({args.la_k})는 비권장. 보통 λ>=1.0.")
+    except Exception:
+        _warn("--la_k 파싱 실패")
+
+    # habit_phi: 권장 0~1
+    if args.habit_phi is not None:
+        try:
+            hp = float(args.habit_phi)
+            if not (0.0 <= hp <= 1.0):
+                _warn(f"--habit_phi 권장범위(0~1) 벗어남 (got {hp}).")
+        except Exception:
+            _warn("--habit_phi 파싱 실패")
+
+    # --- Behavioral Bias (action-layer) sanity checks ---
+    for name in ["bias_loss_aversion", "bias_myopia", "bias_w_cap_shock"]:
+        v = getattr(args, name, 0.0)
+        try:
+            if float(v) < 0.0:
+                _warn(f"--{name} 음수는 비권장 (got {v}). 0 이상 사용을 권장.")
+        except Exception:
+            _warn(f"--{name} 파싱 실패")
+
+    try:
+        if float(args.bias_prob_gamma) <= 0.0:
+            _warn(f"--bias_prob_gamma > 0 이어야 함 (got {args.bias_prob_gamma}).")
+    except Exception:
+        _warn("--bias_prob_gamma 파싱 실패")
+
+    if args.bias_w_floor is not None:
+        try:
+            wf = float(args.bias_w_floor)
+            if not (0.0 <= wf <= 1.0):
+                _warn(f"--bias_w_floor 권장범위(0~1) 벗어남 (got {wf}).")
+        except Exception:
+            _warn("--bias_w_floor 파싱 실패")
 
 
 def _inject_meta(out: Dict[str, Any], args) -> None:
@@ -265,6 +349,30 @@ def _inject_meta(out: Dict[str, Any], args) -> None:
     meta.setdefault("method", getattr(args, "method", None))
     meta.setdefault("asset", getattr(args, "asset", None))
     meta.setdefault("outputs_abs", getattr(args, "outputs", None))
+
+    # 행동/효용 편향 스펙 메타 기록 (env에서 반영하려면 run.py에서 cfg.behavioral_spec 주입 필요)
+    try:
+        if parse_behavioral_from_args and _bh_describe:
+            _spec = parse_behavioral_from_args(args)
+            meta["behavioral"] = _bh_describe(_spec)
+        else:
+            meta.setdefault("behavioral", {
+                "bh_on": getattr(args, "bh_on", "off"),
+                "la_k": getattr(args, "la_k", 1.0),
+                "beta": getattr(args, "beta", None),
+                "habit_phi": getattr(args, "habit_phi", 0.0),
+            })
+        meta.setdefault("behavioral_bias", {
+            "bias_on": getattr(args, "bias_on", "off"),
+            "loss_aversion": getattr(args, "bias_loss_aversion", 0.0),
+            "prob_gamma": getattr(args, "bias_prob_gamma", 1.0),
+            "myopia": getattr(args, "bias_myopia", 0.0),
+            "w_floor": getattr(args, "bias_w_floor", 0.0),
+            "w_cap_shock": getattr(args, "bias_w_cap_shock", 0.0),
+        })
+    except Exception:
+        pass
+
     if _cfg_hash_fn:
         try:
             meta["config_hash"] = _cfg_hash_fn(vars(args))
