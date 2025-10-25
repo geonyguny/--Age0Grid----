@@ -37,7 +37,7 @@ jobs:
           function RunJson([object]) {
              = .\.venv\Scripts\python.exe -m project.runner.cli @argv
             if (0 -ne 0) { throw "CLI fail 0
-" }
+          " }
             return ( | ConvertFrom-Json)
           }
 

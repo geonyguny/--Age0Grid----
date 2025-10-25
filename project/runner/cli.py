@@ -6,6 +6,8 @@ import os
 import re
 import time
 import sys
+import io
+import contextlib
 from typing import Any, Dict, List
 
 import numpy as np  # ES95 임시 계산에 사용
@@ -76,8 +78,6 @@ def _normalize_seeds(seeds_arg: List[int]) -> List[int]:
     if not isinstance(seeds_arg, list) or len(seeds_arg) == 0:
         return [0, 1, 2, 3, 4]
     if len(seeds_arg) == 1:
-        # 의미 모호성을 제거: 값 n을 단일 시드로 해석하지 말고 "0..n-1"로 해석하려면 아래 주석 해제
-        # n = int(seeds_arg[0]); return list(range(max(n, 1)))
         return [int(seeds_arg[0])]
     return sorted({int(x) for x in seeds_arg})
 
@@ -90,14 +90,37 @@ def _print_metrics_summary(metrics: dict) -> None:
         f"Ruin          : {metrics.get('Ruin')}",
         f"mean_WT       : {metrics.get('mean_WT')}",
         f"es95_source   : {metrics.get('es95_source')}",
-        # EU 리포팅
         f"EU            : {metrics.get('EU')}",
         f"EU_per_year   : {metrics.get('EU_per_year')}",
         f"delta_annual  : {metrics.get('delta_annual')}",
-        # 손실 기준선 감사
         f"F_target_used : {metrics.get('F_target_used')}",
     ]
     print("\n".join([s for s in lines if s is not None]))
+
+
+def _safe_print_json(obj: Any) -> None:
+    """
+    최종 stdout에 **오직 JSON 하나**만 출력.
+    - ensure_ascii=False: 한글 보존
+    - sort_keys=True: metrics 모드 같은 비교 시 안정적
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        # JSON 직렬화 불가한 타입 최소화 처리
+        s = json.dumps(_json_fallback(obj), ensure_ascii=False, sort_keys=True)
+    print(s)
+
+
+def _json_fallback(x: Any) -> Any:
+    # dict/list/기본형만 남기기 위한 best-effort 변환
+    if isinstance(x, dict):
+        return {k: _json_fallback(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_json_fallback(v) for v in x]
+    if isinstance(x, (str, int, float, bool)) or x is None:
+        return x
+    return str(x)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -265,10 +288,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eta_budget_s", type=float, default=None)
     p.add_argument("--eta_hard_stop", choices=["on", "off"], default="on")
     p.add_argument("--eta_db", type=str, default=None)
+
+    # Eval-time randomness
     p.add_argument("--eval_seed_jitter", choices=["on", "off"], default="off",
                    help="on이면 평가 에피소드 시드에 시각 기반 소량 지터를 더해 매 실행 시 약간 다른 결과가 나오게 함.")
-    
+
     return p
+
 
 def _apply_data_profile_defaults(args) -> None:
     if getattr(args, "data_profile", None) and not getattr(args, "market_csv", None):
@@ -406,50 +432,8 @@ def _compute_es95_from_losses(losses: List[float] | None, alpha: float = 0.95) -
     return float(np.mean(tail))
 
 
-def main():
-    t0 = time.perf_counter()
-    p = _build_arg_parser()
-    args = p.parse_args()
-
-    # normalize outputs
-    args.outputs = _normalize_outputs_path(getattr(args, "outputs", None))
-
-    # seeds normalize
-    try:
-        if getattr(args, "seed", None) is not None:
-            args.seeds = [int(args.seed)]
-        else:
-            args.seeds = _normalize_seeds(list(getattr(args, "seeds", [])))
-    except Exception:
-        args.seeds = [0]
-
-    parsed_w_grid = _csv_floats(getattr(args, "hjb_w_grid", None))
-    if parsed_w_grid is not None:
-        args.hjb_w_grid = parsed_w_grid
-
-    _apply_data_profile_defaults(args)
-    _validate_args(args)
-
-    # ETA budget check (best-effort)
-    try:
-        if str(getattr(args, "eta_mode", "history")).lower() == "history":
-            db = eta_load_db(eta_db_path(args))
-            eta_s, src = predict_eta_from_history(args, db)
-            if eta_s is not None:
-                print(f"[ETA] ~{fmt_hms(eta_s)} (source={src}) … starting", file=sys.stderr, flush=True)
-                budget = getattr(args, "eta_budget_s", None)
-                if budget is None:
-                    budget = parse_hms_to_seconds(getattr(args, "eta_budget_hms", None))
-                if budget is not None and eta_s > float(budget):
-                    if str(getattr(args, "eta_hard_stop", "on")).lower() == "on":
-                        print(f"[ETA] exceeds budget {fmt_hms(budget)} → abort.", file=sys.stderr, flush=True)
-                        sys.exit(3)
-                    else:
-                        print(f"[ETA] exceeds budget {fmt_hms(budget)} → continue (soft-warn).",
-                              file=sys.stderr, flush=True)
-    except Exception as _e:
-        print(f"[ETA] predictor skipped ({type(_e).__name__})", file=sys.stderr, flush=True)
-
+def _run_core(args) -> Dict[str, Any] | Any:
+    """실제 실행 경로(학습/평가/보정)를 분리 — stdout은 여기서 절대 출력하지 않음."""
     want_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
 
     # routing
@@ -493,40 +477,90 @@ def main():
     except Exception:
         pass
 
+    return out
+
+
+def main():
+    t0 = time.perf_counter()
+    p = _build_arg_parser()
+    args = p.parse_args()
+
+    # normalize outputs
+    args.outputs = _normalize_outputs_path(getattr(args, "outputs", None))
+
+    # seeds normalize
+    try:
+        if getattr(args, "seed", None) is not None:
+            args.seeds = [int(args.seed)]
+        else:
+            args.seeds = _normalize_seeds(list(getattr(args, "seeds", [])))
+    except Exception:
+        args.seeds = [0]
+
+    parsed_w_grid = _csv_floats(getattr(args, "hjb_w_grid", None))
+    if parsed_w_grid is not None:
+        args.hjb_w_grid = parsed_w_grid
+
+    _apply_data_profile_defaults(args)
+    _validate_args(args)
+
+    # ETA budget check (stderr만 사용)
+    try:
+        if str(getattr(args, "eta_mode", "history")).lower() == "history":
+            db = eta_load_db(eta_db_path(args))
+            eta_s, src = predict_eta_from_history(args, db)
+            if eta_s is not None:
+                print(f"[ETA] ~{fmt_hms(eta_s)} (source={src}) … starting", file=sys.stderr, flush=True)
+                budget = getattr(args, "eta_budget_s", None)
+                if budget is None:
+                    budget = parse_hms_to_seconds(getattr(args, "eta_budget_hms", None))
+                if budget is not None and eta_s > float(budget):
+                    if str(getattr(args, "eta_hard_stop", "on")).lower() == "on":
+                        print(f"[ETA] exceeds budget {fmt_hms(budget)} → abort.", file=sys.stderr, flush=True)
+                        sys.exit(3)
+                    else:
+                        print(f"[ETA] exceeds budget {fmt_hms(budget)} → continue (soft-warn).",
+                              file=sys.stderr, flush=True)
+    except Exception as _e:
+        print(f"[ETA] predictor skipped ({type(_e).__name__})", file=sys.stderr, flush=True)
+
+    # -------- 핵심: **모든 실행 구간의 stdout 캡처** (순수 JSON 보장) --------
+    # quiet 여부와 상관없이, 외부 모듈이 실수로 stdout을 찍어도 여기서 잡아서 버립니다.
+    captured_stdout = io.StringIO()
+    with contextlib.redirect_stdout(captured_stdout):
+        out = _run_core(args)
+
     # total time
     elapsed = time.perf_counter() - t0
     if isinstance(out, dict):
         out["time_total_s"] = round(elapsed, 3)
         out["time_total_hms"] = fmt_hms(elapsed)
 
-    # Validation (simple)
-    try:
-        if str(getattr(args, "validate","off")).lower()=="on" and isinstance(out, dict):
-            from .validate.checks import basic_checks
-            tgt = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
-            vres = basic_checks(tgt, hjb_ref=None)
-            out.setdefault("validation", vres)
-    except Exception:
-        pass
-
-    # ETA history
-    try:
-        eta_record(args, elapsed)
-    except Exception:
-        pass
-
-    # summary mode short-circuit
+    # summary 모드: 텍스트 요약만 stdout (JSON 아님). 요구사항상 그대로 유지.
     if str(getattr(args, "print_mode", "full")).lower() == "summary":
         if isinstance(out, dict):
             metrics = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
+            # summary는 사용자 육안 확인용이므로 JSON 강제 제외(요청 사양 유지)
             _print_metrics_summary(metrics)
         else:
             print("[warn] summary mode but no metrics dict available.")
         return
 
-    # stdout (JSON)
-    to_print = prune_for_stdout(args, out) if isinstance(out, dict) else out
-    print(json.dumps(to_print, ensure_ascii=False))
+    # stdout (JSON only)
+    if str(getattr(args, "print_mode", "full")).lower() == "metrics" and isinstance(out, dict):
+        m = out.get("metrics", {})
+        keys = [s.strip() for s in str(getattr(args, "metrics_keys","")).split(",") if s.strip()]
+        if keys:
+            m = {k: m.get(k, None) for k in keys}
+        _safe_print_json(m)  # ← 순수 JSON 한 방
+    else:
+        to_print = prune_for_stdout(args, out) if isinstance(out, dict) else out
+        _safe_print_json(to_print)  # ← 순수 JSON 한 방
+
+    # 참고: captured_stdout.getvalue()에는 내부 모듈이 찍은 stdout이 담김.
+    # 디버깅 목적으로 남기고 싶다면 파일에 남기세요(여긴 콘솔 깨끗하게 유지).
+    # with open(os.path.join(args.outputs, "_logs", "stdout_captured.txt"), "a", encoding="utf-8") as f:
+    #     f.write(captured_stdout.getvalue())
 
 
 if __name__ == "__main__":

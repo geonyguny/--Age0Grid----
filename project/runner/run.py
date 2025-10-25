@@ -25,6 +25,7 @@ try:
     from project.policy.behavioral import parse_behavioral_from_args as _parse_bh, describe as _bh_describe  # type: ignore
 except Exception:
     _parse_bh = None
+
     def _bh_describe(_spec) -> Dict[str, Any]:  # type: ignore
         try:
             return {
@@ -70,7 +71,6 @@ def _es_tail_mean(arr, alpha=0.95):
     if n == 0:
         return None
     k = max(1, int(_np.ceil((1.0 - float(alpha)) * n)))
-    # 하위 k개 요소 평균
     part = _np.partition(x, k - 1)[:k]
     return float(_np.mean(part))
 
@@ -84,15 +84,48 @@ def _cvar_loss_from_wealth(arr, F_target, alpha=0.95):
         return None
     loss = _np.maximum(float(F_target) - x, 0.0)
     k = max(1, int(_np.ceil((1.0 - float(alpha)) * n)))
-    # 손실 상위 k개 평균
     part = _np.partition(loss, -(k))[-k:]
     return float(_np.mean(part))
 
 
 # --------------------------
-# Helpers: parsing mix / hedge
+# Data integrity helpers (NEW)
+# --------------------------
+def _len1d(x):
+    try:
+        a = _np.asarray(x)
+        return int(a.shape[0])
+    except Exception:
+        return 0
+
+
+def _assert_dates_monotonic(dates):
+    try:
+        d = _np.asarray(dates)
+        if d.size <= 1:
+            return
+        if not _np.all(d[1:] > d[:-1]):
+            raise ValueError("dates not strictly increasing")
+    except Exception as e:
+        raise SystemExit(f"[data] invalid dates sequence: {type(e).__name__}: {e}")
+
+
+def _nan_ratio(x):
+    try:
+        a = _np.asarray(x, dtype=float)
+        n = a.size
+        if n == 0:
+            return 0.0
+        return float(_np.isnan(a).sum()) / float(n)
+    except Exception:
+        return 0.0
+
+
+# --------------------------
+# Helpers: parsing mix / hedge  ★★ (호출부보다 위에 위치) ★★
 # --------------------------
 def _parse_alpha_mix(args) -> Tuple[float, float, float]:
+    """alpha 믹스를 (--alpha_mix 'kr,us,au' | 세 개의 개별 플래그)에서 읽어 정규화."""
     def _as_float(x, default=None):
         try:
             return float(x)
@@ -117,11 +150,12 @@ def _parse_alpha_mix(args) -> Tuple[float, float, float]:
 
     s = kr + us + au
     if s <= 0:
-        return (1/3, 1/3, 1/3)
+        return (1 / 3, 1 / 3, 1 / 3)
     return (kr / s, us / s, au / s)
 
 
 def _get_fx_hedge_params(args) -> Tuple[float, float]:
+    """환헤지 비중 h_FX(0~1), 연간 헤지비용을 읽어 반환."""
     h = getattr(args, "h_FX", getattr(args, "h_fx", None))
     try:
         h = float(h)
@@ -175,8 +209,10 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
 
     if _onoff(getattr(args, "quiet", "on")) != "on":
         try:
-            print(f"[market] mode={market_mode}, block={bootstrap_block}, use_real_rf={use_real_rf}, "
-                  f"window='{data_window or ''}', profile='{data_profile or ''}', csv='{market_csv or ''}'")
+            print(
+                f"[market] mode={market_mode}, block={bootstrap_block}, use_real_rf={use_real_rf}, "
+                f"window='{data_window or ''}', profile='{data_profile or ''}', csv='{market_csv or ''}'"
+            )
         except Exception:
             pass
 
@@ -217,15 +253,43 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         cache=True,
     )
 
+    # === integrity checks & quick stats (NEW) ===
+    dates = blob.get("dates")
+    _assert_dates_monotonic(dates)
+
+    _L = {
+        "ret_kr_eq": _len1d(blob.get("ret_kr_eq")),
+        "ret_us_eq_krw": _len1d(blob.get("ret_us_eq_krw")),
+        "ret_gold_krw": _len1d(blob.get("ret_gold_krw")),
+        "rf_real": _len1d(blob.get("rf_real")),
+        "rf_nom": _len1d(blob.get("rf_nom")),
+        "dates": _len1d(dates),
+    }
+    lens_nonzero = [v for v in _L.values() if v > 0]
+    T_min = min(lens_nonzero) if lens_nonzero else 0
+
+    _NaN = {
+        "ret_kr_eq": _nan_ratio(blob.get("ret_kr_eq")),
+        "ret_us_eq_krw": _nan_ratio(blob.get("ret_us_eq_krw")),
+        "ret_gold_krw": _nan_ratio(blob.get("ret_gold_krw")),
+        "rf_real": _nan_ratio(blob.get("rf_real")),
+        "rf_nom": _nan_ratio(blob.get("rf_nom")),
+    }
+
+    data_window = getattr(args, "data_window", None)
+    if data_window and T_min < 24:
+        raise SystemExit(
+            f"[data] window too short (need >=24). window='{data_window}', lens={_L}"
+        )
+
     ret_kr = blob.get("ret_kr_eq")
     ret_us_l = blob.get("ret_us_eq_krw")
     ret_au = blob.get("ret_gold_krw")
     rf_real = blob.get("rf_real")
     rf_nom = blob.get("rf_nom")
-    dates = blob.get("dates")
     cpi = blob.get("cpi")
     ret_fx = blob.get("ret_fx", None)
-    if ret_fx is None:
+    if ret_fx is None or (hasattr(ret_fx, "size") and ret_fx.size == 0):
         ret_fx = blob.get("ret_fx_usdkrw", None)
 
     import numpy as np
@@ -252,9 +316,12 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
 
         lens = [x.shape[0] for x in [kr, us, au] if isinstance(x, np.ndarray)]
         T = min(lens) if len(lens) >= 1 else 0
-        if isinstance(kr, np.ndarray): kr = kr[:T]
-        if isinstance(us, np.ndarray): us = us[:T]
-        if isinstance(au, np.ndarray): au = au[:T]
+        if isinstance(kr, np.ndarray):
+            kr = kr[:T]
+        if isinstance(us, np.ndarray):
+            us = us[:T]
+        if isinstance(au, np.ndarray):
+            au = au[:T]
         mixed = a_kr * kr + a_us * us + a_au * au
 
         setattr(cfg, "alpha_mix", (a_kr, a_us, a_au))
@@ -277,11 +344,13 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
             a = getattr(cfg, "alpha_mix", None)
             a_str = f"alpha={a}" if a is not None else "alpha=legacy"
             print(
-                f"[data] len={len(mixed) if mixed is not None else 0}, "
+                "[data] "
+                f"len_total={len(mixed) if mixed is not None else 0}, "
                 f"ret_mean={ret_mean:.4f}, rf_mean={rf_mean:.4f}, "
                 f"h_FX={getattr(cfg,'h_FX',0.0):.2f}, {a_str}, "
                 f"asset={getattr(cfg, 'asset', '?')}, window={getattr(cfg, 'data_window', None)}"
             )
+            print("[data] lens=", _L, " NaN%=", {k: round(v * 100, 3) for k, v in _NaN.items()})
         except Exception:
             pass
 
@@ -357,9 +426,7 @@ def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: An
     return _np.asarray([0.0, float(getattr(env, "W", 0.0))], dtype=float)
 
 
-def _rollout_terminal_wealths(cfg: SimConfig,
-                              actor: Callable[[Any], tuple[float, float]],
-                              n_paths: int) -> List[float]:
+def _rollout_terminal_wealths(cfg: SimConfig, actor: Callable[[Any], tuple[float, float]], n_paths: int) -> List[float]:
     env = RetirementEnv(cfg)
     WTs: List[float] = []
     n_paths = int(max(1, n_paths))
@@ -408,14 +475,23 @@ def run_once(args) -> Dict[str, Any]:
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
-        t1 = time.perf_counter(); _wire_market_data(cfg, args); time_wire_data = time.perf_counter() - t1
+        t1 = time.perf_counter()
+        _wire_market_data(cfg, args)
+        time_wire_data = time.perf_counter() - t1
+
         t2 = time.perf_counter()
         ann_enabled = (_onoff(getattr(args, "ann_on", "off")) == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
-        if ann_enabled: setup_annuity_overlay(cfg, args)
+        if ann_enabled:
+            setup_annuity_overlay(cfg, args)
         time_annuity = time.perf_counter() - t2
 
-        t3 = time.perf_counter(); actor = build_actor(cfg, args); time_build_actor = time.perf_counter() - t3
-        t4 = time.perf_counter(); m, extras = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth")); time_eval = time.perf_counter() - t4
+        t3 = time.perf_counter()
+        actor = build_actor(cfg, args)
+        time_build_actor = time.perf_counter() - t3
+
+        t4 = time.perf_counter()
+        m, extras = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
+        time_eval = time.perf_counter() - t4
 
     extras = extras or {}
     need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
@@ -437,14 +513,16 @@ def run_once(args) -> Dict[str, Any]:
         y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
         a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
         P_val = float(getattr(cfg, "ann_P", 0.0) or 0.0)
-        m.update({"y_ann": y_ann if y_ann != 0.0 else 0.0,
-                  "ann_a_factor": a_fac if a_fac != 0.0 else 0.0,
-                  "a_factor": a_fac if a_fac != 0.0 else 0.0,
-                  "P": P_val if P_val != 0.0 else 0.0})
+        m.update({
+            "y_ann": y_ann if y_ann != 0.0 else 0.0,
+            "ann_a_factor": a_fac if a_fac != 0.0 else 0.0,
+            "a_factor": a_fac if a_fac != 0.0 else 0.0,
+            "P": P_val if P_val != 0.0 else 0.0,
+        })
 
-        if bh_spec is not None:
+        if _parse_bh is not None:
             try:
-                m.update(_bh_describe(bh_spec))
+                m.update(_bh_describe(bh_spec))  # type: ignore
             except Exception:
                 pass
 
@@ -485,9 +563,9 @@ def run_once(args) -> Dict[str, Any]:
     _inject_market_meta(cfg, args, out)
 
     meta_bh = None
-    if bh_spec is not None:
+    if _parse_bh is not None:
         try:
-            meta_bh = _bh_describe(bh_spec)
+            meta_bh = _bh_describe(bh_spec)  # type: ignore
         except Exception:
             meta_bh = None
     out.setdefault("meta", {})
@@ -541,28 +619,27 @@ def _build_env_factory_from_args(args, cfg: SimConfig):
 
     # RetirementEnv가 직접 받는 값들은 base_kwargs에 넣는다.
     base_kwargs = dict(
-        horizon_years   = int(args.horizon_years),
-        w_max           = float(args.w_max),
-        fee_annual      = float(fee_annual),
-        floor_on        = "on" if bool(getattr(args, "floor_on", False)) else "off",
-        f_min_real      = float(getattr(args, "f_min_real", 0.0) or 0.0),
-        market_mode     = str(args.market_mode),
-        market_csv      = str(getattr(args, "market_csv", "" ) or ""),
-        bootstrap_block = int(args.bootstrap_block),
-        use_real_rf     = str(args.use_real_rf),
-        survive_bonus   = float(getattr(args, "survive_bonus", 0.0) or 0.0),
-        u_scale         = float(getattr(args, "u_scale", 0.05) or 0.05),
-        crra_gamma      = float(getattr(args, "crra_gamma", 3.0) or 3.0),
-        age0            = int(getattr(args, "age0", 65)),
-        sex             = str(getattr(args, "sex", "M")),
-        F_target        = float(getattr(args, "F_target", 0.0) or 0.0),
+        horizon_years=int(args.horizon_years),
+        w_max=float(args.w_max),
+        fee_annual=float(fee_annual),
+        floor_on="on" if bool(getattr(args, "floor_on", False)) else "off",
+        f_min_real=float(getattr(args, "f_min_real", 0.0) or 0.0),
+        market_mode=str(args.market_mode),
+        market_csv=str(getattr(args, "market_csv", "") or ""),
+        bootstrap_block=int(args.bootstrap_block),
+        use_real_rf=str(args.use_real_rf),
+        survive_bonus=float(getattr(args, "survive_bonus", 0.0) or 0.0),
+        u_scale=float(getattr(args, "u_scale", 0.05) or 0.05),
+        crra_gamma=float(getattr(args, "crra_gamma", 3.0) or 3.0),
+        age0=int(getattr(args, "age0", 65)),
+        sex=str(getattr(args, "sex", "M")),
+        F_target=float(getattr(args, "F_target", 0.0) or 0.0),
         # seeds는 RetirementEnv가 cfg에서 읽을 수 있지만, 혹시 kwargs 경로도 지원한다면 setdefault로 전달
-        seeds           = list(getattr(cfg, "seeds", getattr(args, "seeds", [0]))),
+        seeds=list(getattr(cfg, "seeds", getattr(args, "seeds", [0]))),
     )
 
     # cfg에 주입된 데이터 시리즈가 있을 경우 base_kwargs에도 중복 안전(setdefault)으로 복사
-    for k in ("data_ret_series", "data_rf_series", "data_cpi", "data_dates",
-              "data_ret_kr_eq", "data_ret_us_eq_krw", "data_ret_gold_krw"):
+    for k in ("data_ret_series", "data_rf_series", "data_cpi", "data_dates", "data_ret_kr_eq", "data_ret_us_eq_krw", "data_ret_gold_krw"):
         v = getattr(cfg, k, None)
         if v is not None:
             base_kwargs.setdefault(k, v)
@@ -573,13 +650,14 @@ def _build_env_factory_from_args(args, cfg: SimConfig):
 
     def env_factory():
         return IRPEnvAdapter(
-            f_target   = base_kwargs.get("F_target", 0.0),
-            w_max      = base_kwargs.get("w_max", None),
-            q_floor    = float(getattr(args, "q_floor", 0.0) or 0.0),
-            base_kwargs= base_kwargs,
-            q_cap      = float(getattr(args, "rl_q_cap", 0.0) or 0.0),
-            cfg        = cfg,  # ★ 핵심: cfg 전달
+            f_target=base_kwargs.get("F_target", 0.0),
+            w_max=base_kwargs.get("w_max", None),
+            q_floor=float(getattr(args, "q_floor", 0.0) or 0.0),
+            base_kwargs=base_kwargs,
+            q_cap=float(getattr(args, "rl_q_cap", 0.0) or 0.0),
+            cfg=cfg,  # ★ 핵심: cfg 전달 (IRPEnvAdapter가 지원해야 함)
         )
+
     return env_factory
 
 
@@ -599,7 +677,7 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
     returns = []
     base_seed = int(getattr(tr.cfg, "seed", 0))
 
-    # <<< ADD: 지터 모드일 때 시각 기반 오프셋(낮은 비트만 사용)
+    # <<< 지터 모드: 시각 하위 비트 오프셋
     if eval_seed_jitter:
         base_seed = base_seed + (int(time.time_ns()) & 0xFFFF)
 
@@ -627,207 +705,278 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
         "eval_return_mean": float(_np.mean(returns)) if len(returns) else 0.0,
         "eval_return_std": float(_np.std(returns)) if len(returns) else 0.0,
         "episodes": int(n_episodes),
-        # <<< ADD: 메타 기록
         "eval_seed_mode": "jitter" if eval_seed_jitter else "fixed",
         "eval_seed_base": int(base_seed),
     }
     return out
 
+
 def run_rl(args):
     t_all_0 = time.perf_counter()
 
-    t0 = time.perf_counter()
-    cfg: SimConfig = make_cfg(args)
+    # 🔇 quiet 모드면 stdout/stderr 완전 침묵
+    quiet_ctx = silence_stdio(also_stderr=True) if _onoff(getattr(args, "quiet", "on")) == "on" else contextlib.nullcontext()
 
-    # seeds normalize into cfg (single source of truth)
-    if not hasattr(cfg, "seeds"):
-        setattr(cfg, "seeds", list(getattr(args, "seeds", [0])))
-    if getattr(cfg, "seeds", None):
-        setattr(cfg, "seed", int(cfg.seeds[0]))
+    with quiet_ctx:
+        # -----------------------------
+        # 0) CFG 구성 및 시드 단일화
+        # -----------------------------
+        t0 = time.perf_counter()
+        cfg: SimConfig = make_cfg(args)
 
-    bh_spec = None
-    if _parse_bh is not None:
+        # seeds normalize into cfg (single source of truth)
+        if not hasattr(cfg, "seeds"):
+            setattr(cfg, "seeds", list(getattr(args, "seeds", [0])))
+        # 단일 seed 우선순위: args.seed > cfg.seeds[0]
         try:
-            bh_spec = _parse_bh(args)
-            setattr(cfg, "behavioral_spec", bh_spec)
+            single_seed = int(getattr(args, "seed", None)) if getattr(args, "seed", None) is not None else int(cfg.seeds[0])
         except Exception:
-            setattr(cfg, "behavioral_spec", None)
-    time_make_cfg = time.perf_counter() - t0
+            single_seed = 0
+        setattr(cfg, "seed", int(single_seed))
 
-    ensure_dir(args.outputs)
-    if getattr(args, "tag", None) is not None:
-        setattr(cfg, "tag", args.tag)
+        # behavioral spec (있으면 기록)
+        bh_spec = None
+        if _parse_bh is not None:
+            try:
+                bh_spec = _parse_bh(args)
+                setattr(cfg, "behavioral_spec", bh_spec)
+            except Exception:
+                setattr(cfg, "behavioral_spec", None)
+        time_make_cfg = time.perf_counter() - t0
 
-    t1 = time.perf_counter(); _wire_market_data(cfg, args); time_wire_data = time.perf_counter() - t1
+        # 출력 디렉토리 및 태그
+        ensure_dir(args.outputs)
+        if getattr(args, "tag", None) is not None:
+            setattr(cfg, "tag", args.tag)
 
-    ann_enabled = (_onoff(getattr(args, "ann_on", "off")) == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
-    t2 = time.perf_counter()
-    if ann_enabled: setup_annuity_overlay(cfg, args)
-    time_annuity = time.perf_counter() - t2
+        # -----------------------------
+        # 1) 데이터 배선 + 연금 오버레이
+        # -----------------------------
+        t1 = time.perf_counter()
+        _wire_market_data(cfg, args)
+        time_wire_data = time.perf_counter() - t1
 
-    # ★ cfg를 캡처하는 env 팩토리
-    env_factory = _build_env_factory_from_args(args, cfg)
+        ann_enabled = (_onoff(getattr(args, "ann_on", "off")) == "on" and float(getattr(args, "ann_alpha", 0.0) or 0.0) > 0.0)
+        t2 = time.perf_counter()
+        if ann_enabled:
+            setup_annuity_overlay(cfg, args)
+        time_annuity = time.perf_counter() - t2
 
-    # 🔒 절대경로 임포트 고정
-    try:
-        from project.trainer.rl_trainer import RLConfig, RLTrainer
-    except Exception as e1:
+        # -----------------------------
+        # 2) Env factory (cfg 캡처)
+        # -----------------------------
+        env_factory = _build_env_factory_from_args(args, cfg)
+
+        # -----------------------------
+        # 3) RLTrainer 로드 & 설정
+        # -----------------------------
         try:
-            from ..trainer.rl_trainer import RLConfig, RLTrainer  # type: ignore
-        except Exception as e2:
-            raise SystemExit(f"RL trainer import failed: {e1}")
+            from project.trainer.rl_trainer import RLConfig, RLTrainer
+        except Exception as e1:
+            try:
+                from ..trainer.rl_trainer import RLConfig, RLTrainer  # type: ignore
+            except Exception:
+                raise SystemExit(f"RL trainer import failed: {e1}")
 
-    max_steps = int(args.rl_epochs) * int(args.rl_steps_per_epoch)
-    cfg_rl = RLConfig(
-        obs_dim = -1,
-        hidden_dims = [128, 128],
-        gamma = float(getattr(args, "beta", 0.996) or 0.996),
-        lam = float(getattr(args, "gae_lambda", 0.95) or 0.95),
-        ent_coef = float(getattr(args, "entropy_coef", 0.005) or 0.005),
-        vf_coef = float(getattr(args, "value_coef", 0.5) or 0.5),
-        lr = float(getattr(args, "lr", 3e-4) or 3e-4),
-        max_grad_norm = float(getattr(args, "max_grad_norm", 0.5) or 0.5),
-        max_steps = max_steps,
-        rollout_len = int(getattr(args, "rl_steps_per_epoch", 512) or 512),
-        batch_size = int(getattr(args, "rl_steps_per_epoch", 512) or 512),
-        seed = int(getattr(cfg, "seed", 0)),
-        log_dir = os.path.join(os.path.abspath(args.outputs), "_logs"),
-        tag = str(getattr(args, "tag", "rl_run") or "rl_run"),
-        device = "auto",
-        value_clip = 0.0,
-        entropy_clip = 0.0,
-    )
+        max_steps = int(args.rl_epochs) * int(args.rl_steps_per_epoch)
+        cfg_rl = RLConfig(
+            obs_dim=-1,
+            hidden_dims=[128, 128],
+            gamma=float(getattr(args, "beta", 0.996) or 0.996),
+            lam=float(getattr(args, "gae_lambda", 0.95) or 0.95),
+            ent_coef=float(getattr(args, "entropy_coef", 0.005) or 0.005),
+            vf_coef=float(getattr(args, "value_coef", 0.5) or 0.5),
+            lr=float(getattr(args, "lr", 3e-4) or 3e-4),
+            max_grad_norm=float(getattr(args, "max_grad_norm", 0.5) or 0.5),
+            max_steps=max_steps,
+            rollout_len=int(getattr(args, "rl_steps_per_epoch", 512) or 512),
+            batch_size=int(getattr(args, "rl_steps_per_epoch", 512) or 512),
+            seed=int(getattr(cfg, "seed", 0)),  # ← 단일화된 seed 사용
+            log_dir=os.path.join(os.path.abspath(args.outputs), "_logs"),
+            tag=str(getattr(args, "tag", "rl_run") or "rl_run"),
+            device="auto",
+            value_clip=0.0,
+            entropy_clip=0.0,
+        )
 
-    t3 = time.perf_counter()
-    trainer = RLTrainer(cfg_rl, env_factory)
-    trainer.train()
-    time_train_call = time.perf_counter() - t3
+        # -----------------------------
+        # 4) 학습
+        # -----------------------------
+        t3 = time.perf_counter()
+        trainer = RLTrainer(cfg_rl, env_factory)
+        trainer.train()
+        time_train_call = time.perf_counter() - t3
 
-    t4 = time.perf_counter()
-    extras_dict = _evaluate_collect_WT(
-        trainer, env_factory,
-        int(getattr(args, "rl_n_paths_eval", 64) or 64),
-        eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower()=="on"),
-    )
-    time_eval = time.perf_counter() - t4
+        # -----------------------------
+        # 5) 평가 (WT 수집 + ES/EW 산출)
+        # -----------------------------
+        t4 = time.perf_counter()
+        extras_dict = _evaluate_collect_WT(
+            trainer,
+            env_factory,
+            int(getattr(args, "rl_n_paths_eval", 64) or 64),
+            eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower() == "on"),
+        )
+        time_eval = time.perf_counter() - t4
 
-    # ---- Build metrics from eval_WT (NEW) ----
-    wt = extras_dict.get("eval_WT", []) or []
-    alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
-    es_mode = str(getattr(args, "es_mode", "wealth")).lower()
-    F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
+        # ---- metrics from eval_WT ----
+        wt = extras_dict.get("eval_WT", []) or []
+        alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
+        es_mode = str(getattr(args, "es_mode", "wealth")).lower()
+        F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
 
-    metrics_dict: Dict[str, Any] = {}
-    if len(wt) > 0:
-        ew = float(_np.mean(wt))
-        ruin = float(_np.mean(_np.asarray(wt, dtype=float) <= 0.0))
-        if es_mode == "wealth":
-            es95 = _es_tail_mean(wt, alpha=alpha)
-        else:  # "loss"
-            es95 = _cvar_loss_from_wealth(wt, F_target=F_target, alpha=alpha)
-        metrics_dict.update({
-            "EW": ew,
-            "mean_WT": ew,
-            "ES95": es95,
-            "Ruin": ruin,
-            "es95_source": f"computed_from_eval_WT_{es_mode}",
-            "eval_episodes": int(extras_dict.get("episodes", 0)),
-        })
-    else:
-        metrics_dict.update({
-            "EW": None, "mean_WT": None, "ES95": None, "Ruin": None,
-            "es95_source": "no_eval_WT",
-            "eval_episodes": int(extras_dict.get("episodes", 0)),
-        })
+        metrics_dict: Dict[str, Any] = {}
+        if len(wt) > 0:
+            ew = float(_np.mean(wt))
+            ruin = float(_np.mean(_np.asarray(wt, dtype=float) <= 0.0))
+            if es_mode == "wealth":
+                es95 = _es_tail_mean(wt, alpha=alpha)
+            else:
+                es95 = _cvar_loss_from_wealth(wt, F_target=F_target, alpha=alpha)
+            metrics_dict.update({
+                "EW": ew,
+                "mean_WT": ew,
+                "ES95": es95,
+                "Ruin": ruin,
+                "es95_source": f"computed_from_eval_WT_{es_mode}",
+                "eval_episodes": int(extras_dict.get("episodes", 0)),
+            })
+        else:
+            metrics_dict.update({
+                "EW": None,
+                "mean_WT": None,
+                "ES95": None,
+                "Ruin": None,
+                "es95_source": "no_eval_WT",
+                "eval_episodes": int(extras_dict.get("episodes", 0)),
+            })
 
-    time_total = time.perf_counter() - t_all_0
-    timing = {
-        "make_cfg_s": round(time_make_cfg, 6),
-        "wire_data_s": round(time_wire_data, 6),
-        "annuity_setup_s": round(time_annuity, 6),
-        "train_call_s": round(time_train_call, 6),
-        "evaluate_s": round(time_eval, 6),
-        "total_s": round(time_total, 6),
-        "total_hms": _fmt_hms(time_total),
-    }
+        # === market quick stats → metrics에도 적절히 반영
+        try:
+            _mixed = getattr(cfg, "data_ret_series", None)
+            _rf = getattr(cfg, "data_rf_series", None)
+            _dates = getattr(cfg, "data_dates", None)
+            _a_mix = getattr(cfg, "alpha_mix", None)
+            _hfx = getattr(cfg, "h_FX", None)
 
-    out = dict(
-        asset=getattr(cfg, "asset", None),
-        method="rl",
-        baseline="",
-        metrics=metrics_dict,  # ← filled
-        w_max=getattr(cfg, "w_max", None),
-        fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
-        lambda_term=getattr(cfg, "lambda_term", None),
-        alpha=getattr(cfg, "alpha", None),
-        F_target=getattr(cfg, "F_target", None),
-        es_mode=es_mode,
-        n_paths=int(getattr(args, "rl_n_paths_eval", 64) or 64),
-        args=slim_args(args) | {
-            "rl_q_cap": getattr(args, "rl_q_cap", None),
-            "teacher_eps0": getattr(args, "teacher_eps0", None),
-            "teacher_decay": getattr(args, "teacher_decay", None),
-            "survive_bonus": getattr(args, "survive_bonus", None),
-            "u_scale": getattr(args, "u_scale", None),
-            "lw_scale": getattr(args, "lw_scale", None),
-            "tag": getattr(args, "tag", None),
-            "alpha_mix": getattr(cfg, "alpha_mix", None),
-            "h_FX": getattr(cfg, "h_FX", None),
-        },
-        ckpt_path=None,
-        extra=extras_dict,
-        timing=timing,
-        time_total_s=timing["total_s"],
-        time_total_hms=timing["total_hms"],
-    )
+            metrics_dict.setdefault("market_len_ret", _len1d(_mixed))
+            metrics_dict.setdefault("market_len_rf", _len1d(_rf))
+            metrics_dict.setdefault("market_len_dates", _len1d(_dates))
+            metrics_dict.setdefault("ret_mean", float(_np.nanmean(_mixed)) if _mixed is not None else None)
+            metrics_dict.setdefault("rf_mean", float(_np.nanmean(_rf)) if _rf is not None else None)
+            if _a_mix is not None:
+                metrics_dict.setdefault("alpha_mix_used", tuple(map(float, _a_mix)))
+            if _hfx is not None:
+                metrics_dict.setdefault("h_FX_used", float(_hfx))
+            fx_cost_ann = getattr(cfg, "fx_hedge_cost_annual", None)
+            if fx_cost_ann is not None:
+                metrics_dict.setdefault("fx_hedge_cost_annual", float(fx_cost_ann))
+        except Exception:
+            pass
 
-    _inject_market_meta(cfg, args, out)
-    # <<< ADD: 최상위 메타에도 노출(요약 확인용)
-    try:
-        out.setdefault("meta", {})
-        out["meta"]["eval_seed_mode"] = extras_dict.get("eval_seed_mode")
-        out["meta"]["eval_seed_base"] = extras_dict.get("eval_seed_base")
-    except Exception:
-        pass
+        # -----------------------------
+        # 6) 결과 패키징
+        # -----------------------------
+        time_total = time.perf_counter() - t_all_0
+        timing = {
+            "make_cfg_s": round(time_make_cfg, 6),
+            "wire_data_s": round(time_wire_data, 6),
+            "annuity_setup_s": round(time_annuity, 6),
+            "train_call_s": round(time_train_call, 6),
+            "evaluate_s": round(time_eval, 6),
+            "total_s": round(time_total, 6),
+            "total_hms": _fmt_hms(time_total),
+        }
 
-    if bh_spec is not None:
+        out = dict(
+            asset=getattr(cfg, "asset", None),
+            method="rl",
+            baseline="",
+            metrics=metrics_dict,
+            w_max=getattr(cfg, "w_max", None),
+            fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
+            lambda_term=getattr(cfg, "lambda_term", None),
+            alpha=getattr(cfg, "alpha", None),
+            F_target=getattr(cfg, "F_target", None),
+            es_mode=es_mode,
+            n_paths=int(getattr(args, "rl_n_paths_eval", 64) or 64),
+            args=slim_args(args) | {
+                "rl_q_cap": getattr(args, "rl_q_cap", None),
+                "teacher_eps0": getattr(args, "teacher_eps0", None),
+                "teacher_decay": getattr(args, "teacher_decay", None),
+                "survive_bonus": getattr(args, "survive_bonus", None),
+                "u_scale": getattr(args, "u_scale", None),
+                "lw_scale": getattr(args, "lw_scale", None),
+                "tag": getattr(args, "tag", None),
+                "alpha_mix": getattr(cfg, "alpha_mix", None),
+                "h_FX": getattr(cfg, "h_FX", None),
+            },
+            ckpt_path=None,
+            extra=extras_dict,
+            timing=timing,
+            time_total_s=timing["total_s"],
+            time_total_hms=timing["total_hms"],
+        )
+
+        # 시장 메타 및 평가 시드 메타
+        _inject_market_meta(cfg, args, out)
         try:
             out.setdefault("meta", {})
-            out["meta"]["behavioral"] = _bh_describe(bh_spec)
+            out["meta"]["eval_seed_mode"] = extras_dict.get("eval_seed_mode")
+            out["meta"]["eval_seed_base"] = extras_dict.get("eval_seed_base")
+            out["meta"].update({
+                "market_len_ret": metrics_dict.get("market_len_ret"),
+                "market_len_rf": metrics_dict.get("market_len_rf"),
+                "market_len_dates": metrics_dict.get("market_len_dates"),
+                "ret_mean": metrics_dict.get("ret_mean"),
+                "rf_mean": metrics_dict.get("rf_mean"),
+                "alpha_mix_used": metrics_dict.get("alpha_mix_used"),
+                "h_FX_used": metrics_dict.get("h_FX_used"),
+                "fx_hedge_cost_annual": metrics_dict.get("fx_hedge_cost_annual"),
+            })
         except Exception:
             pass
 
-    metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
-    meta = {
-        "tag": getattr(args, "tag", None),
-        "method": "rl",
-        "asset": getattr(cfg, "asset", None),
-        "outputs_abs": os.path.abspath(args.outputs),
-        "time_total_hms": timing["total_hms"],
-        "market_mode": getattr(cfg, "market_mode", None),
-        "bootstrap_block": getattr(cfg, "bootstrap_block", None),
-        "use_real_rf": getattr(cfg, "use_real_rf", None),
-        "data_window": getattr(cfg, "data_window", None),
-    }
-    if bh_spec is not None:
+        if _parse_bh is not None and bh_spec is not None:
+            try:
+                out.setdefault("meta", {})
+                out["meta"]["behavioral"] = _bh_describe(bh_spec)
+            except Exception:
+                pass
+
+        # 파일 기록(조용히)
+        metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
+        meta = {
+            "tag": getattr(args, "tag", None),
+            "method": "rl",
+            "asset": getattr(cfg, "asset", None),
+            "outputs_abs": os.path.abspath(args.outputs),
+            "time_total_hms": timing["total_hms"],
+            "market_mode": getattr(cfg, "market_mode", None),
+            "bootstrap_block": getattr(cfg, "bootstrap_block", None),
+            "use_real_rf": getattr(cfg, "use_real_rf", None),
+            "data_window": getattr(cfg, "data_window", None),
+        }
+        if _parse_bh is not None and bh_spec is not None:
+            try:
+                meta.update({f"bh_{k}": v for k, v in _bh_describe(bh_spec).items()})
+            except Exception:
+                pass
+
         try:
-            meta.update({f"bh_{k}": v for k, v in _bh_describe(bh_spec).items()})
+            write_metrics_csv(metrics_csv, args, out, meta=meta)
         except Exception:
             pass
 
-    try:
-        write_metrics_csv(metrics_csv, args, out, meta=meta)
-    except Exception:
-        pass
+        try:
+            setattr(cfg, "method", "rl")
+            setattr(cfg, "es_mode", es_mode)
+            save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
+        except Exception:
+            pass
 
-    try:
-        setattr(cfg, "method", "rl")
-        setattr(cfg, "es_mode", es_mode)
-        save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
-    except Exception:
-        pass
+        if _onoff(getattr(args, "autosave", "off")) == "on":
+            do_autosave(out.get("metrics") or {}, cfg, args, out)
 
-    if _onoff(getattr(args, "autosave", "off")) == "on":
-        do_autosave(out.get("metrics") or {}, cfg, args, out)
-
+    # with quiet_ctx 종료 — 여기까지 어떤 stdout/stderr도 내보내지 않음
     return out

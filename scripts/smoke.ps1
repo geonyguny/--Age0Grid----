@@ -1,60 +1,37 @@
-# UTF-8 + 작업 폴더
-chcp 65001 > $null
-Set-Location D:\01_simul
-
-# 타임스탬프 & 로그
-$TS  = Get-Date -Format "yyyyMMdd_HHmm"
-$LOG = ".\outputs\_logs\smoke_$TS.log"
-New-Item (Split-Path $LOG) -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
-Start-Transcript -Path $LOG -Append
-
-# 공통 옵션(해시테이블 스플래팅)
-$OR = ".\outputs\night_$TS"
-$COMMON = @{
-  OutRoot        = $OR
-  Seeds          = 2
-  NPaths         = 500
-  MarketMode     = 'iid'          # 빠른 스모크: bootstrap 미사용(원하면 변경)
-  BootstrapBlock = 12
-  Quiet          = 'on'
-  XaiOn          = 'off'
-  EtaMode        = 'history'
-  EtaDb          = '.\outputs\_logs\eta_history.csv'
-  SkipExisting   = $false
-  DoSummary      = $true
-}
-
-# 1) RULE : 극단값만 빠르게 확인 (w=0, 1)
-.\night_run.ps1 -Method rule -Baseline 4pct -Tag ("smk_rule_4pct_{0}" -f $TS) -WList 0,1 @COMMON
-
-# 2) HJB : 파라미터 기본으로 1회 (짧은 스펙, i.i.d.)
-.\night_run.ps1 -Method hjb -Tag ("smk_hjb_{0}" -f $TS) `
-  -Lambda 0.8 -Alpha 0.95 -WMax 0.70 -QFloor 0.02 -Fee 0.004 -HorizonY 15 @COMMON
-
-# 3) RL : 1 epoch 초경량
-$RLARGS = @(
-  "--rl_epochs","1",
-  "--rl_steps_per_epoch","1024",
-  "--rl_n_paths_eval","100",
-  "--gae_lambda","0.95",
-  "--entropy_coef","0.01",
-  "--value_coef","0.5",
-  "--lr","0.0003",
-  "--max_grad_norm","0.5"
+Param(
+  [string]$Csv = ".\project\data\market\kr_us_gold_bootstrap_full_extended.csv",
+  [string]$Outputs = ".\outputs"
 )
-.\night_run.ps1 -Method rl -Tag ("smk_rl_{0}" -f $TS) @COMMON -ExtraArgs $RLARGS
 
-# 4) 그림/표 생성
-python .\scripts\make_paper_figs.py $OR
+$ErrorActionPreference = "Stop"
 
-# 5) 요약 프린트(있을 때만)
-Write-Host "====== SMOKE SUMMARY ($OR) ======"
-if (Test-Path "$OR\night_summary_report.csv") {
-  Import-Csv "$OR\night_summary_report.csv" |
-    Sort method,baseline,w_fixed |
-    Format-Table -Auto
-} else {
-  Write-Warning "요약 파일이 아직 없습니다. 로그($LOG)를 확인하세요."
+function RunJson($argv) {
+  $out = .\.venv\Scripts\python.exe -m project.runner.cli @argv
+  if ($LASTEXITCODE -ne 0) { throw "CLI failed ($LASTEXITCODE):`n$out" }
+  return ($out | ConvertFrom-Json)
 }
 
-Stop-Transcript
+$COMMON = @(
+  "--method","rl","--asset","KR",
+  "--market_mode","bootstrap","--market_csv",$Csv,
+  "--use_real_rf","on","--outputs",$Outputs,
+  "--rl_epochs","0","--rl_n_paths_eval","200","--seed","42",
+  "--quiet","on","--print_mode","metrics",
+  "--metrics_keys","EW,ES95,Ruin,mean_WT","--no_paths"
+)
+
+$f1 = RunJson ($COMMON + @("--tag","reg_fixed1","--eval_seed_jitter","off"))
+$f2 = RunJson ($COMMON + @("--tag","reg_fixed2","--eval_seed_jitter","off"))
+if ($f1.EW -ne $f2.EW -or $f1.ES95 -ne $f2.ES95 -or $f1.mean_WT -ne $f2.mean_WT) {
+  Write-Host "FIXED MISMATCH"
+  exit 2
+}
+
+$j1 = RunJson ($COMMON + @("--tag","reg_jitter1","--eval_seed_jitter","on"))
+$j2 = RunJson ($COMMON + @("--tag","reg_jitter2","--eval_seed_jitter","on"))
+if ($j1.EW -eq $j2.EW -and $j1.ES95 -eq $j2.ES95 -and $j1.mean_WT -eq $j2.mean_WT) {
+  Write-Host "JITTER NO-DIFF"
+  exit 3
+}
+
+Write-Host "SMOKE REGRESSION: PASS"
