@@ -1,0 +1,63 @@
+name: smoke
+on: [push, pull_request]
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          Continue = "Stop"
+          python -m venv .venv
+          .\.venv\Scripts\python -m pip install -U pip
+          .\.venv\Scripts\python -m pip install -r requirements.txt
+          New-Item -ItemType Directory .\outputs -ea SilentlyContinue | Out-Null
+
+      - name: Smoke regression (fixed/jitter)
+        shell: pwsh
+        run: |
+          Continue = "Stop"
+
+          --method rl --asset KR --market_mode bootstrap --market_csv .\project\data\market\kr_us_gold_bootstrap_full_extended.csv --use_real_rf on --outputs .\outputs --rl_epochs 0 --rl_n_paths_eval 200 --seed 42 --quiet on --print_mode metrics --metrics_keys EW,ES95,Ruin,mean_WT --no_paths = @(
+            "--method","rl","--asset","KR",
+            "--market_mode","bootstrap","--market_csv",".\project\data\market\kr_us_gold_bootstrap_full_extended.csv",
+            "--use_real_rf","on","--outputs",".\outputs",
+            "--rl_epochs","0","--rl_n_paths_eval","200","--seed","42",
+            "--quiet","on","--print_mode","metrics","--metrics_keys","EW,ES95,Ruin,mean_WT","--no_paths"
+          )
+
+          function RunJson([object]) {
+             = .\.venv\Scripts\python.exe -m project.runner.cli @argv
+            if (0 -ne 0) { throw "CLI fail 0
+" }
+            return ( | ConvertFrom-Json)
+          }
+
+          # fixed: identical
+          @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503} = RunJson (--method rl --asset KR --market_mode bootstrap --market_csv .\project\data\market\kr_us_gold_bootstrap_full_extended.csv --use_real_rf on --outputs .\outputs --rl_epochs 0 --rl_n_paths_eval 200 --seed 42 --quiet on --print_mode metrics --metrics_keys EW,ES95,Ruin,mean_WT --no_paths + @("--tag","ci_fixed1","--eval_seed_jitter","off"))
+          @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503} = RunJson (--method rl --asset KR --market_mode bootstrap --market_csv .\project\data\market\kr_us_gold_bootstrap_full_extended.csv --use_real_rf on --outputs .\outputs --rl_epochs 0 --rl_n_paths_eval 200 --seed 42 --quiet on --print_mode metrics --metrics_keys EW,ES95,Ruin,mean_WT --no_paths + @("--tag","ci_fixed2","--eval_seed_jitter","off"))
+          if (@{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503}.EW -ne @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503}.EW -or @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503}.ES95 -ne @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503}.ES95 -or @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503}.mean_WT -ne @{ES95=0.7569125438827253; EW=3.045249725750503; Ruin=0.0; mean_WT=3.045249725750503}.mean_WT) {
+            throw "FIXED MISMATCH"
+          }
+
+          # jitter: must differ
+          @{ES95=0.7567352354870372; EW=2.856859286627795; Ruin=0.0; mean_WT=2.856859286627795} = RunJson (--method rl --asset KR --market_mode bootstrap --market_csv .\project\data\market\kr_us_gold_bootstrap_full_extended.csv --use_real_rf on --outputs .\outputs --rl_epochs 0 --rl_n_paths_eval 200 --seed 42 --quiet on --print_mode metrics --metrics_keys EW,ES95,Ruin,mean_WT --no_paths + @("--tag","ci_j1","--eval_seed_jitter","on"))
+          @{ES95=0.8205507946579099; EW=3.097254566738535; Ruin=0.0; mean_WT=3.097254566738535} = RunJson (--method rl --asset KR --market_mode bootstrap --market_csv .\project\data\market\kr_us_gold_bootstrap_full_extended.csv --use_real_rf on --outputs .\outputs --rl_epochs 0 --rl_n_paths_eval 200 --seed 42 --quiet on --print_mode metrics --metrics_keys EW,ES95,Ruin,mean_WT --no_paths + @("--tag","ci_j2","--eval_seed_jitter","on"))
+          if (@{ES95=0.7567352354870372; EW=2.856859286627795; Ruin=0.0; mean_WT=2.856859286627795}.EW -eq @{ES95=0.8205507946579099; EW=3.097254566738535; Ruin=0.0; mean_WT=3.097254566738535}.EW -and @{ES95=0.7567352354870372; EW=2.856859286627795; Ruin=0.0; mean_WT=2.856859286627795}.ES95 -eq @{ES95=0.8205507946579099; EW=3.097254566738535; Ruin=0.0; mean_WT=3.097254566738535}.ES95 -and @{ES95=0.7567352354870372; EW=2.856859286627795; Ruin=0.0; mean_WT=2.856859286627795}.mean_WT -eq @{ES95=0.8205507946579099; EW=3.097254566738535; Ruin=0.0; mean_WT=3.097254566738535}.mean_WT) {
+            throw "JITTER NO-DIFF"
+          }
+
+      - name: Upload logs (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs-logs
+          path: outputs/_logs
