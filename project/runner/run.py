@@ -4,6 +4,9 @@ import contextlib
 import os
 import time
 from typing import Any, Dict, Optional, Callable, Tuple, List, Union
+from pathlib import Path
+import json as _json
+import csv as _csv
 
 import numpy as _np
 
@@ -36,6 +39,57 @@ except Exception:
             }
         except Exception:
             return {"bh_on": False, "lambda_loss": 1.0, "beta": 1.0, "habit_phi": 0.0}
+
+
+# --------------------------
+# Local safe writers (NEW): 외부 유틸 없이도 항상 저장되도록
+# --------------------------
+def _safe_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    tmp.replace(path)
+
+def _safe_write_csv_one_row(path: Path, row: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fields = list(row.keys())
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerow(row)
+    tmp.replace(path)
+
+def _save_metrics_files(out_dir: Path, metrics: Dict[str, Any], args: Any) -> None:
+    """
+    outputs/<tag>/metrics.json & metrics.csv 강제 생성.
+    - Ruin만 있을 때 RuinPct 자동 보정(동일값 복제; %명칭 호환용)
+    - seed/n_paths_eval 등 메타 기본 포함
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 호환 필드 세팅
+    ew = metrics.get("EW", None)
+    es = metrics.get("ES95", None)
+    ruin = metrics.get("Ruin", None)
+    rpct = metrics.get("RuinPct", None)
+    if rpct is None and ruin is not None:
+        # 스크립트 호환을 위해 이름만 맞춰서 복제(스케일은 ruin 그대로)
+        rpct = ruin
+
+    row = {
+        "EW": float(ew) if ew is not None else None,
+        "ES95": float(es) if es is not None else None,
+        "RuinPct": float(rpct) if rpct is not None else None,
+        "mean_WT": float(metrics.get("mean_WT", ew if ew is not None else 0.0)) if metrics.get("mean_WT", None) is not None or ew is not None else None,
+        "es95_source": str(metrics.get("es95_source", "")) if metrics.get("es95_source", None) is not None else None,
+        "seed": int(getattr(args, "seed", -1)) if getattr(args, "seed", None) is not None else None,
+        "n_paths_eval": int(getattr(args, "rl_n_paths_eval", -1)) if getattr(args, "rl_n_paths_eval", None) is not None else None,
+        "method": getattr(args, "method", None),
+        "data_profile": getattr(args, "data_profile", None),
+    }
+    # JSON/CSV 동시 저장
+    _safe_write_text(out_dir / "metrics.json", _json.dumps(row, indent=2))
+    _safe_write_csv_one_row(out_dir / "metrics.csv", row)
 
 
 # --------------------------
@@ -122,7 +176,7 @@ def _nan_ratio(x):
 
 
 # --------------------------
-# Helpers: parsing mix / hedge  ★★ (호출부보다 위에 위치) ★★
+# Helpers: parsing mix / hedge
 # --------------------------
 def _parse_alpha_mix(args) -> Tuple[float, float, float]:
     """alpha 믹스를 (--alpha_mix 'kr,us,au' | 세 개의 개별 플래그)에서 읽어 정규화."""
@@ -587,15 +641,25 @@ def run_once(args) -> Dict[str, Any]:
     if meta_bh:
         meta.update({f"bh_{k}": v for k, v in meta_bh.items()})
 
+    # (A) 중앙 로그 파일 갱신
     try:
         write_metrics_csv(metrics_csv, args, out, meta=meta)
     except Exception:
         pass
 
+    # (B) 기존 자동 CSV 경로 유지
     try:
         setattr(cfg, "method", getattr(args, "method", ""))
         setattr(cfg, "es_mode", getattr(args, "es_mode", "wealth"))
         save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
+    except Exception:
+        pass
+
+    # (C) NEW: outputs/<tag>/metrics.json & metrics.csv 강제 생성
+    try:
+        tag = getattr(args, "tag", None)
+        if tag:
+            _save_metrics_files(Path(args.outputs) / tag, out.get("metrics", {}) or {}, args)
     except Exception:
         pass
 
@@ -963,15 +1027,25 @@ def run_rl(args):
             except Exception:
                 pass
 
+        # (A) 중앙 로그 파일 갱신
         try:
             write_metrics_csv(metrics_csv, args, out, meta=meta)
         except Exception:
             pass
 
+        # (B) 기존 자동 CSV 경로 유지
         try:
             setattr(cfg, "method", "rl")
             setattr(cfg, "es_mode", es_mode)
             save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
+        except Exception:
+            pass
+
+        # (C) NEW: outputs/<tag>/metrics.json & metrics.csv 강제 생성
+        try:
+            tag = getattr(args, "tag", None)
+            if tag:
+                _save_metrics_files(Path(args.outputs) / tag, metrics_dict, args)
         except Exception:
             pass
 

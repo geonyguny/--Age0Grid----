@@ -1,8 +1,12 @@
 # scripts/make_paper_figs.py
+from __future__ import annotations
+
 import os, sys, math, argparse, pathlib
+from typing import Tuple, List
 import pandas as pd
 import numpy as np
 import matplotlib
+
 matplotlib.use("Agg")  # headless 안전
 import matplotlib.pyplot as plt
 
@@ -15,7 +19,7 @@ SAVE_PDF = False            # paper_style on이면 자동 True
 # ─────────────────────────────────────────────────────────
 # A) 공통 유틸: OutRoot 해석 + 데이터 가드 + 메시지 오버레이
 # ─────────────────────────────────────────────────────────
-def resolve_outroot(arg_path: str) -> tuple[str, bool]:
+def resolve_outroot(arg_path: str | None) -> tuple[str, bool]:
     """
     반환: (OR_abs, used_latest_fallback)
     - 인자가 디렉터리면 절대경로로 반환
@@ -73,7 +77,6 @@ def guard_stats(arr_like) -> tuple[bool, bool, bool]:
 def annotate_center(ax, text: str, sub: str = "", alpha: float = 0.35):
     """
     축/눈금/데이터는 유지하면서 중앙에 반투명 박스로 안내문을 오버레이.
-    - fig를 지우지 않고, ax도 clear하지 않음.
     """
     if not text:
         return
@@ -90,7 +93,7 @@ def overlay_message(fig, ax, title: str, msg: str, sub: str = "", keep_axes: boo
     """
     데이터가 없거나 단일점일 때:
     - keep_axes=True: 축은 유지 + 중앙 메시지(요청사항 반영)
-    - keep_axes=False: 예전 방식(축 숨김) 메시지 화면
+    - keep_axes=False: 축 숨김
     """
     if keep_axes:
         ax.set_title(title)
@@ -121,8 +124,46 @@ def save_fig(fig, path_png: str):
     plt.close(fig)
 
 # ─────────────────────────────────────────────────────────
-# B) 인자/경로 및 데이터 로드
+# B) 인자/경로 및 데이터 로드 + 정규화
 # ─────────────────────────────────────────────────────────
+def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+def _ensure_columns(df: pd.DataFrame, defaults: dict) -> pd.DataFrame:
+    d = df.copy()
+    for k, v in defaults.items():
+        if k not in d.columns:
+            d[k] = v
+        d[k] = d[k].fillna(v)
+    return d
+
+def _normalize_ruin_columns(df_rep: pd.DataFrame, df_cln: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Ruin/RuinPct 혼재시 0~1 확률로 통일.
+    - df_rep: 'Ruin_avg'가 있으면 값이 1 초과면 100으로 나눔
+    - df_cln: 'RuinPct' 있으면 값이 1 초과면 100으로 나눔 후 'Ruin' 컬럼 추가(0~1)
+    """
+    rep = df_rep.copy()
+    cln = df_cln.copy()
+
+    if "Ruin_avg" in rep.columns:
+        rep["Ruin_avg"] = pd.to_numeric(rep["Ruin_avg"], errors="coerce")
+        over_one = rep["Ruin_avg"] > 1.0
+        if over_one.any():
+            rep.loc[over_one, "Ruin_avg"] = rep.loc[over_one, "Ruin_avg"] / 100.0
+
+    if "RuinPct" in cln.columns:
+        cln["RuinPct"] = pd.to_numeric(cln["RuinPct"], errors="coerce")
+        over_one = cln["RuinPct"] > 1.0
+        cln["Ruin"] = cln["RuinPct"] / 100.0
+        cln.loc[~over_one, "Ruin"] = cln.loc[~over_one, "RuinPct"]  # 이미 0~1 스케일인 경우
+    elif "Ruin" in cln.columns:
+        cln["Ruin"] = pd.to_numeric(cln["Ruin"], errors="coerce")
+
+    return rep, cln
+
 def load_data(or_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     rep = os.path.join(or_path, "night_summary_report.csv")
     cln = os.path.join(or_path, "night_summary_clean.csv")
@@ -139,17 +180,15 @@ def load_data(or_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     df_cln = pd.read_csv(cln)
 
     # 숫자형 보정
-    for c in ["EW_avg", "ES95_avg", "Ruin_avg", "WT_avg"]:
-        if c in df_rep.columns:
-            df_rep[c] = pd.to_numeric(df_rep[c], errors="coerce")
-    for c in ["EW", "ES95", "RuinPct", "mean_WT"]:
-        if c in df_cln.columns:
-            df_cln[c] = pd.to_numeric(df_cln[c], errors="coerce")
+    _coerce_numeric(df_rep, ["EW_avg", "ES95_avg", "Ruin_avg", "WT_avg"])
+    _coerce_numeric(df_cln, ["EW", "ES95", "RuinPct", "Ruin", "mean_WT"])
 
-    # 결측 컬럼 기본값
-    for col, default in [("method", ""), ("baseline", ""), ("w_fixed", "NA")]:
-        if col not in df_rep.columns:
-            df_rep[col] = default
+    # 결측 기본값
+    df_rep = _ensure_columns(df_rep, {"method": "", "baseline": "", "w_fixed": "NA"})
+    df_cln = _ensure_columns(df_cln, {"method": "", "baseline": "", "w_fixed": "NA"})
+
+    # Ruin 스케일 정규화
+    df_rep, df_cln = _normalize_ruin_columns(df_rep, df_cln)
 
     return df_rep, df_cln
 
@@ -160,10 +199,11 @@ def normalize_labels(df_rep: pd.DataFrame) -> tuple[pd.DataFrame, list[str], flo
     # baseline: 비어있으면 method 기반 치환
     df_rep = df_rep.copy()
     df_rep["baseline"] = df_rep["baseline"].fillna("")
+    m_lower = df_rep["method"].astype(str).str.lower()
     mask_empty = df_rep["baseline"].str.strip() == ""
-    df_rep.loc[(df_rep["method"].str.lower() == "hjb") & mask_empty, "baseline"] = "HJB"
-    df_rep.loc[(df_rep["method"].str.lower() == "rl") & mask_empty,  "baseline"] = "RL"
-    df_rep.loc[(df_rep["method"].str.lower() == "rule") & mask_empty, "baseline"] = "(unknown)"
+    df_rep.loc[(m_lower == "hjb") & mask_empty, "baseline"] = "HJB"
+    df_rep.loc[(m_lower == "rl") & mask_empty,  "baseline"] = "RL"
+    df_rep.loc[(m_lower == "rule") & mask_empty, "baseline"] = "(unknown)"
 
     # w_fixed 카테고리 정렬
     w_order = ["w_0", "w_0_3", "w_0_5", "w_0_7", "w_1", "NA"]
@@ -181,7 +221,7 @@ def normalize_labels(df_rep: pd.DataFrame) -> tuple[pd.DataFrame, list[str], flo
     df_rep = df_rep.sort_values(["method", "baseline", "w_fixed"])
 
     # HJB 벤치마크(있으면 1개만 참조)
-    hjb_row = df_rep.loc[df_rep["method"].str.lower() == "hjb"].head(1)
+    hjb_row = df_rep.loc[m_lower == "hjb"].head(1)
     hjb_EW  = float(hjb_row["EW_avg"].iloc[0])   if len(hjb_row) and pd.notna(hjb_row["EW_avg"].iloc[0])   else np.nan
     hjb_ES  = float(hjb_row["ES95_avg"].iloc[0]) if len(hjb_row) and pd.notna(hjb_row["ES95_avg"].iloc[0]) else np.nan
 
@@ -214,7 +254,7 @@ def plot_ew_vs_w(df_rep: pd.DataFrame, baselines: list[str], hjb_EW: float, OR: 
         ax.axhline(hjb_EW, linestyle="--", label="HJB", alpha=0.8)
         lines_y.append([hjb_EW])
 
-    is_empty, is_all_zero, is_single = guard_stats(np.concatenate(lines_y) if lines_y else [])
+    is_empty, _, is_single = guard_stats(np.concatenate(lines_y) if lines_y else [])
     if is_empty or is_single:
         overlay_message(fig, ax, "EW vs w_fixed",
                         "Single-point result (identical samples)" if is_single else "No data to visualize",
@@ -249,7 +289,7 @@ def plot_es_vs_w(df_rep: pd.DataFrame, baselines: list[str], hjb_ES: float, OR: 
         ax.axhline(hjb_ES, linestyle="--", label="HJB", alpha=0.8)
         lines_y.append([hjb_ES])
 
-    is_empty, is_all_zero, is_single = guard_stats(np.concatenate(lines_y) if lines_y else [])
+    is_empty, _, is_single = guard_stats(np.concatenate(lines_y) if lines_y else [])
     if is_empty or is_single:
         overlay_message(fig, ax, "ES95 vs w_fixed",
                         "Single-point result (identical samples)" if is_single else "No data to visualize",
@@ -333,7 +373,6 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
     """
     fig, ax = plt.subplots(figsize=(7,6))
 
-    # 방법별 스타일 (linestyle 제거: scatter에는 불필요/오류 원인)
     styles = {
         "rule": dict(marker="o", alpha=0.85, s=35),
         "hjb":  dict(marker="*", s=120),
@@ -343,13 +382,12 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
     # 전체 점
     any_points = False
     for m in ["rule", "hjb", "rl"]:
-        d = df_rep.loc[df_rep["method"].str.lower() == m].dropna(subset=["ES95_avg","EW_avg"]).copy()
+        d = df_rep.loc[df_rep["method"].astype(str).str.lower() == m].dropna(subset=["ES95_avg","EW_avg"]).copy()
         if len(d) == 0:
             continue
         any_points = True
         if m == "rule":
             ax.scatter(d["ES95_avg"], d["EW_avg"], label="rule", **styles["rule"])
-            # 라벨(가독성 위해 소형)
             for _, r in d.iterrows():
                 lbl = str(r.get("w_fixed","")).replace("w_","").replace("_",".")
                 if lbl and lbl != "NA":
@@ -361,10 +399,7 @@ def plot_frontier(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str|
 
     # 프런티어(모든 방법 합산 후 계산)
     d_all = df_rep.dropna(subset=["ES95_avg","EW_avg"]).copy()
-    if len(d_all) > 0:
-        fr = _compute_frontier(d_all)
-    else:
-        fr = pd.DataFrame(columns=["ES95_avg","EW_avg"])
+    fr = _compute_frontier(d_all) if len(d_all) > 0 else pd.DataFrame(columns=["ES95_avg","EW_avg"])
 
     if len(fr) == 0 or not any_points:
         overlay_message(fig, ax, "EW–ES Frontier",
@@ -394,7 +429,7 @@ def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str 
     from matplotlib.ticker import PercentFormatter, AutoMinorLocator
 
     # 1) 룰 데이터 필터링/가드
-    d_rule = df_rep.loc[df_rep["method"].str.lower() == "rule"].copy()
+    d_rule = df_rep.loc[df_rep["method"].astype(str).str.lower() == "rule"].copy()
     d_rule = d_rule.loc[d_rule["w_fixed"].astype(str) != "NA"]
     d_rule = d_rule.dropna(subset=["Ruin_avg"])
 
@@ -451,9 +486,11 @@ def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str 
     # HJB 참고선 값 (y-limit 계산에 반영)
     hjb_val = None
     try:
-        hjb = df_rep.loc[df_rep["method"].str.lower() == "hjb"].head(1)
+        hjb = df_rep.loc[df_rep["method"].astype(str).str.lower() == "hjb"].head(1)
         if len(hjb) and pd.notna(hjb["Ruin_avg"].iloc[0]):
             hjb_val = float(hjb["Ruin_avg"].iloc[0])
+            if hjb_val > 1.0:
+                hjb_val /= 100.0
     except Exception:
         pass
 
@@ -496,12 +533,11 @@ def plot_ruin_bar(df_rep: pd.DataFrame, OR: str, sub_hint: str, center_msg: str 
     ax.set_title("Ruin (by baseline & w_fixed)")
 
     if treat_as_prob:
-        from matplotlib.ticker import PercentFormatter
         ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+        ax.set_ylabel("Ruin probability")
     else:
-        ax.set_ylabel("Ruin probability (avg)")
+        ax.set_ylabel("Ruin (avg)")
 
-    from matplotlib.ticker import AutoMinorLocator
     ax.yaxis.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.35)
     ax.yaxis.set_minor_locator(AutoMinorLocator(2))
     ax.yaxis.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.20)
@@ -608,6 +644,7 @@ def main():
             style_path = os.path.join(os.path.dirname(__file__), "fig_style_paper.py")
             spec = importlib.util.spec_from_file_location("fig_style_paper", style_path)
             mod = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
             spec.loader.exec_module(mod)  # type: ignore
             mod.apply_paper_style()
             SAVE_PDF = True
@@ -653,11 +690,11 @@ def main():
                 f.write(f"- Market: {mkt_hint.strip(' |') or 'N/A'}\n")
                 # 대표 결과(있으면) 간단 첨부
                 try:
-                    hjb = df_rep.loc[df_rep["method"].str.lower()=="hjb"].head(1)
-                    rl = df_rep.loc[df_rep["method"].str.lower()=="rl"].head(1)
-                    if len(hjb):
+                    hjb = df_rep.loc[df_rep["method"].astype(str).str.lower()=="hjb"].head(1)
+                    rl = df_rep.loc[df_rep["method"].astype(str).str.lower()=="rl"].head(1)
+                    if len(hjb) and pd.notna(hjb['EW_avg'].iloc[0]) and pd.notna(hjb['ES95_avg'].iloc[0]):
                         f.write(f"- HJB: EW={hjb['EW_avg'].iloc[0]:.4f}, ES95={hjb['ES95_avg'].iloc[0]:.4f}\n")
-                    if len(rl):
+                    if len(rl) and pd.notna(rl['EW_avg'].iloc[0]) and pd.notna(rl['ES95_avg'].iloc[0]):
                         f.write(f"- RL : EW={rl['EW_avg'].iloc[0]:.4f}, ES95={rl['ES95_avg'].iloc[0]:.4f}\n")
                 except Exception:
                     pass

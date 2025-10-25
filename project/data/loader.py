@@ -26,9 +26,8 @@ except Exception:  # pragma: no cover
             raise ValueError(f"[schema] missing date column '{date_col}' in {os.path.basename(path)}")
 
 # ─────────────────────────────────────────────────────────
-# Constants & regex
+# Regex
 # ─────────────────────────────────────────────────────────
-REQUIRED_MIN = ["date", "ret_kr_eq", "cpi_kr", "rf_kr_nom"]
 _WINDOW_RE = re.compile(r"^(?:\d{4}-\d{2})?:(?:\d{4}-\d{2})?$")
 
 __all__ = ["load_market_csv"]
@@ -58,6 +57,7 @@ def _slice_window(df: pd.DataFrame, window: Optional[str]) -> pd.DataFrame:
     if not _WINDOW_RE.match(s):
         raise ValueError(f"--data_window 형식 오류: '{window}' (예: 1999-01:2024-12, '1999-01:', ':2024-12')")
     a, b = s.split(":")
+    # 날짜는 아래에서 YYYY-MM 문자열로 표준화하므로 문자열 비교로도 안전
     if a:
         df = df[df["date"] >= a]
     if b:
@@ -80,7 +80,6 @@ def _to_monthly_rate_like(x: np.ndarray) -> np.ndarray:
         r = np.empty_like(arr, dtype=float)
         with np.errstate(all="ignore"):
             r[1:] = arr[1:] / arr[:-1] - 1.0
-        # 첫 값은 2번째 값으로 채우거나 0
         r[0] = r[1] if arr.size > 1 and np.isfinite(r[1]) else 0.0
         return np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
@@ -107,7 +106,6 @@ def _usd_to_krw_ret(r_usd: Optional[np.ndarray], fx_ret: Optional[np.ndarray]) -
         return np.array([], dtype=float)
     T = min(r_usd.size, fx_ret.size)
     out = (1.0 + r_usd[:T]) * (1.0 + fx_ret[:T]) - 1.0
-    # 첫 값 NaN 방지
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return out
 
@@ -116,20 +114,30 @@ def _parse_on_flag(v: str) -> bool:
     return str(v).strip().lower() in {"on", "true", "1", "yes", "y"}
 
 
+def _read_csv_forgiving(p: str) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            return pd.read_csv(p, encoding=enc, engine="python")
+        except Exception:
+            continue
+    return pd.read_csv(p)
+
+
 # ─────────────────────────────────────────────────────────
 # Loader
 # ─────────────────────────────────────────────────────────
 def load_market_csv(
     path: str,
-    asset: str,
+    asset: str = "KR",
     use_real_rf: str = "on",
     data_window: Optional[str] = None,
     cache: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
     CSV schema v1 (월간):
-      필수: date, ret_kr_eq, cpi_kr, rf_kr_nom
-      선택: ret_us_eq_usd, ret_gold_usd, usdkrw, ret_us_eq_krw, ret_gold_krw, rf_kr_real
+      권장 표준 컬럼: date, ret_kr_eq, cpi, rf_nom
+      허용 별칭    : cpi_kr→cpi, rf_kr_nom→rf_nom, ret_fx_usdkrw→ret_fx
+      선택 컬럼    : ret_us_eq_usd, ret_gold_usd, usdkrw, ret_us_eq_krw, ret_gold_krw, rf_real
 
     반환 키:
       dates(str[]), ret_asset, ret_kr_eq, ret_us_eq_krw, ret_gold_krw,
@@ -139,13 +147,13 @@ def load_market_csv(
       - 수익률은 0.01 = +1%
       - CPI는 지수/률 모두 허용(자동 판별)
       - KRW 환산: (1+r_usd)*(1+fx) - 1
-      - use_real_rf: "on"이면 rf_real ≈ rf_nom - cpi_rate (rf_kr_real 있으면 우선)
+      - use_real_rf: "on"이면 rf_real ≈ rf_nom - cpi_rate (CSV에 rf_real 있으면 우선)
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"market_csv not found: {path}")
 
-    # 0) 스키마 검증(명확한 메시지)
-    assert_market_csv_valid(path, required_cols=["ret_kr_eq", "cpi_kr", "rf_kr_nom"], date_col="date")
+    # 0) 스키마 검증(표준 컬럼 기준; 별칭 허용은 schema_checks에서 처리)
+    assert_market_csv_valid(path, required_cols=["ret_kr_eq", "cpi", "rf_nom"], date_col="date")
 
     # 1) 캐시 준비
     cache_dir = os.path.join(os.path.dirname(path), "_cache")
@@ -160,93 +168,94 @@ def load_market_csv(
             out["dates"] = out["dates"].astype(str)
         return out  # type: ignore[return-value]
 
-    # 2) CSV 로드(인코딩/엔진 내결함성)
-    def _read_csv_forgiving(p: str) -> pd.DataFrame:
-        for enc in ("utf-8-sig", "utf-8", "cp949"):
-            try:
-                return pd.read_csv(p, encoding=enc, engine="python")
-            except Exception:
-                continue
-        # 마지막 시도: 기본
-        return pd.read_csv(p)
-
+    # 2) CSV 로드
     df = _read_csv_forgiving(path)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 필수 헤더 재확인(로더 층)
-    missing = [c for c in REQUIRED_MIN if c not in df.columns]
-    if missing:
-        raise ValueError(f"CSV 누락컬럼: {missing} (필수: {REQUIRED_MIN})")
+    # 3) 별칭 → 표준 컬럼 정규화 (표준이 이미 있으면 보존)
+    alias_renames = {
+        "cpi_kr": "cpi",
+        "rf_kr_nom": "rf_nom",
+        "ret_fx_usdkrw": "ret_fx",
+    }
+    for src, dst in alias_renames.items():
+        if dst not in df.columns and src in df.columns:
+            df = df.rename(columns={src: dst})
 
-    # 날짜 표준화/정렬
+    # 4) 날짜 표준화/정렬 (YYYY-MM 문자열)
     try:
         df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m")
     except Exception:
         df["date"] = df["date"].astype(str).str.slice(0, 7)
     df = df.sort_values("date").reset_index(drop=True)
 
-    # 기간 슬라이스
+    # 5) 기간 슬라이스
     df = _slice_window(df, data_window)
     if len(df) < 24:
         raise ValueError(f"데이터 구간이 짧습니다(>=24 필요). window={data_window}, len={len(df)}")
 
-    # 3) FX 월수익률 (usdkrw → ret_fx)
-    usdkrw = _as_float_col(df, "usdkrw") if "usdkrw" in df.columns else np.array([], dtype=float)
-    fx_ret = _to_monthly_rate_like(usdkrw) if usdkrw.size else None
+    # 6) FX 월수익률 (우선순위: ret_fx ▶ ret_fx_usdkrw 별칭 ▶ usdkrw 레벨 변환)
+    fx_ret: Optional[np.ndarray] = None
+    if "ret_fx" in df.columns:
+        fx_ret = _as_float_col(df, "ret_fx")
+    elif "ret_fx_usdkrw" in df.columns:
+        fx_ret = _as_float_col(df, "ret_fx_usdkrw")
+    elif "usdkrw" in df.columns:
+        usdkrw = _as_float_col(df, "usdkrw")
+        fx_ret = _to_monthly_rate_like(usdkrw)
 
-    # 4) risky legs
+    # 7) risky legs
     ret_kr_eq = _as_float_col(df, "ret_kr_eq")
 
     # US: KRW 열 우선, 없으면 USD+FX로 생성
     ret_us_eq_krw = _as_float_col(df, "ret_us_eq_krw")
     if np.all(np.isnan(ret_us_eq_krw)):
         ret_us_eq_usd = _as_float_col(df, "ret_us_eq_usd")
-        conv = _usd_to_krw_ret(ret_us_eq_usd, fx_ret)
+        conv = _usd_to_krw_ret(ret_us_eq_usd, fx_ret) if fx_ret is not None else np.array([], dtype=float)
         if conv.size:
             ret_us_eq_krw = conv
         else:
-            # 길이 맞추기 (존재하되 산출 불가였다면 NaN 배열)
             ret_us_eq_krw = np.full(len(df), np.nan, dtype=float)
 
     # GOLD: KRW 열 우선, 없으면 USD+FX로 생성
     ret_gold_krw = _as_float_col(df, "ret_gold_krw")
     if np.all(np.isnan(ret_gold_krw)):
         ret_gold_usd = _as_float_col(df, "ret_gold_usd")
-        conv = _usd_to_krw_ret(ret_gold_usd, fx_ret)
+        conv = _usd_to_krw_ret(ret_gold_usd, fx_ret) if fx_ret is not None else np.array([], dtype=float)
         if conv.size:
             ret_gold_krw = conv
         else:
             ret_gold_krw = np.full(len(df), np.nan, dtype=float)
 
-    # 5) CPI & RF
-    cpi_col = _as_float_col(df, "cpi_kr")                 # 지수/률 혼재 허용
-    cpi_rate = _to_monthly_rate_like(cpi_col)             # CPI 월간률
-    rf_nom = _as_float_col(df, "rf_kr_nom")
+    # 8) CPI & RF
+    cpi_col = _as_float_col(df, "cpi")                  # 지수/률 혼재 허용
+    cpi_rate = _to_monthly_rate_like(cpi_col)           # CPI 월간률
+    rf_nom = _as_float_col(df, "rf_nom")
 
     use_real_flag = _parse_on_flag(use_real_rf)
-    if "rf_kr_real" in df.columns:
-        rf_real_src = _as_float_col(df, "rf_kr_real")
+    if "rf_real" in df.columns:
+        rf_real_src = _as_float_col(df, "rf_real")
         rf_real = rf_real_src if use_real_flag else rf_nom
     else:
         approx_real = np.nan_to_num(rf_nom, nan=0.0) - np.nan_to_num(cpi_rate, nan=0.0)
         rf_real = approx_real if use_real_flag else rf_nom
 
-    # 6) 자산 선택 (레거시 호환용 ret_asset)
+    # 9) 자산 선택 (레거시 호환용 ret_asset)
     asset_u = str(asset).upper().strip()
     if asset_u == "KR":
         ret_asset = ret_kr_eq
     elif asset_u == "US":
         if np.all(np.isnan(ret_us_eq_krw)):
-            raise ValueError("US 수익률 산출 불가: ret_us_eq_usd/ret_us_eq_krw/usdkrw 중 최소 조합 필요")
+            raise ValueError("US 수익률 산출 불가: ret_us_eq_usd/ret_us_eq_krw/(ret_fx|usdkrw) 중 최소 조합 필요")
         ret_asset = ret_us_eq_krw
     elif asset_u in {"GOLD", "XAU"}:
         if np.all(np.isnan(ret_gold_krw)):
-            raise ValueError("Gold 수익률 산출 불가: ret_gold_usd/ret_gold_krw/usdkrw 중 최소 조합 필요")
+            raise ValueError("Gold 수익률 산출 불가: ret_gold_usd/ret_gold_krw/(ret_fx|usdkrw) 중 최소 조합 필요")
         ret_asset = ret_gold_krw
     else:
         raise ValueError(f"알 수 없는 asset: {asset} (KR|US|GOLD)")
 
-    # 7) 출력 (모든 수치 NaN→0 치환은 ‘최종’ 단계에서만 수행)
+    # 10) 출력 (모든 수치 NaN→0 치환은 ‘최종’ 단계에서만 수행)
     def _nz(a: np.ndarray) -> np.ndarray:
         return np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).astype(float, copy=False)
 
@@ -264,7 +273,7 @@ def load_market_csv(
         "ret_fx_usdkrw": _nz(fx_ret) if fx_ret is not None else np.full(len(df), np.nan, dtype=float),
     }
 
-    # 8) 캐시 저장
+    # 11) 캐시 저장
     if cache:
         np.savez_compressed(cache_npz, **out)
 
