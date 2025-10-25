@@ -1,4 +1,3 @@
-# project/env/irp_env.py
 # -*- coding: utf-8 -*-
 """
 Thin adapter for RL trainer expecting a simple Env factory `make_env()` with:
@@ -20,7 +19,7 @@ ENV OVERRIDES (optional)
 """
 from __future__ import annotations
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -39,10 +38,13 @@ class IRPEnvAdapter:
         w_max: Optional[float] = None,
         q_floor: Optional[float] = None,
         base_kwargs: Optional[Dict[str, Any]] = None,
-         q_cap: Optional[float] = None):  # ★ 추가
-    
+        q_cap: Optional[float] = None,
+        cfg: Any = None,  # ★ 추가: RetirementEnv에 그대로 전달
+    ):
         self.f_target = float(f_target)
-        self.q_cap = float(q_cap) if q_cap is not None else None  # ★ 추가
+        self.q_cap = float(q_cap) if q_cap is not None else None
+        self._cfg = cfg
+
         kwargs = dict(base_kwargs or {})
         # best-effort: common flags if supported by underlying env
         if w_max is not None:
@@ -50,7 +52,12 @@ class IRPEnvAdapter:
         if q_floor is not None:
             kwargs.setdefault("q_floor", float(q_floor))
 
-        self._env = RetirementEnv(**kwargs)
+        # ★ 핵심: cfg 주입 경로 보장
+        if self._cfg is not None:
+            self._env = RetirementEnv(self._cfg, **kwargs)
+        else:
+            self._env = RetirementEnv(**kwargs)
+
         self._last_info: Dict[str, Any] | None = None
 
     # ---------- Helpers ----------
@@ -240,6 +247,7 @@ def _env_from_envvars() -> IRPEnvAdapter:
         w_max=w_max,
         q_floor=q_floor,
         base_kwargs=base_kwargs,
+        cfg=None,
     )
 
 

@@ -1,5 +1,4 @@
-﻿# project/runner/run.py
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import contextlib
 import os
@@ -531,18 +530,18 @@ def run_once(args) -> Dict[str, Any]:
 # ==========================
 # RL (RLTrainer 경로, 절대임포트 고정)
 # ==========================
-# (중략) 파일 상단 및 다른 함수들은 그대로 유지
-
-def _build_env_factory_from_args(args):
-    """IRPEnvAdapter(env) + RetirementEnv kwargs 전달."""
+def _build_env_factory_from_args(args, cfg: SimConfig):
+    """
+    IRPEnvAdapter(env) + RetirementEnv kwargs 전달.
+    cfg를 클로저로 캡처하여 RetirementEnv(cfg, **kwargs) 경로를 강제.
+    """
     from project.env.irp_env import IRPEnvAdapter  # ← 절대경로
 
     fee_annual = float(args.phi_adval) if (getattr(args, "phi_adval", None) not in (None, 0.0)) else float(args.fee_annual)
 
-    # RetirementEnv가 직접 받는 값들은 base_kwargs에만 넣는다.
+    # RetirementEnv가 직접 받는 값들은 base_kwargs에 넣는다.
     base_kwargs = dict(
         horizon_years   = int(args.horizon_years),
-        # w_max는 IRPEnvAdapter에도 전달하지만, 혹시 RetirementEnv도 받는다면 setdefault로 중복 안전
         w_max           = float(args.w_max),
         fee_annual      = float(fee_annual),
         floor_on        = "on" if bool(getattr(args, "floor_on", False)) else "off",
@@ -556,20 +555,33 @@ def _build_env_factory_from_args(args):
         crra_gamma      = float(getattr(args, "crra_gamma", 3.0) or 3.0),
         age0            = int(getattr(args, "age0", 65)),
         sex             = str(getattr(args, "sex", "M")),
-        seeds=[int(getattr(args, "seed", 0))],   # 또는 seeds=args.seeds
         F_target        = float(getattr(args, "F_target", 0.0) or 0.0),
+        # seeds는 RetirementEnv가 cfg에서 읽을 수 있지만, 혹시 kwargs 경로도 지원한다면 setdefault로 전달
+        seeds           = list(getattr(cfg, "seeds", getattr(args, "seeds", [0]))),
     )
 
-    # IRPEnvAdapter에 허용된 인자만 직접 전달: f_target, w_max, q_floor, base_kwargs
+    # cfg에 주입된 데이터 시리즈가 있을 경우 base_kwargs에도 중복 안전(setdefault)으로 복사
+    for k in ("data_ret_series", "data_rf_series", "data_cpi", "data_dates",
+              "data_ret_kr_eq", "data_ret_us_eq_krw", "data_ret_gold_krw"):
+        v = getattr(cfg, k, None)
+        if v is not None:
+            base_kwargs.setdefault(k, v)
+
+    # window도 혹시 직접 참조할 경우 대비
+    if getattr(cfg, "data_window", None):
+        base_kwargs.setdefault("data_window", getattr(cfg, "data_window"))
+
     def env_factory():
         return IRPEnvAdapter(
             f_target   = base_kwargs.get("F_target", 0.0),
             w_max      = base_kwargs.get("w_max", None),
             q_floor    = float(getattr(args, "q_floor", 0.0) or 0.0),
             base_kwargs= base_kwargs,
-            q_cap      = float(getattr(args, "rl_q_cap", 0.01) or 0.01),  # ★ 추가: 기본 1%/월
+            q_cap      = float(getattr(args, "rl_q_cap", 0.0) or 0.0),
+            cfg        = cfg,  # ★ 핵심: cfg 전달
         )
     return env_factory
+
 
 def _deterministic_policy_step(tr, obs, device):
     import torch
@@ -591,7 +603,7 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int) -> Dict[str, Any]:
         env = env_factory()
         # 에피소드별 고유 시드
         eval_seed = base_seed + ep
-        obs = env.reset(seed=eval_seed)   # <<< 핵심 수정
+        obs = env.reset(seed=eval_seed)   # ★ 핵심: episode별 seed
         done = False
         ret_sum = 0.0
         info = {}
@@ -615,11 +627,18 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int) -> Dict[str, Any]:
     }
     return out
 
+
 def run_rl(args):
     t_all_0 = time.perf_counter()
 
     t0 = time.perf_counter()
     cfg: SimConfig = make_cfg(args)
+
+    # seeds normalize into cfg (single source of truth)
+    if not hasattr(cfg, "seeds"):
+        setattr(cfg, "seeds", list(getattr(args, "seeds", [0])))
+    if getattr(cfg, "seeds", None):
+        setattr(cfg, "seed", int(cfg.seeds[0]))
 
     bh_spec = None
     if _parse_bh is not None:
@@ -641,7 +660,8 @@ def run_rl(args):
     if ann_enabled: setup_annuity_overlay(cfg, args)
     time_annuity = time.perf_counter() - t2
 
-    env_factory = _build_env_factory_from_args(args)
+    # ★ cfg를 캡처하는 env 팩토리
+    env_factory = _build_env_factory_from_args(args, cfg)
 
     # 🔒 절대경로 임포트 고정
     try:
@@ -665,7 +685,7 @@ def run_rl(args):
         max_steps = max_steps,
         rollout_len = int(getattr(args, "rl_steps_per_epoch", 512) or 512),
         batch_size = int(getattr(args, "rl_steps_per_epoch", 512) or 512),
-        seed = int(args.seeds[0] if isinstance(args.seeds, (list, tuple)) else int(args.seeds)),
+        seed = int(getattr(cfg, "seed", 0)),
         log_dir = os.path.join(os.path.abspath(args.outputs), "_logs"),
         tag = str(getattr(args, "tag", "rl_run") or "rl_run"),
         device = "auto",

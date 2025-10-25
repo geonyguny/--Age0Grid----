@@ -1,5 +1,4 @@
-﻿# project/runner/cli.py
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -77,8 +76,9 @@ def _normalize_seeds(seeds_arg: List[int]) -> List[int]:
     if not isinstance(seeds_arg, list) or len(seeds_arg) == 0:
         return [0, 1, 2, 3, 4]
     if len(seeds_arg) == 1:
-        n = int(seeds_arg[0])
-        return list(range(max(n, 1)))
+        # 의미 모호성을 제거: 값 n을 단일 시드로 해석하지 말고 "0..n-1"로 해석하려면 아래 주석 해제
+        # n = int(seeds_arg[0]); return list(range(max(n, 1)))
+        return [int(seeds_arg[0])]
     return sorted({int(x) for x in seeds_arg})
 
 
@@ -119,7 +119,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--w_fixed", type=float, default=0.60)
     p.add_argument("--floor_on", action="store_true")
     p.add_argument("--f_min_real", type=float, default=0.0)
+    # Seeds
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    p.add_argument("--seed", type=int, default=None, help="단일 시드(지정 시 seeds=[seed]로 사용)")
     p.add_argument("--n_paths", type=int, default=100)
     p.add_argument("--es_mode", type=str, default="wealth", choices=["wealth", "loss"])
     p.add_argument("--outputs", type=str, default="./outputs")
@@ -169,7 +171,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # autosave
     p.add_argument("--autosave", choices=["on", "off"], default="off")
 
-    # RL (기존 인자 유지, 내부에서 RLTrainer 매핑)
+    # RL
     p.add_argument("--rl_epochs", type=int, default=60)
     p.add_argument("--rl_steps_per_epoch", type=int, default=2048)
     p.add_argument("--rl_n_paths_eval", type=int, default=300)
@@ -408,12 +410,17 @@ def main():
     p = _build_arg_parser()
     args = p.parse_args()
 
-    # normalize
+    # normalize outputs
     args.outputs = _normalize_outputs_path(getattr(args, "outputs", None))
+
+    # seeds normalize
     try:
-        args.seeds = _normalize_seeds(list(getattr(args, "seeds", [])))
+        if getattr(args, "seed", None) is not None:
+            args.seeds = [int(args.seed)]
+        else:
+            args.seeds = _normalize_seeds(list(getattr(args, "seeds", [])))
     except Exception:
-        args.seeds = [0, 1, 2, 3, 4]
+        args.seeds = [0]
 
     parsed_w_grid = _csv_floats(getattr(args, "hjb_w_grid", None))
     if parsed_w_grid is not None:
@@ -451,9 +458,7 @@ def main():
             out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
     else:
         if args.method == "rl":
-            # ✅ 항상 run_rl로: 학습 → 정책 롤아웃 → EW/ES/Ruin/mean_WT 산출
             out = run_rl(args)
-            # 주의: run_rl이 이미 ES/EW 계산을 끝냈으므로, 여기서 maybe_evaluate_with_es_mode로 덮어쓰지 않습니다.
         else:
             res = run_once(args)
             out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"), want_paths=want_paths)
@@ -466,7 +471,7 @@ def main():
         out.setdefault("outputs_abs", getattr(args, "outputs", None))
         _inject_meta(out, args)
 
-    # ES95(CVaR) fixup (best-effort) — 표준 정의와 다를 경우 내부 유틸이 덮어씀
+    # ES95(CVaR) fixup (best-effort)
     try:
         if isinstance(out, dict):
             out = fixup_metrics_with_cvar(args, out)
