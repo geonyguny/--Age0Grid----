@@ -120,6 +120,8 @@ class RetirementEnv:
       • [ANN] init_annuity에 r_f_real_annual를 옵션 전달, 외생소득 y_ann은 c = y_ann + q*W_start로 처리(기존 유지)
       • [Behavioral/Utility] cfg.behavioral_spec가 있으면 distort_utility/habit_utility로 보상 변환
       • [Bias Signals] info에 recent_ret/recent_vol 제공(액션-레이어 편향 모듈이 참조)
+      • [NEW] 에피소드 종료 시 info에 W_T, done_reason, (옵션) L_term=max(F_target-W_T,0) 추가
+      • [NEW] reset/_obs가 np.float32로 정규화
     """
 
     # --- cfg/kwargs 통합 접근자 ---
@@ -140,7 +142,9 @@ class RetirementEnv:
 
         # floor_on + f_min_real 지원 / q_floor None→0.0
         _qf = self._get(cfg, kwargs, "q_floor", 0.0)
-        self.q_floor_base = _safe_float(0.0 if _qf is None else _qf, 0.0)
+        # 수정: q_floor를 연간으로 받아 월로 변환하고 저장
+        spm = int(getattr(self, "steps_per_year", 12) or 12)
+        self.q_floor_base = _safe_float(0.0 if _qf is None else _qf, 0.0) / spm
         self.floor_on = str(self._get(cfg, kwargs, "floor_on", "off") or "off").lower() == "on"
         self.f_min_real = _safe_float(self._get(cfg, kwargs, "f_min_real", 0.0), 0.0)
 
@@ -226,6 +230,9 @@ class RetirementEnv:
         # ---- yearly flags ----
         self.is_new_year: bool = True
         self.cpi_yoy: float = 0.0
+
+        # --- [NEW] Terminal shortfall target (옵션) ---
+        self.F_target = _safe_float(self._get(cfg, kwargs, "F_target", 0.0), 0.0)
 
         self.reset()
 
@@ -357,12 +364,12 @@ class RetirementEnv:
         # t=0 연금 매입(옵션)
         self._annuity_init_if_any()
 
-        return self._obs()
+        return self._obs().astype(np.float32)
 
     def _obs(self) -> np.ndarray:
-        """정규화 시간과 현재 자산을 ndarray로 반환."""
+        """정규화 시간과 현재 자산을 ndarray(float32)로 반환."""
         t_norm = (self.t / max(1, self.T - 1)) if self.T > 1 else 0.0
-        return np.array([_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0)], dtype=float)
+        return np.asarray([_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0)], dtype=np.float32)
 
     def _state(self) -> np.ndarray:
         """과거 호환용 shim."""
@@ -376,7 +383,10 @@ class RetirementEnv:
         W_now = max(_safe_float(self.W, 0.0), 0.0)
         if W_now <= 0.0:
             return 0.0
-        dyn = max(0.0, min(1.0, _safe_float(self.f_min_real, 0.0) / W_now))
+        # 수정: f_min_real을 '연간' 입력으로 보고 월로 환산
+        spm = int(getattr(self, "steps_per_year", 12) or 12)
+        f_min_per_step = _safe_float(self.f_min_real, 0.0) / spm
+        dyn = max(0.0, min(1.0, f_min_per_step / W_now))
         return max(float(self.q_floor_base or 0.0), dyn)
 
     # ----- hedge -----
@@ -413,35 +423,38 @@ class RetirementEnv:
           - step(q=..., w=...)
           - step(q, w)
           - step([q, w]) / step((q, w)) / step(np.array([q, w]))
+          - step({"q":..., "w":...})   ← NEW: dict 지원
         Returns: (obs, reward, done, trunc, info)
-
-        처리 순서:
-          clipping → consumption → returns(+hedge) → fee
-          floor_on: q_min=max(q_floor_base, f_min_real/W)
-          [ANN] c = y_ann + q*W_start (연금소득은 외생 유입)
-          효용-레이어 편향(있으면) → 보상 변환
         """
         # ---- parse (q, w) ----
         if len(args) == 1 and not kwargs:
             act = args[0]
-            try:
-                q = float(act[0]); w = float(act[1])
-            except Exception as e:
-                raise TypeError("step(action) expects sequence-like [q,w]") from e
+            # NEW: dict 형태 지원
+            if isinstance(act, dict):
+                try:
+                    q = float(act.get("q", 0.0)); w = float(act.get("w", 0.0))
+                except Exception as e:
+                    raise TypeError("step(dict) expects keys {'q','w'}") from e
+            else:
+                # 시퀀스형 [q,w] 지원 (기존 로직)
+                try:
+                    q = float(act[0]); w = float(act[1])
+                except Exception as e:
+                    raise TypeError("step(action) expects sequence-like [q,w] or dict {'q','w'}") from e
         elif len(args) >= 2:
             q = float(args[0]); w = float(args[1])
         else:
             if "q" in kwargs and "w" in kwargs:
                 q = float(kwargs["q"]); w = float(kwargs["w"])
             else:
-                raise TypeError("step requires (q, w) or action=[q,w]")
+                raise TypeError("step requires (q, w) or action=[q,w] or dict {'q','w'}")
 
         q = _safe_float(q, 0.0)
         w = _safe_float(w, 0.0)
 
         # 에피소드 종료 후 호출 방지
         if self.t >= self.T:
-            return self._obs(), 0.0, True, False, {}
+            return self._obs(), 0.0, True, False, {"W_T": float(self.W), "done_reason": "already_ended"}
 
         # 현재 스텝 시작 자산(수수료 기준 보존)
         W_start = max(_safe_float(self.W, 0.0), 0.0)
@@ -493,6 +506,7 @@ class RetirementEnv:
                 u_eff = base_u
         reward = _safe_float(getattr(self, "u_scale", 0.0), 0.0) * _safe_float(u_eff, base_u) \
                  + _safe_float(getattr(self, "survive_bonus", 0.0), 0.0)
+        reward = np.clip(reward, -100.0, 100.0)
 
         # advance time ------------------------------------------------------
         self.t += 1
@@ -511,6 +525,18 @@ class RetirementEnv:
             self.cpi_yoy = 0.0
 
         done = (self.t >= self.T) or (self.W <= 0.0)
+        trunc = False  # 현재는 잘라내기 없음
+
+        # 에피소드 종료 메타 (W_T, done_reason, L_term)
+        done_reason = "horizon" if (self.t >= self.T and self.W > 0.0) else ("ruin" if self.W <= 0.0 else None)
+        W_T = float(self.W) if done else None
+        L_term = None
+        if done and W_T is not None:
+            Ft = _safe_float(getattr(self, "F_target", 0.0), 0.0)
+            try:
+                L_term = max(Ft - float(W_T), 0.0)
+            except Exception:
+                L_term = None
 
         # ----- Bias 신호(액션-레이어 편향 모듈용) -----
         # 최근 1개월 수익률, 최근 12개월 변동성
@@ -554,4 +580,39 @@ class RetirementEnv:
             "FlipNegToPos": bool(flip_neg_to_pos),
             "UpDriftRate": bool(up_drift),
         }
-        return self._obs(), float(reward), bool(done), False, info
+
+        # --- [NEW] 종료 시나리오 정보 주입 ---
+        # --- [NEW] 종료 시나리오 정보 주입 (robust) ---
+        # 항상 안전한 스칼라로 W_T 산출
+        W_T = float(_safe_float(getattr(self, "W", 0.0), 0.0))
+
+        if done:
+            # 종료 사유 추론(자산 고갈 vs 만기)
+            if W_T <= 0.0:
+                _done_reason = "wealth_depleted"
+            elif self.t >= self.T:
+                _done_reason = "horizon"
+            else:
+                _done_reason = "external"
+
+            # 터미널 재무지표 확정 기록
+            info.setdefault("W_T", W_T)
+            info.setdefault("terminal_wealth", W_T)
+            info.setdefault("done_reason", _done_reason)
+
+            # 선택: F_target이 있으면 L_term = max(F - W_T, 0) 계산
+            _F = getattr(self, "F_target", None)
+            try:
+                if _F is not None:
+                    F_val = float(_safe_float(_F, 0.0))
+                    info.setdefault("L_term", float(max(F_val - W_T, 0.0)))
+            except Exception:
+                        pass
+
+            # trunc 플래그가 없다면 False로 보장
+            trunc = bool(locals().get("trunc", False))
+
+            return self._obs(), float(reward), bool(done), trunc, info
+        # ✅ 비종료 시에도 반드시 5-튜플 반환 (여기가 누락되어 있었음)
+        return self._obs(), float(reward), False, False, info
+

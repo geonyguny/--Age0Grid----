@@ -8,22 +8,22 @@ from typing import Any, Dict, Optional, Callable, Tuple, List, Union
 
 import numpy as _np
 
-from ..eval import evaluate, save_metrics_autocsv  # ← 백업 CSV 기록 루틴 함께 임포트
-from ..config import SimConfig
-from .config_build import make_cfg
-from .actors import build_actor
-from .annuity_wiring import setup_annuity_overlay
-from .io_utils import ensure_dir, slim_args, do_autosave
-from .logging_filters import silence_stdio
-from ..data.loader import load_market_csv
-from ..env.retirement_env import RetirementEnv  # type: ignore
+from project.eval import evaluate, save_metrics_autocsv  # ← 절대경로
+from project.config import SimConfig
+from project.runner.config_build import make_cfg
+from project.runner.actors import build_actor
+from project.runner.annuity_wiring import setup_annuity_overlay
+from project.runner.io_utils import ensure_dir, slim_args, do_autosave
+from project.runner.logging_filters import silence_stdio
+from project.data.loader import load_market_csv
+from project.env.retirement_env import RetirementEnv  # type: ignore
 
 # ✅ metrics.csv 기록 (주 기록 루트)
-from ..utils.logging_io import write_metrics_csv
+from project.utils.logging_io import write_metrics_csv
 
 # ✅ 효용-레이어 행동편향(있으면 사용, 없으면 안전 폴백)
 try:
-    from ..policy.behavioral import parse_behavioral_from_args as _parse_bh, describe as _bh_describe  # type: ignore
+    from project.policy.behavioral import parse_behavioral_from_args as _parse_bh, describe as _bh_describe  # type: ignore
 except Exception:
     _parse_bh = None
     def _bh_describe(_spec) -> Dict[str, Any]:  # type: ignore
@@ -62,11 +62,38 @@ def _onoff(v: Any, default: str = "on") -> str:
     return default
 
 
+# ---- ES/EV helpers (NEW) ----
+def _es_tail_mean(arr, alpha=0.95):
+    """Wealth 모드 ES: 하위 (1-α) 구간 평균."""
+    x = _np.asarray(arr, dtype=float)
+    x = x[_np.isfinite(x)]
+    n = x.size
+    if n == 0:
+        return None
+    k = max(1, int(_np.ceil((1.0 - float(alpha)) * n)))
+    # 하위 k개 요소 평균
+    part = _np.partition(x, k - 1)[:k]
+    return float(_np.mean(part))
+
+
+def _cvar_loss_from_wealth(arr, F_target, alpha=0.95):
+    """Loss 모드 ES: L=max(F−W,0)의 상위 (1-α) 구간 평균."""
+    x = _np.asarray(arr, dtype=float)
+    x = x[_np.isfinite(x)]
+    n = x.size
+    if n == 0:
+        return None
+    loss = _np.maximum(float(F_target) - x, 0.0)
+    k = max(1, int(_np.ceil((1.0 - float(alpha)) * n)))
+    # 손실 상위 k개 평균
+    part = _np.partition(loss, -(k))[-k:]
+    return float(_np.mean(part))
+
+
 # --------------------------
 # Helpers: parsing mix / hedge
 # --------------------------
 def _parse_alpha_mix(args) -> Tuple[float, float, float]:
-    """--alpha_mix 'a,b,c' 또는 --alpha_kr/us/au. 없으면 1/3,1/3,1/3."""
     def _as_float(x, default=None):
         try:
             return float(x)
@@ -96,7 +123,6 @@ def _parse_alpha_mix(args) -> Tuple[float, float, float]:
 
 
 def _get_fx_hedge_params(args) -> Tuple[float, float]:
-    """h_FX∈[0,1], fx_hedge_cost 연율(기본 0.002)."""
     h = getattr(args, "h_FX", getattr(args, "h_fx", None))
     try:
         h = float(h)
@@ -116,10 +142,8 @@ def _get_fx_hedge_params(args) -> Tuple[float, float]:
 # Market meta injection
 # --------------------------
 def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
-    """cfg/meta/args의 시장 관련 정보를 out/metrics/meta에 주입."""
     if not isinstance(out_dict, dict):
         return
-    # 1) 확보
     market_mode = str(getattr(cfg, "market_mode", "iid") or "iid").lower()
     bootstrap_block = int(getattr(cfg, "bootstrap_block", 24) or 24)
     use_real_rf = _onoff(getattr(cfg, "use_real_rf", "on"), default="on")
@@ -128,7 +152,6 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
     market_csv = getattr(args, "market_csv", None)
     data_profile = getattr(args, "data_profile", None)
 
-    # 2) out.meta 보강
     meta = out_dict.setdefault("meta", {})
     meta_market = dict(market_meta_from_cfg) if isinstance(market_meta_from_cfg, dict) else {}
     meta_market.update({
@@ -142,7 +165,6 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
     meta["market"] = meta_market
     out_dict["meta"] = meta
 
-    # 3) metrics 보강(평탄화된 칼럼으로 — metrics.csv 유도)
     metrics = out_dict.get("metrics")
     if isinstance(metrics, dict):
         metrics.setdefault("market_mode", market_mode)
@@ -152,7 +174,6 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
         metrics.setdefault("market_csv", meta_market["market_csv"])
         metrics.setdefault("data_profile", data_profile or "")
 
-    # 4) 조용하지 않으면 한 줄 출력
     if _onoff(getattr(args, "quiet", "on")) != "on":
         try:
             print(f"[market] mode={market_mode}, block={bootstrap_block}, use_real_rf={use_real_rf}, "
@@ -165,7 +186,6 @@ def _inject_market_meta(cfg: SimConfig, args, out_dict: Dict[str, Any]) -> None:
 # Data wiring (with mix & FX hedge)
 # --------------------------
 def _wire_market_data(cfg: SimConfig, args) -> None:
-    """bootstrap이면 CSV를 로드하여 cfg에 시계열/파라미터를 주입."""
     setattr(cfg, "bands", getattr(args, "bands", "on"))
     setattr(cfg, "data_window", getattr(args, "data_window", None))
     setattr(cfg, "use_real_rf", _onoff(getattr(args, "use_real_rf", "on")))
@@ -205,7 +225,9 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     rf_nom = blob.get("rf_nom")
     dates = blob.get("dates")
     cpi = blob.get("cpi")
-    ret_fx = blob.get("ret_fx") or blob.get("ret_fx_usdkrw") or None
+    ret_fx = blob.get("ret_fx", None)
+    if ret_fx is None:
+        ret_fx = blob.get("ret_fx_usdkrw", None)
 
     import numpy as np
     steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
@@ -266,7 +288,6 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
 
 
 def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
-    """policy/agent를 (q,w) 반환 actor(state)로 어댑트."""
     if policy_like is None:
         raise RuntimeError("policy_like is None")
 
@@ -292,9 +313,7 @@ def _to_actor(policy_like: Any) -> Callable[[Any], tuple[float, float]]:
     return _actor
 
 
-# --- evaluate 출력 표준화 ---
 def _normalize_evaluate_output(ret, es_mode: str):
-    """evaluate 반환을 (metrics, extras)로 정규화."""
     metrics, extras = {}, {}
 
     if isinstance(ret, dict):
@@ -316,7 +335,6 @@ def _normalize_evaluate_output(ret, es_mode: str):
 
 
 def _call_evaluate(cfg, actor, es_mode: str):
-    """return_paths 지원 유무에 맞춰 evaluate 호출."""
     try:
         ret = evaluate(cfg, actor, es_mode=str(es_mode).lower(), return_paths=True)
     except TypeError:
@@ -324,11 +342,7 @@ def _call_evaluate(cfg, actor, es_mode: str):
     return _normalize_evaluate_output(ret, es_mode)
 
 
-# ==========================
-# 상태 어댑팅
-# ==========================
 def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: Any) -> _np.ndarray:
-    """dict/ndarray 상태를 최소 2특징 [t_norm, W]로 정규화."""
     if isinstance(raw_obs, dict):
         T = int(getattr(env, "T", 1) or 1)
         t_idx = float(raw_obs.get("t", 0.0))
@@ -347,7 +361,6 @@ def _as_ndarray_state(raw_obs: Union[Dict[str, Any], _np.ndarray, None], env: An
 def _rollout_terminal_wealths(cfg: SimConfig,
                               actor: Callable[[Any], tuple[float, float]],
                               n_paths: int) -> List[float]:
-    """빠른 로컬 롤아웃으로 eval_WT 대체/보강."""
     env = RetirementEnv(cfg)
     WTs: List[float] = []
     n_paths = int(max(1, n_paths))
@@ -360,14 +373,12 @@ def _rollout_terminal_wealths(cfg: SimConfig,
             raw = env._obs() if hasattr(env, "_obs") else None
             state_nd = _as_ndarray_state(raw, env)
             q, w = actor(state_nd)
-            # 키워드 인자로 호출(다형성 안전)
             _, _, done, truncated, _ = env.step(q=q, w=w)
         WTs.append(float(getattr(env, "W", 0.0)))
     return WTs
 
 
 def _looks_degenerate_wt(xs) -> bool:
-    """WT 분포가 단일값/퇴화하면 True."""
     try:
         arr = _np.asarray(xs, dtype=float).ravel()
         if arr.size <= 1:
@@ -377,9 +388,6 @@ def _looks_degenerate_wt(xs) -> bool:
         return True
 
 
-# ==========================
-# HJB/RULE 공통 실행
-# ==========================
 def run_once(args) -> Dict[str, Any]:
     t_all_0 = time.perf_counter()
 
@@ -388,7 +396,6 @@ def run_once(args) -> Dict[str, Any]:
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
 
-        # ✅ 효용-레이어 행동편향 스펙 주입(있으면)
         bh_spec = None
         if _parse_bh is not None:
             try:
@@ -411,7 +418,6 @@ def run_once(args) -> Dict[str, Any]:
         t3 = time.perf_counter(); actor = build_actor(cfg, args); time_build_actor = time.perf_counter() - t3
         t4 = time.perf_counter(); m, extras = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth")); time_eval = time.perf_counter() - t4
 
-    # eval_WT 보강
     extras = extras or {}
     need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
     wt_from_eval = extras.get("eval_WT", None)
@@ -428,7 +434,6 @@ def run_once(args) -> Dict[str, Any]:
             except Exception as _e:
                 extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
 
-    # annuity 메타(없으면 0.0)
     if isinstance(m, dict):
         y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
         a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
@@ -438,7 +443,6 @@ def run_once(args) -> Dict[str, Any]:
                   "a_factor": a_fac if a_fac != 0.0 else 0.0,
                   "P": P_val if P_val != 0.0 else 0.0})
 
-        # ✅ 행동편향 요약 메트릭(있으면)
         if bh_spec is not None:
             try:
                 m.update(_bh_describe(bh_spec))
@@ -479,10 +483,8 @@ def run_once(args) -> Dict[str, Any]:
         time_total_hms=timing["total_hms"],
     )
 
-    # 🔗 시장 메타/플래그 주입
     _inject_market_meta(cfg, args, out)
 
-    # ✅ meta에 행동편향 기록
     meta_bh = None
     if bh_spec is not None:
         try:
@@ -493,7 +495,6 @@ def run_once(args) -> Dict[str, Any]:
     if meta_bh:
         out["meta"]["behavioral"] = meta_bh
 
-    # ✅ metrics.csv 기록 (항상)
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
         "tag": getattr(args, "tag", None),
@@ -501,13 +502,11 @@ def run_once(args) -> Dict[str, Any]:
         "asset": getattr(cfg, "asset", None),
         "outputs_abs": os.path.abspath(args.outputs),
         "time_total_hms": timing["total_hms"],
-        # 일부 시장 메타 요약
         "market_mode": getattr(cfg, "market_mode", None),
         "bootstrap_block": getattr(cfg, "bootstrap_block", None),
         "use_real_rf": getattr(cfg, "use_real_rf", None),
         "data_window": getattr(cfg, "data_window", None),
     }
-    # 행동편향 요약도 CSV에 함께 남김(있으면)
     if meta_bh:
         meta.update({f"bh_{k}": v for k, v in meta_bh.items()})
 
@@ -516,7 +515,6 @@ def run_once(args) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 🔁 백업 기록 루틴(항상 시도: 헤더 자동 보정 & tag 보장)
     try:
         setattr(cfg, "method", getattr(args, "method", ""))
         setattr(cfg, "es_mode", getattr(args, "es_mode", "wealth"))
@@ -531,45 +529,91 @@ def run_once(args) -> Dict[str, Any]:
 
 
 # ==========================
-# RL
+# RL (RLTrainer 경로, 절대임포트 고정)
 # ==========================
-def _maybe_load_actor_from_ckpt(
-    ckpt_path: Optional[str],
-    cfg_hint: Optional[Any],
-) -> Optional[Callable[[Any], tuple[float, float]]]:
-    """체크포인트에서 actor 로드(가능한 모든 로더 시도)."""
-    if not ckpt_path:
-        return None
+# (중략) 파일 상단 및 다른 함수들은 그대로 유지
 
-    try:
-        from ..trainer.policy_io import load_policy_as_actor  # type: ignore
-        actor = load_policy_as_actor(ckpt_path, cfg_hint=cfg_hint)
-        if callable(actor):
-            return actor
-    except Exception:
-        pass
+def _build_env_factory_from_args(args):
+    """IRPEnvAdapter(env) + RetirementEnv kwargs 전달."""
+    from project.env.irp_env import IRPEnvAdapter  # ← 절대경로
 
-    loaders = [
-        ("..trainer.policy_io", "load_policy_as_actor"),
-        ("..trainer.policy_io", "load_actor"),
-        ("..trainer.rl_a2c", "load_policy_as_actor"),
-        ("..trainer.rl_io", "load_actor"),
-    ]
-    import importlib
+    fee_annual = float(args.phi_adval) if (getattr(args, "phi_adval", None) not in (None, 0.0)) else float(args.fee_annual)
 
-    for mod, attr in loaders:
-        try:
-            modobj = importlib.import_module(mod, package=__package__)
-            loader = getattr(modobj, attr)
-            try:
-                policy_like = loader(ckpt_path, cfg_hint)  # cfg_hint 지원
-            except TypeError:
-                policy_like = loader(ckpt_path)
-            return _to_actor(policy_like)
-        except Exception:
-            continue
-    return None
+    # RetirementEnv가 직접 받는 값들은 base_kwargs에만 넣는다.
+    base_kwargs = dict(
+        horizon_years   = int(args.horizon_years),
+        # w_max는 IRPEnvAdapter에도 전달하지만, 혹시 RetirementEnv도 받는다면 setdefault로 중복 안전
+        w_max           = float(args.w_max),
+        fee_annual      = float(fee_annual),
+        floor_on        = "on" if bool(getattr(args, "floor_on", False)) else "off",
+        f_min_real      = float(getattr(args, "f_min_real", 0.0) or 0.0),
+        market_mode     = str(args.market_mode),
+        market_csv      = str(getattr(args, "market_csv", "" ) or ""),
+        bootstrap_block = int(args.bootstrap_block),
+        use_real_rf     = str(args.use_real_rf),
+        survive_bonus   = float(getattr(args, "survive_bonus", 0.0) or 0.0),
+        u_scale         = float(getattr(args, "u_scale", 0.05) or 0.05),
+        crra_gamma      = float(getattr(args, "crra_gamma", 3.0) or 3.0),
+        age0            = int(getattr(args, "age0", 65)),
+        sex             = str(getattr(args, "sex", "M")),
+        seeds=[int(getattr(args, "seed", 0))],   # 또는 seeds=args.seeds
+        F_target        = float(getattr(args, "F_target", 0.0) or 0.0),
+    )
 
+    # IRPEnvAdapter에 허용된 인자만 직접 전달: f_target, w_max, q_floor, base_kwargs
+    def env_factory():
+        return IRPEnvAdapter(
+            f_target   = base_kwargs.get("F_target", 0.0),
+            w_max      = base_kwargs.get("w_max", None),
+            q_floor    = float(getattr(args, "q_floor", 0.0) or 0.0),
+            base_kwargs= base_kwargs,
+            q_cap      = float(getattr(args, "rl_q_cap", 0.01) or 0.01),  # ★ 추가: 기본 1%/월
+        )
+    return env_factory
+
+def _deterministic_policy_step(tr, obs, device):
+    import torch
+    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+    dist_q, dist_w, _ = tr.actor(obs_t)
+    a_q = (dist_q.concentration1 / (dist_q.concentration1 + dist_q.concentration0)).squeeze(-1)
+    a_w = (dist_w.concentration1 / (dist_w.concentration1 + dist_w.concentration0)).squeeze(-1)
+    a_q = float(a_q.detach().cpu().item())
+    a_w = float(a_w.detach().cpu().item())
+    return {"q": a_q, "w": a_w}
+
+
+def _evaluate_collect_WT(tr, env_factory, n_episodes: int) -> Dict[str, Any]:
+    WT = []
+    returns = []
+    # 평가 시드: 트레이너 시드 기준으로 에피소드마다 분기
+    base_seed = int(getattr(tr.cfg, "seed", 0))
+    for ep in range(int(n_episodes)):
+        env = env_factory()
+        # 에피소드별 고유 시드
+        eval_seed = base_seed + ep
+        obs = env.reset(seed=eval_seed)   # <<< 핵심 수정
+        done = False
+        ret_sum = 0.0
+        info = {}
+        while not done:
+            act = _deterministic_policy_step(tr, obs, tr.device)
+            step_out = env.step(act)
+            if isinstance(step_out, tuple) and len(step_out) == 5:
+                obs, rew, done, trunc, info = step_out
+                done = bool(done) or bool(trunc)
+            else:
+                obs, rew, done, info = step_out
+            ret_sum += float(rew)
+        W_T = info.get("W_T") or info.get("terminal_wealth") or info.get("W")
+        WT.append(float(W_T) if W_T is not None else 0.0)
+        returns.append(ret_sum)
+    out = {
+        "eval_WT": WT,
+        "eval_return_mean": float(_np.mean(returns)) if len(returns) else 0.0,
+        "eval_return_std": float(_np.std(returns)) if len(returns) else 0.0,
+        "episodes": int(n_episodes),
+    }
+    return out
 
 def run_rl(args):
     t_all_0 = time.perf_counter()
@@ -577,7 +621,6 @@ def run_rl(args):
     t0 = time.perf_counter()
     cfg: SimConfig = make_cfg(args)
 
-    # ✅ 효용-레이어 행동편향 스펙 주입(있으면)
     bh_spec = None
     if _parse_bh is not None:
         try:
@@ -585,7 +628,6 @@ def run_rl(args):
             setattr(cfg, "behavioral_spec", bh_spec)
         except Exception:
             setattr(cfg, "behavioral_spec", None)
-
     time_make_cfg = time.perf_counter() - t0
 
     ensure_dir(args.outputs)
@@ -599,81 +641,75 @@ def run_rl(args):
     if ann_enabled: setup_annuity_overlay(cfg, args)
     time_annuity = time.perf_counter() - t2
 
+    env_factory = _build_env_factory_from_args(args)
+
+    # 🔒 절대경로 임포트 고정
     try:
-        from ..trainer.rl_a2c import train_rl
-    except Exception as e:
-        raise SystemExit(f"RL trainer import failed: {e}")
+        from project.trainer.rl_trainer import RLConfig, RLTrainer
+    except Exception as e1:
+        try:
+            from ..trainer.rl_trainer import RLConfig, RLTrainer  # type: ignore
+        except Exception as e2:
+            raise SystemExit(f"RL trainer import failed: {e1}")
+
+    max_steps = int(args.rl_epochs) * int(args.rl_steps_per_epoch)
+    cfg_rl = RLConfig(
+        obs_dim = -1,
+        hidden_dims = [128, 128],
+        gamma = float(getattr(args, "beta", 0.996) or 0.996),
+        lam = float(getattr(args, "gae_lambda", 0.95) or 0.95),
+        ent_coef = float(getattr(args, "entropy_coef", 0.005) or 0.005),
+        vf_coef = float(getattr(args, "value_coef", 0.5) or 0.5),
+        lr = float(getattr(args, "lr", 3e-4) or 3e-4),
+        max_grad_norm = float(getattr(args, "max_grad_norm", 0.5) or 0.5),
+        max_steps = max_steps,
+        rollout_len = int(getattr(args, "rl_steps_per_epoch", 512) or 512),
+        batch_size = int(getattr(args, "rl_steps_per_epoch", 512) or 512),
+        seed = int(args.seeds[0] if isinstance(args.seeds, (list, tuple)) else int(args.seeds)),
+        log_dir = os.path.join(os.path.abspath(args.outputs), "_logs"),
+        tag = str(getattr(args, "tag", "rl_run") or "rl_run"),
+        device = "auto",
+        value_clip = 0.0,
+        entropy_clip = 0.0,
+    )
 
     t3 = time.perf_counter()
-    fields: Dict[str, Any] = train_rl(
-        cfg,
-        seed_list=args.seeds,
-        outputs=args.outputs,
-        n_paths_eval=args.rl_n_paths_eval,
-        rl_epochs=args.rl_epochs,
-        steps_per_epoch=args.rl_steps_per_epoch,
-        lr=args.lr,
-        gae_lambda=args.gae_lambda,
-        entropy_coef=args.entropy_coef,
-        value_coef=args.value_coef,
-        max_grad_norm=args.max_grad_norm,
-    )
+    trainer = RLTrainer(cfg_rl, env_factory)
+    trainer.train()
     time_train_call = time.perf_counter() - t3
 
-    best_epoch = fields.get("best_epoch")
-    ckpt_path = fields.get("ckpt_path")
-    train_time_s = fields.get("train_time_s")
-    eval_time_s = fields.get("eval_time_s")
-
-    policy_like = fields.get("actor") or fields.get("policy") or fields.get("pi") or fields.get("agent")
     t4 = time.perf_counter()
-    actor: Optional[Callable[[Any], tuple[float, float]]] = None
-    try:
-        if policy_like is not None:
-            actor = _to_actor(policy_like)
-    except Exception:
-        actor = None
-    if actor is None:
-        actor = _maybe_load_actor_from_ckpt(ckpt_path, cfg_hint=cfg)
-    time_actor_load = time.perf_counter() - t4
+    extras_dict = _evaluate_collect_WT(trainer, env_factory, int(getattr(args, "rl_n_paths_eval", 64) or 64))
+    time_eval = time.perf_counter() - t4
 
-    n_paths_total = int(getattr(args, "rl_n_paths_eval", 0)) * max(1, len(getattr(args, "seeds", [])))
+    # ---- Build metrics from eval_WT (NEW) ----
+    wt = extras_dict.get("eval_WT", []) or []
+    alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
+    es_mode = str(getattr(args, "es_mode", "wealth")).lower()
+    F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
 
-    if actor is not None and _onoff(getattr(args, "return_actor", "off")) == "on":
-        return (cfg, actor)
-
-    metrics_dict: Dict[str, Any]
-    extras_dict: Dict[str, Any] = {}
-
-    t5 = time.perf_counter()
-    if actor is not None:
-        try:
-            metrics_dict, extras_dict = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
-            metrics_dict.update({"best_epoch": best_epoch, "train_time_s": train_time_s, "eval_time_s": eval_time_s})
-            metrics_dict.setdefault("es95_source", "computed_in_evaluate")
-        except Exception as e:
-            metrics_dict = {
-                "EW": fields.get("EW"),
-                "ES95": fields.get("ES95"),
-                "Ruin": fields.get("Ruin"),
-                "mean_WT": fields.get("mean_WT"),
-                "best_epoch": best_epoch,
-                "train_time_s": train_time_s,
-                "eval_time_s": eval_time_s,
-                "es95_note": f"evaluate failed in run_rl: {type(e).__name__}",
-            }
+    metrics_dict: Dict[str, Any] = {}
+    if len(wt) > 0:
+        ew = float(_np.mean(wt))
+        ruin = float(_np.mean(_np.asarray(wt, dtype=float) <= 0.0))
+        if es_mode == "wealth":
+            es95 = _es_tail_mean(wt, alpha=alpha)
+        else:  # "loss"
+            es95 = _cvar_loss_from_wealth(wt, F_target=F_target, alpha=alpha)
+        metrics_dict.update({
+            "EW": ew,
+            "mean_WT": ew,
+            "ES95": es95,
+            "Ruin": ruin,
+            "es95_source": f"computed_from_eval_WT_{es_mode}",
+            "eval_episodes": int(extras_dict.get("episodes", 0)),
+        })
     else:
-        metrics_dict = {
-            "EW": fields.get("EW"),
-            "ES95": fields.get("ES95"),
-            "Ruin": fields.get("Ruin"),
-            "mean_WT": fields.get("mean_WT"),
-            "best_epoch": best_epoch,
-            "train_time_s": train_time_s,
-            "eval_time_s": eval_time_s,
-            "es95_note": "no actor available (trainer didn't return policy and ckpt loader failed)",
-        }
-    time_eval = time.perf_counter() - t5
+        metrics_dict.update({
+            "EW": None, "mean_WT": None, "ES95": None, "Ruin": None,
+            "es95_source": "no_eval_WT",
+            "eval_episodes": int(extras_dict.get("episodes", 0)),
+        })
 
     time_total = time.perf_counter() - t_all_0
     timing = {
@@ -681,7 +717,6 @@ def run_rl(args):
         "wire_data_s": round(time_wire_data, 6),
         "annuity_setup_s": round(time_annuity, 6),
         "train_call_s": round(time_train_call, 6),
-        "actor_load_s": round(time_actor_load, 6),
         "evaluate_s": round(time_eval, 6),
         "total_s": round(time_total, 6),
         "total_hms": _fmt_hms(time_total),
@@ -691,14 +726,14 @@ def run_rl(args):
         asset=getattr(cfg, "asset", None),
         method="rl",
         baseline="",
-        metrics=metrics_dict,
+        metrics=metrics_dict,  # ← filled
         w_max=getattr(cfg, "w_max", None),
         fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", None)),
         lambda_term=getattr(cfg, "lambda_term", None),
         alpha=getattr(cfg, "alpha", None),
         F_target=getattr(cfg, "F_target", None),
-        es_mode=getattr(args, "es_mode", "wealth"),
-        n_paths=n_paths_total,
+        es_mode=es_mode,
+        n_paths=int(getattr(args, "rl_n_paths_eval", 64) or 64),
         args=slim_args(args) | {
             "rl_q_cap": getattr(args, "rl_q_cap", None),
             "teacher_eps0": getattr(args, "teacher_eps0", None),
@@ -710,17 +745,15 @@ def run_rl(args):
             "alpha_mix": getattr(cfg, "alpha_mix", None),
             "h_FX": getattr(cfg, "h_FX", None),
         },
-        ckpt_path=ckpt_path,
+        ckpt_path=None,
         extra=extras_dict,
         timing=timing,
         time_total_s=timing["total_s"],
         time_total_hms=timing["total_hms"],
     )
 
-    # 🔗 시장 메타/플래그 주입
     _inject_market_meta(cfg, args, out)
 
-    # ✅ meta에 행동편향 기록
     if bh_spec is not None:
         try:
             out.setdefault("meta", {})
@@ -728,7 +761,6 @@ def run_rl(args):
         except Exception:
             pass
 
-    # ✅ metrics.csv 기록 (항상)
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
         "tag": getattr(args, "tag", None),
@@ -736,7 +768,6 @@ def run_rl(args):
         "asset": getattr(cfg, "asset", None),
         "outputs_abs": os.path.abspath(args.outputs),
         "time_total_hms": timing["total_hms"],
-        # 일부 시장 메타 요약
         "market_mode": getattr(cfg, "market_mode", None),
         "bootstrap_block": getattr(cfg, "bootstrap_block", None),
         "use_real_rf": getattr(cfg, "use_real_rf", None),
@@ -753,10 +784,9 @@ def run_rl(args):
     except Exception:
         pass
 
-    # 🔁 백업 기록 루틴(항상 시도)
     try:
         setattr(cfg, "method", "rl")
-        setattr(cfg, "es_mode", getattr(args, "es_mode", "wealth"))
+        setattr(cfg, "es_mode", es_mode)
         save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
     except Exception:
         pass

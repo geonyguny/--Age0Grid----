@@ -9,6 +9,8 @@ import time
 import sys
 from typing import Any, Dict, List
 
+import numpy as np  # ES95 임시 계산에 사용
+
 from ..config import (
     CVAR_TARGET_DEFAULT,
     CVAR_TOL_DEFAULT,
@@ -167,7 +169,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # autosave
     p.add_argument("--autosave", choices=["on", "off"], default="off")
 
-    # RL
+    # RL (기존 인자 유지, 내부에서 RLTrainer 매핑)
     p.add_argument("--rl_epochs", type=int, default=60)
     p.add_argument("--rl_steps_per_epoch", type=int, default=2048)
     p.add_argument("--rl_n_paths_eval", type=int, default=300)
@@ -350,7 +352,7 @@ def _inject_meta(out: Dict[str, Any], args) -> None:
     meta.setdefault("asset", getattr(args, "asset", None))
     meta.setdefault("outputs_abs", getattr(args, "outputs", None))
 
-    # 행동/효용 편향 스펙 메타 기록 (env에서 반영하려면 run.py에서 cfg.behavioral_spec 주입 필요)
+    # 행동/효용 편향 스펙 메타 기록
     try:
         if parse_behavioral_from_args and _bh_describe:
             _spec = parse_behavioral_from_args(args)
@@ -385,6 +387,20 @@ def _inject_meta(out: Dict[str, Any], args) -> None:
                 meta.update({k: vi.get(k) for k in ("git_commit", "py_ver", "np_ver")})
         except Exception:
             pass
+
+
+def _compute_es95_from_losses(losses: List[float] | None, alpha: float = 0.95) -> float | None:
+    """
+    간단 ES(CVaR) 계산기. '손실'이 클수록 나쁨이라는 전제.
+    프로젝트의 표준 정의와 다르면 cvar_utils.fixup 단계에서 덮어씁니다.
+    """
+    if not losses:
+        return None
+    x = np.asarray(losses, dtype=float)
+    x = np.sort(x)  # 오름차순
+    k = max(1, int(np.ceil(len(x) * alpha)))
+    tail = x[-k:]   # 상위 손실 꼬리(큰 값이 손실이라는 가정)
+    return float(np.mean(tail))
 
 
 def main():
@@ -435,8 +451,9 @@ def main():
             out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
     else:
         if args.method == "rl":
-            res = run_rl(args)
-            out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"), want_paths=want_paths)
+            # ✅ 항상 run_rl로: 학습 → 정책 롤아웃 → EW/ES/Ruin/mean_WT 산출
+            out = run_rl(args)
+            # 주의: run_rl이 이미 ES/EW 계산을 끝냈으므로, 여기서 maybe_evaluate_with_es_mode로 덮어쓰지 않습니다.
         else:
             res = run_once(args)
             out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"), want_paths=want_paths)
@@ -449,7 +466,7 @@ def main():
         out.setdefault("outputs_abs", getattr(args, "outputs", None))
         _inject_meta(out, args)
 
-    # ES95(CVaR) fixup (best-effort)
+    # ES95(CVaR) fixup (best-effort) — 표준 정의와 다를 경우 내부 유틸이 덮어씀
     try:
         if isinstance(out, dict):
             out = fixup_metrics_with_cvar(args, out)
