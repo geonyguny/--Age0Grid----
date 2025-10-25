@@ -265,9 +265,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eta_budget_s", type=float, default=None)
     p.add_argument("--eta_hard_stop", choices=["on", "off"], default="on")
     p.add_argument("--eta_db", type=str, default=None)
-
+    p.add_argument("--eval_seed_jitter", choices=["on", "off"], default="off",
+                   help="on이면 평가 에피소드 시드에 시각 기반 소량 지터를 더해 매 실행 시 약간 다른 결과가 나오게 함.")
+    
     return p
-
 
 def _apply_data_profile_defaults(args) -> None:
     if getattr(args, "data_profile", None) and not getattr(args, "market_csv", None):

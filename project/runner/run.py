@@ -594,16 +594,19 @@ def _deterministic_policy_step(tr, obs, device):
     return {"q": a_q, "w": a_w}
 
 
-def _evaluate_collect_WT(tr, env_factory, n_episodes: int) -> Dict[str, Any]:
+def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: bool = False) -> Dict[str, Any]:
     WT = []
     returns = []
-    # 평가 시드: 트레이너 시드 기준으로 에피소드마다 분기
     base_seed = int(getattr(tr.cfg, "seed", 0))
+
+    # <<< ADD: 지터 모드일 때 시각 기반 오프셋(낮은 비트만 사용)
+    if eval_seed_jitter:
+        base_seed = base_seed + (int(time.time_ns()) & 0xFFFF)
+
     for ep in range(int(n_episodes)):
         env = env_factory()
-        # 에피소드별 고유 시드
         eval_seed = base_seed + ep
-        obs = env.reset(seed=eval_seed)   # ★ 핵심: episode별 seed
+        obs = env.reset(seed=eval_seed)
         done = False
         ret_sum = 0.0
         info = {}
@@ -624,9 +627,11 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int) -> Dict[str, Any]:
         "eval_return_mean": float(_np.mean(returns)) if len(returns) else 0.0,
         "eval_return_std": float(_np.std(returns)) if len(returns) else 0.0,
         "episodes": int(n_episodes),
+        # <<< ADD: 메타 기록
+        "eval_seed_mode": "jitter" if eval_seed_jitter else "fixed",
+        "eval_seed_base": int(base_seed),
     }
     return out
-
 
 def run_rl(args):
     t_all_0 = time.perf_counter()
@@ -699,7 +704,11 @@ def run_rl(args):
     time_train_call = time.perf_counter() - t3
 
     t4 = time.perf_counter()
-    extras_dict = _evaluate_collect_WT(trainer, env_factory, int(getattr(args, "rl_n_paths_eval", 64) or 64))
+    extras_dict = _evaluate_collect_WT(
+        trainer, env_factory,
+        int(getattr(args, "rl_n_paths_eval", 64) or 64),
+        eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower()=="on"),
+    )
     time_eval = time.perf_counter() - t4
 
     # ---- Build metrics from eval_WT (NEW) ----
@@ -773,6 +782,13 @@ def run_rl(args):
     )
 
     _inject_market_meta(cfg, args, out)
+    # <<< ADD: 최상위 메타에도 노출(요약 확인용)
+    try:
+        out.setdefault("meta", {})
+        out["meta"]["eval_seed_mode"] = extras_dict.get("eval_seed_mode")
+        out["meta"]["eval_seed_base"] = extras_dict.get("eval_seed_base")
+    except Exception:
+        pass
 
     if bh_spec is not None:
         try:
