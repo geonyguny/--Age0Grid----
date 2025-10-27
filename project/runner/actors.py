@@ -313,18 +313,34 @@ def build_rl_actor(cfg: SimConfig, _args):
 
 
 # ---------- entry ----------
-def build_actor(cfg: SimConfig, args):
-    env = RetirementEnv(cfg)  # 일부 룰 정책이 참조
-    if args.method == "rule":
-        base_actor = build_rule_actor(cfg, args, env)
-    elif args.method == "hjb":
-        base_actor = build_hjb_actor(cfg, args, env)
-    elif args.method == "rl":
-        base_actor = build_rl_actor(cfg, args)
-    else:
-        raise SystemExit("Unknown method")
+def build_actor(cfg: SimConfig, args) -> Callable[[Any], Tuple[float, float]]:
+    """
+    주어진 cfg/args로 정책 actor(q,w)->(q,w)를 생성.
+    - method in {"rule","hjb","rl"}
+    - 행동편향 래퍼는 항상 체결하되 bias_on=off면 no-op (성능/안전성 영향 없음)
+    """
+    # 1) 공용 환경 (rule/hjb가 참조), RL은 기존대로 env 미전달
+    env = RetirementEnv(cfg)
 
-    # (선택) 행동편향(action-layer) 래퍼 적용
-    # behavioral_bias.py가 존재하고 --bias_on on 등일 때만 효과가 있음
-    wrapper = make_bias_wrapper(args, env)
-    return wrapper(base_actor)
+    # 2) 메서드 정규화 + 디스패치
+    method = str(getattr(args, "method", "")).lower()
+    builders: dict[str, Callable[[], Callable[[Any], Tuple[float, float]]]] = {
+        "rule": lambda: build_rule_actor(cfg, args, env),
+        "hjb":  lambda: build_hjb_actor(cfg, args, env),
+        "rl":   lambda: build_rl_actor(cfg, args),
+    }
+    if method not in builders:
+        raise SystemExit(f"Unknown method: {method}")
+
+    base_actor = builders[method]()  # Callable[[obs], (q,w)]
+
+    # 3) 행동편향 래퍼 체결 (bias_on=off면 내부에서 바로 원액터 반환하여 무해)
+    try:
+        wrapper = make_bias_wrapper(args, env)  # env 신호(recent_ret/vol) 전달
+        actor = wrapper(base_actor)
+    except Exception as e:
+        # 래퍼 쪽 문제로 전체 런이 깨지지 않도록 폴백
+        print(f"[WARN] behavioral bias wrapper failed: {e!r}. Fallback to base_actor.")
+        actor = base_actor
+
+    return actor

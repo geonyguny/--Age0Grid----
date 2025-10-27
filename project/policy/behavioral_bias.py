@@ -92,15 +92,28 @@ def make_bias_wrapper(args, env: Optional[Any] = None) -> Callable[[Callable[[An
         # 파라미터 파싱 실패 시 no-op
         cfg = BiasConfig(on=False)
 
-    def wrapper(actor: Callable[[Any], Tuple[float, float]]) -> Callable[[Any], Tuple[float, float]]:
+ # ▼ 추가: 켜졌을 때만 1회 알림
+    if cfg.on:
+        print(f"[BIAS] on={cfg.on} loss_aversion={cfg.loss_aversion} prob_gamma={cfg.prob_gamma} myopia={cfg.myopia}")
+
+    def wrapper(actor):
         if not cfg.on:
             return actor
 
-        def acted(obs: Any) -> Tuple[float, float]:
+        def acted(obs):
             q, w = actor(obs)
-            # env에서 신호를 읽어 state로 전달(옵션)
             state = _extract_env_signal(env) if env is not None else {}
-            return apply_bias(q, w, state, cfg)
+            q_b, w_b = apply_bias(q, w, state, cfg)
+
+            # ▼ 추가: 초기 2스텝 정도만 q/w 변환 확인(시끄러우면 나중에 삭제)
+            try:
+                t = int(getattr(env, "t", 0))
+            except Exception:
+                t = -1
+            if 0 <= t < 2:
+                print(f"[BIAS-APPLY] t={t} q:{q:.4f}->{q_b:.4f} w:{w:.4f}->{w_b:.4f} state={state}")
+
+            return q_b, w_b
         return acted
 
     return wrapper

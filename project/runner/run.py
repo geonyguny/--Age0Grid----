@@ -19,6 +19,7 @@ from project.runner.io_utils import ensure_dir, slim_args, do_autosave
 from project.runner.logging_filters import silence_stdio
 from project.data.loader import load_market_csv
 from project.env.retirement_env import RetirementEnv  # type: ignore
+from project.policy.behavioral_bias import make_bias_wrapper
 
 # ✅ metrics.csv 기록 (주 기록 루트)
 from project.utils.logging_io import write_metrics_csv
@@ -540,7 +541,7 @@ def run_once(args) -> Dict[str, Any]:
         time_annuity = time.perf_counter() - t2
 
         t3 = time.perf_counter()
-        actor = build_actor(cfg, args)
+        actor = build_actor(cfg, args)   # ← 여기서 이미 wrapper 적용됨 (rule/hjb 경로)
         time_build_actor = time.perf_counter() - t3
 
         t4 = time.perf_counter()
@@ -736,7 +737,12 @@ def _deterministic_policy_step(tr, obs, device):
     return {"q": a_q, "w": a_w}
 
 
-def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: bool = False) -> Dict[str, Any]:
+def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: bool = False, args: Any = None) -> Dict[str, Any]:
+    """
+    RL 평가 루프.
+    - trainer.actor에서 얻은 (q,w)에 대해 행동편향 래퍼(make_bias_wrapper)를 에피소드별 env에 장착하여 적용.
+    - env.step에는 dict 액션을 유지하되, 래퍼로 보정된 (q,w)을 주입.
+    """
     WT = []
     returns = []
     base_seed = int(getattr(tr.cfg, "seed", 0))
@@ -752,18 +758,49 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
         done = False
         ret_sum = 0.0
         info = {}
+
+        # 한 에피소드당 한 번만 로그(quiet=off일 때)
+        if args is not None and _onoff(getattr(args, "quiet", "on")) != "on":
+            try:
+                print(f"[BIAS] on={getattr(args,'bias_on','off')} "
+                      f"loss_aversion={getattr(args,'bias_loss_aversion',0.0)} "
+                      f"prob_gamma={getattr(args,'bias_prob_gamma',1.0)} "
+                      f"myopia={getattr(args,'bias_myopia',0.0)}")
+            except Exception:
+                pass
+
         while not done:
-            act = _deterministic_policy_step(tr, obs, tr.device)
-            step_out = env.step(act)
+            # 1) 기본 행위자(트레이너) 결정
+            base_act = _deterministic_policy_step(tr, obs, tr.device)  # dict{"q","w"}
+            q0, w0 = float(base_act.get("q", 0.0)), float(base_act.get("w", 0.0))
+
+            # 2) 행동편향 래퍼 적용 (env 신호를 내부에서 사용)
+            q_b, w_b = q0, w0
+            try:
+                if args is not None:
+                    # 래퍼는 (obs)->(q,w) 형태의 actor를 감싸므로, 현재 q0,w0을 반환하는 미니 액터를 만든다.
+                    def _mini_actor(_obs):  # ignore obs; env 신호는 wrapper 내부에서 env로부터 추출
+                        return q0, w0
+                    wrapped = make_bias_wrapper(args, env)(_mini_actor)
+                    q_b, w_b = wrapped(obs)
+                    q_b, w_b = float(q_b), float(w_b)
+            except Exception:
+                q_b, w_b = q0, w0  # 안전 폴백
+
+            # 3) env.step — 기존 dict 인터페이스 유지
+            step_out = env.step({"q": q_b, "w": w_b})
             if isinstance(step_out, tuple) and len(step_out) == 5:
                 obs, rew, done, trunc, info = step_out
                 done = bool(done) or bool(trunc)
             else:
                 obs, rew, done, info = step_out
+
             ret_sum += float(rew)
+
         W_T = info.get("W_T") or info.get("terminal_wealth") or info.get("W")
         WT.append(float(W_T) if W_T is not None else 0.0)
         returns.append(ret_sum)
+
     out = {
         "eval_WT": WT,
         "eval_return_mean": float(_np.mean(returns)) if len(returns) else 0.0,
@@ -872,7 +909,7 @@ def run_rl(args):
         time_train_call = time.perf_counter() - t3
 
         # -----------------------------
-        # 5) 평가 (WT 수집 + ES/EW 산출)
+        # 5) 평가 (WT 수집 + ES/EW 산출)  ← ★ 편향 래퍼가 평가 행동에 적용됨
         # -----------------------------
         t4 = time.perf_counter()
         extras_dict = _evaluate_collect_WT(
@@ -880,6 +917,7 @@ def run_rl(args):
             env_factory,
             int(getattr(args, "rl_n_paths_eval", 64) or 64),
             eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower() == "on"),
+            args=args,  # ★ 핵심: args 전달해 bias wrapper 사용
         )
         time_eval = time.perf_counter() - t4
 
