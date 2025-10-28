@@ -3,7 +3,7 @@
 import contextlib
 import os
 import time
-from typing import Any, Dict, Optional, Callable, Tuple, List, Union
+from typing import Any, Dict, Callable, Tuple, List, Union
 from pathlib import Path
 import json as _json
 import csv as _csv
@@ -19,7 +19,7 @@ from project.runner.io_utils import ensure_dir, slim_args, do_autosave
 from project.runner.logging_filters import silence_stdio
 from project.data.loader import load_market_csv
 from project.env.retirement_env import RetirementEnv  # type: ignore
-from project.policy.behavioral_bias import make_bias_wrapper
+from project.policy.behavioral_bias import make_bias_wrapper  # RL 평가에서만 사용
 
 # ✅ metrics.csv 기록 (주 기록 루트)
 from project.utils.logging_io import write_metrics_csv
@@ -43,7 +43,7 @@ except Exception:
 
 
 # --------------------------
-# Local safe writers (NEW): 외부 유틸 없이도 항상 저장되도록
+# Local safe writers
 # --------------------------
 def _safe_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,34 +61,48 @@ def _safe_write_csv_one_row(path: Path, row: Dict[str, Any]) -> None:
         w.writerow(row)
     tmp.replace(path)
 
+def _bias_meta_from_args(args: Any) -> Dict[str, Any]:
+    """액션-레이어 편향 파라미터를 metrics 파일에 기록하기 위한 helper."""
+    try:
+        return {
+            "bias_on": str(getattr(args, "bias_on", "off")).lower() in ("on", "true", "1", "yes", "y"),
+            "loss_aversion": float(getattr(args, "bias_loss_aversion", 0.0) or 0.0),
+            "prob_gamma": float(getattr(args, "bias_prob_gamma", 1.0) or 1.0),
+            "myopia": float(getattr(args, "bias_myopia", 0.0) or 0.0),
+            "w_floor": float(getattr(args, "bias_w_floor", 0.0) or 0.0),
+            "w_cap_shock": float(getattr(args, "bias_w_cap_shock", 0.0) or 0.0),
+        }
+    except Exception:
+        return {}
+
 def _save_metrics_files(out_dir: Path, metrics: Dict[str, Any], args: Any) -> None:
     """
-    outputs/<tag>/metrics.json & metrics.csv 강제 생성.
-    - Ruin만 있을 때 RuinPct 자동 보정(동일값 복제; %명칭 호환용)
-    - seed/n_paths_eval 등 메타 기본 포함
+    outputs/<tag>/metrics.json & metrics.csv 생성.
+    - Ruin만 있을 때 RuinPct 자동 보정
+    - seed/n_paths_eval/편향 파라미터 등 메타 포함
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    # 호환 필드 세팅
+
     ew = metrics.get("EW", None)
     es = metrics.get("ES95", None)
     ruin = metrics.get("Ruin", None)
     rpct = metrics.get("RuinPct", None)
     if rpct is None and ruin is not None:
-        # 스크립트 호환을 위해 이름만 맞춰서 복제(스케일은 ruin 그대로)
         rpct = ruin
 
     row = {
         "EW": float(ew) if ew is not None else None,
         "ES95": float(es) if es is not None else None,
         "RuinPct": float(rpct) if rpct is not None else None,
-        "mean_WT": float(metrics.get("mean_WT", ew if ew is not None else 0.0)) if metrics.get("mean_WT", None) is not None or ew is not None else None,
+        "mean_WT": float(metrics.get("mean_WT", ew if ew is not None else 0.0)) if (metrics.get("mean_WT", None) is not None or ew is not None) else None,
         "es95_source": str(metrics.get("es95_source", "")) if metrics.get("es95_source", None) is not None else None,
         "seed": int(getattr(args, "seed", -1)) if getattr(args, "seed", None) is not None else None,
         "n_paths_eval": int(getattr(args, "rl_n_paths_eval", -1)) if getattr(args, "rl_n_paths_eval", None) is not None else None,
         "method": getattr(args, "method", None),
         "data_profile": getattr(args, "data_profile", None),
+        # 액션-레이어 편향 파라미터 메타 추가
+        **_bias_meta_from_args(args),
     }
-    # JSON/CSV 동시 저장
     _safe_write_text(out_dir / "metrics.json", _json.dumps(row, indent=2))
     _safe_write_csv_one_row(out_dir / "metrics.csv", row)
 
@@ -105,7 +119,6 @@ def _fmt_hms(sec: float) -> str:
     except Exception:
         return "00:00:00"
 
-
 def _onoff(v: Any, default: str = "on") -> str:
     s = str(v).strip().lower() if v is not None else default
     if s in ("on", "off"):
@@ -117,7 +130,7 @@ def _onoff(v: Any, default: str = "on") -> str:
     return default
 
 
-# ---- ES/EV helpers (NEW) ----
+# ---- ES/EV helpers ----
 def _es_tail_mean(arr, alpha=0.95):
     """Wealth 모드 ES: 하위 (1-α) 구간 평균."""
     x = _np.asarray(arr, dtype=float)
@@ -128,7 +141,6 @@ def _es_tail_mean(arr, alpha=0.95):
     k = max(1, int(_np.ceil((1.0 - float(alpha)) * n)))
     part = _np.partition(x, k - 1)[:k]
     return float(_np.mean(part))
-
 
 def _cvar_loss_from_wealth(arr, F_target, alpha=0.95):
     """Loss 모드 ES: L=max(F−W,0)의 상위 (1-α) 구간 평균."""
@@ -144,7 +156,7 @@ def _cvar_loss_from_wealth(arr, F_target, alpha=0.95):
 
 
 # --------------------------
-# Data integrity helpers (NEW)
+# Data integrity helpers
 # --------------------------
 def _len1d(x):
     try:
@@ -152,7 +164,6 @@ def _len1d(x):
         return int(a.shape[0])
     except Exception:
         return 0
-
 
 def _assert_dates_monotonic(dates):
     try:
@@ -163,7 +174,6 @@ def _assert_dates_monotonic(dates):
             raise ValueError("dates not strictly increasing")
     except Exception as e:
         raise SystemExit(f"[data] invalid dates sequence: {type(e).__name__}: {e}")
-
 
 def _nan_ratio(x):
     try:
@@ -207,7 +217,6 @@ def _parse_alpha_mix(args) -> Tuple[float, float, float]:
     if s <= 0:
         return (1 / 3, 1 / 3, 1 / 3)
     return (kr / s, us / s, au / s)
-
 
 def _get_fx_hedge_params(args) -> Tuple[float, float]:
     """환헤지 비중 h_FX(0~1), 연간 헤지비용을 읽어 반환."""
@@ -308,7 +317,7 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
         cache=True,
     )
 
-    # === integrity checks & quick stats (NEW) ===
+    # === integrity checks & quick stats ===
     dates = blob.get("dates")
     _assert_dates_monotonic(dates)
 
@@ -510,6 +519,11 @@ def _looks_degenerate_wt(xs) -> bool:
 
 
 def run_once(args) -> Dict[str, Any]:
+    """
+    rule/hjb 경로:
+      - build_actor(cfg,args) 내부에서 액션-레이어 편향 래퍼(behavioral_bias)가 필요한 경우에만 단일 적용됨.
+      - 여기서는 추가로 감싸지지 않음(이중 적용 방지).
+    """
     t_all_0 = time.perf_counter()
 
     quiet_ctx = silence_stdio(also_stderr=True) if _onoff(getattr(args, "quiet", "on")) == "on" else contextlib.nullcontext()
@@ -541,7 +555,7 @@ def run_once(args) -> Dict[str, Any]:
         time_annuity = time.perf_counter() - t2
 
         t3 = time.perf_counter()
-        actor = build_actor(cfg, args)   # ← 여기서 이미 wrapper 적용됨 (rule/hjb 경로)
+        actor = build_actor(cfg, args)   # ← actors.build_actor가 필요 시 래퍼 단일 적용
         time_build_actor = time.perf_counter() - t3
 
         t4 = time.perf_counter()
@@ -638,9 +652,9 @@ def run_once(args) -> Dict[str, Any]:
         "bootstrap_block": getattr(cfg, "bootstrap_block", None),
         "use_real_rf": getattr(cfg, "use_real_rf", None),
         "data_window": getattr(cfg, "data_window", None),
+        # 액션-레이어 편향 메타도 중앙 로그에 얹기
+        **_bias_meta_from_args(args),
     }
-    if meta_bh:
-        meta.update({f"bh_{k}": v for k, v in meta_bh.items()})
 
     # (A) 중앙 로그 파일 갱신
     try:
@@ -656,7 +670,7 @@ def run_once(args) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # (C) NEW: outputs/<tag>/metrics.json & metrics.csv 강제 생성
+    # (C) outputs/<tag>/metrics.json & metrics.csv 강제 생성 (+편향 메타)
     try:
         tag = getattr(args, "tag", None)
         if tag:
@@ -699,17 +713,15 @@ def _build_env_factory_from_args(args, cfg: SimConfig):
         age0=int(getattr(args, "age0", 65)),
         sex=str(getattr(args, "sex", "M")),
         F_target=float(getattr(args, "F_target", 0.0) or 0.0),
-        # seeds는 RetirementEnv가 cfg에서 읽을 수 있지만, 혹시 kwargs 경로도 지원한다면 setdefault로 전달
         seeds=list(getattr(cfg, "seeds", getattr(args, "seeds", [0]))),
     )
 
-    # cfg에 주입된 데이터 시리즈가 있을 경우 base_kwargs에도 중복 안전(setdefault)으로 복사
+    # cfg에 주입된 데이터 시리즈가 있을 경우 base_kwargs에도 복사
     for k in ("data_ret_series", "data_rf_series", "data_cpi", "data_dates", "data_ret_kr_eq", "data_ret_us_eq_krw", "data_ret_gold_krw"):
         v = getattr(cfg, k, None)
         if v is not None:
             base_kwargs.setdefault(k, v)
 
-    # window도 혹시 직접 참조할 경우 대비
     if getattr(cfg, "data_window", None):
         base_kwargs.setdefault("data_window", getattr(cfg, "data_window"))
 
@@ -720,7 +732,7 @@ def _build_env_factory_from_args(args, cfg: SimConfig):
             q_floor=float(getattr(args, "q_floor", 0.0) or 0.0),
             base_kwargs=base_kwargs,
             q_cap=float(getattr(args, "rl_q_cap", 0.0) or 0.0),
-            cfg=cfg,  # ★ 핵심: cfg 전달 (IRPEnvAdapter가 지원해야 함)
+            cfg=cfg,  # ★ 핵심: cfg 전달
         )
 
     return env_factory
@@ -741,13 +753,12 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
     """
     RL 평가 루프.
     - trainer.actor에서 얻은 (q,w)에 대해 행동편향 래퍼(make_bias_wrapper)를 에피소드별 env에 장착하여 적용.
-    - env.step에는 dict 액션을 유지하되, 래퍼로 보정된 (q,w)을 주입.
+    - 학습 단계에는 편향을 적용하지 않고, 평가 시에만 적용(명시적 설계).
     """
     WT = []
     returns = []
     base_seed = int(getattr(tr.cfg, "seed", 0))
 
-    # <<< 지터 모드: 시각 하위 비트 오프셋
     if eval_seed_jitter:
         base_seed = base_seed + (int(time.time_ns()) & 0xFFFF)
 
@@ -759,7 +770,6 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
         ret_sum = 0.0
         info = {}
 
-        # 한 에피소드당 한 번만 로그(quiet=off일 때)
         if args is not None and _onoff(getattr(args, "quiet", "on")) != "on":
             try:
                 print(f"[BIAS] on={getattr(args,'bias_on','off')} "
@@ -774,12 +784,11 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
             base_act = _deterministic_policy_step(tr, obs, tr.device)  # dict{"q","w"}
             q0, w0 = float(base_act.get("q", 0.0)), float(base_act.get("w", 0.0))
 
-            # 2) 행동편향 래퍼 적용 (env 신호를 내부에서 사용)
+            # 2) 행동편향 래퍼 적용
             q_b, w_b = q0, w0
             try:
                 if args is not None:
-                    # 래퍼는 (obs)->(q,w) 형태의 actor를 감싸므로, 현재 q0,w0을 반환하는 미니 액터를 만든다.
-                    def _mini_actor(_obs):  # ignore obs; env 신호는 wrapper 내부에서 env로부터 추출
+                    def _mini_actor(_obs):
                         return q0, w0
                     wrapped = make_bias_wrapper(args, env)(_mini_actor)
                     q_b, w_b = wrapped(obs)
@@ -813,29 +822,29 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
 
 
 def run_rl(args):
+    """
+    RL 경로:
+      - 학습(train)에는 액션-레이어 편향을 적용하지 않음.
+      - 평가(evaluate) 시에만 make_bias_wrapper(args, env)로 보정된 (q,w)를 사용.
+      - 중앙 로그/태그별 metrics.*에 편향 파라미터 메타를 함께 기록.
+    """
     t_all_0 = time.perf_counter()
 
-    # 🔇 quiet 모드면 stdout/stderr 완전 침묵
     quiet_ctx = silence_stdio(also_stderr=True) if _onoff(getattr(args, "quiet", "on")) == "on" else contextlib.nullcontext()
 
     with quiet_ctx:
-        # -----------------------------
         # 0) CFG 구성 및 시드 단일화
-        # -----------------------------
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
 
-        # seeds normalize into cfg (single source of truth)
         if not hasattr(cfg, "seeds"):
             setattr(cfg, "seeds", list(getattr(args, "seeds", [0])))
-        # 단일 seed 우선순위: args.seed > cfg.seeds[0]
         try:
             single_seed = int(getattr(args, "seed", None)) if getattr(args, "seed", None) is not None else int(cfg.seeds[0])
         except Exception:
             single_seed = 0
         setattr(cfg, "seed", int(single_seed))
 
-        # behavioral spec (있으면 기록)
         bh_spec = None
         if _parse_bh is not None:
             try:
@@ -850,9 +859,7 @@ def run_rl(args):
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
-        # -----------------------------
         # 1) 데이터 배선 + 연금 오버레이
-        # -----------------------------
         t1 = time.perf_counter()
         _wire_market_data(cfg, args)
         time_wire_data = time.perf_counter() - t1
@@ -863,14 +870,10 @@ def run_rl(args):
             setup_annuity_overlay(cfg, args)
         time_annuity = time.perf_counter() - t2
 
-        # -----------------------------
-        # 2) Env factory (cfg 캡처)
-        # -----------------------------
+        # 2) Env factory
         env_factory = _build_env_factory_from_args(args, cfg)
 
-        # -----------------------------
         # 3) RLTrainer 로드 & 설정
-        # -----------------------------
         try:
             from project.trainer.rl_trainer import RLConfig, RLTrainer
         except Exception as e1:
@@ -892,7 +895,7 @@ def run_rl(args):
             max_steps=max_steps,
             rollout_len=int(getattr(args, "rl_steps_per_epoch", 512) or 512),
             batch_size=int(getattr(args, "rl_steps_per_epoch", 512) or 512),
-            seed=int(getattr(cfg, "seed", 0)),  # ← 단일화된 seed 사용
+            seed=int(getattr(cfg, "seed", 0)),
             log_dir=os.path.join(os.path.abspath(args.outputs), "_logs"),
             tag=str(getattr(args, "tag", "rl_run") or "rl_run"),
             device="auto",
@@ -900,24 +903,20 @@ def run_rl(args):
             entropy_clip=0.0,
         )
 
-        # -----------------------------
         # 4) 학습
-        # -----------------------------
         t3 = time.perf_counter()
         trainer = RLTrainer(cfg_rl, env_factory)
         trainer.train()
         time_train_call = time.perf_counter() - t3
 
-        # -----------------------------
-        # 5) 평가 (WT 수집 + ES/EW 산출)  ← ★ 편향 래퍼가 평가 행동에 적용됨
-        # -----------------------------
+        # 5) 평가 (WT 수집 + ES/EW 산출) — ★ 편향은 여기서만 적용
         t4 = time.perf_counter()
         extras_dict = _evaluate_collect_WT(
             trainer,
             env_factory,
             int(getattr(args, "rl_n_paths_eval", 64) or 64),
             eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower() == "on"),
-            args=args,  # ★ 핵심: args 전달해 bias wrapper 사용
+            args=args,
         )
         time_eval = time.perf_counter() - t4
 
@@ -953,7 +952,7 @@ def run_rl(args):
                 "eval_episodes": int(extras_dict.get("episodes", 0)),
             })
 
-        # === market quick stats → metrics에도 적절히 반영
+        # 시장 통계 일부도 metrics에
         try:
             _mixed = getattr(cfg, "data_ret_series", None)
             _rf = getattr(cfg, "data_rf_series", None)
@@ -976,9 +975,7 @@ def run_rl(args):
         except Exception:
             pass
 
-        # -----------------------------
         # 6) 결과 패키징
-        # -----------------------------
         time_total = time.perf_counter() - t_all_0
         timing = {
             "make_cfg_s": round(time_make_cfg, 6),
@@ -1020,7 +1017,7 @@ def run_rl(args):
             time_total_hms=timing["total_hms"],
         )
 
-        # 시장 메타 및 평가 시드 메타
+        # 시장/평가 시드 메타 + 편향 메타
         _inject_market_meta(cfg, args, out)
         try:
             out.setdefault("meta", {})
@@ -1046,7 +1043,7 @@ def run_rl(args):
             except Exception:
                 pass
 
-        # 파일 기록(조용히)
+        # 파일 기록
         metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
         meta = {
             "tag": getattr(args, "tag", None),
@@ -1058,12 +1055,9 @@ def run_rl(args):
             "bootstrap_block": getattr(cfg, "bootstrap_block", None),
             "use_real_rf": getattr(cfg, "use_real_rf", None),
             "data_window": getattr(cfg, "data_window", None),
+            # 액션-레이어 편향 메타도 중앙 로그에 얹기
+            **_bias_meta_from_args(args),
         }
-        if _parse_bh is not None and bh_spec is not None:
-            try:
-                meta.update({f"bh_{k}": v for k, v in _bh_describe(bh_spec).items()})
-            except Exception:
-                pass
 
         # (A) 중앙 로그 파일 갱신
         try:
@@ -1079,7 +1073,7 @@ def run_rl(args):
         except Exception:
             pass
 
-        # (C) NEW: outputs/<tag>/metrics.json & metrics.csv 강제 생성
+        # (C) outputs/<tag>/metrics.json & metrics.csv 강제 생성
         try:
             tag = getattr(args, "tag", None)
             if tag:
@@ -1090,5 +1084,4 @@ def run_rl(args):
         if _onoff(getattr(args, "autosave", "off")) == "on":
             do_autosave(out.get("metrics") or {}, cfg, args, out)
 
-    # with quiet_ctx 종료 — 여기까지 어떤 stdout/stderr도 내보내지 않음
     return out

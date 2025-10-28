@@ -71,6 +71,7 @@ def _normalize_outputs_path(p: str | None) -> str:
     base = p or "./outputs"
     abs_p = os.path.abspath(base)
     os.makedirs(abs_p, exist_ok=True)
+    os.makedirs(os.path.join(abs_p, "_logs"), exist_ok=True)
     return abs_p
 
 
@@ -107,13 +108,11 @@ def _safe_print_json(obj: Any) -> None:
     try:
         s = json.dumps(obj, ensure_ascii=False, sort_keys=True)
     except TypeError:
-        # JSON 직렬화 불가한 타입 최소화 처리
         s = json.dumps(_json_fallback(obj), ensure_ascii=False, sort_keys=True)
     print(s)
 
 
 def _json_fallback(x: Any) -> Any:
-    # dict/list/기본형만 남기기 위한 best-effort 변환
     if isinstance(x, dict):
         return {k: _json_fallback(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
@@ -125,6 +124,13 @@ def _json_fallback(x: Any) -> Any:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
+
+    # --- High-level execution mode ---
+    # auto: (기본) method에 따라 once/rl 라우팅, calib=off면 평가 실행
+    # once: run_once 강제(rule/hjb)
+    # rl:   run_rl 강제
+    # calib: CVaR 보정 루트(calibrate_lambda) 강제
+    p.add_argument("--mode", type=str, default="auto", choices=["auto", "once", "rl", "calib"])
 
     # Core
     p.add_argument("--asset", type=str, default="KR")
@@ -158,7 +164,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--w_min_dev", type=float, default=None,
                    help="(dev) Minimum risky weight; drop w < w_min_dev from HJB action set.")
 
-    # Hedge
+    # Hedge (legacy logical hedge — 별개)
     p.add_argument("--hedge", choices=["on", "off"], default="off")
     p.add_argument("--hedge_mode", choices=["mu", "sigma", "downside"], default="sigma")
     p.add_argument("--hedge_cost", type=float, default=0.005)
@@ -228,8 +234,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # XAI
     p.add_argument("--xai_on", choices=["on", "off"], default="on")
 
-    # QUIET
+    # QUIET / VERBOSE
     p.add_argument("--quiet", choices=["on", "off"], default="on")
+    p.add_argument("--verbose", choices=["on", "off"], default="off",
+                   help="콘솔 로그를 조금 더 상세히(편향 적용 로그 등).")
 
     # ANN Overlay
     p.add_argument("--ann_on", choices=["on", "off"], default="off")
@@ -250,6 +258,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--alpha_us", type=float, default=None)
     p.add_argument("--alpha_au", type=float, default=None)
     p.add_argument("--h_FX", type=float, default=None)
+    p.add_argument("--h_fx", type=float, default=None, help="--h_FX alias")
     p.add_argument("--fx_hedge_cost", type=float, default=None)
 
     # Behavioral (utility-layer)
@@ -312,7 +321,7 @@ def _validate_args(args) -> None:
         if s and not _WINDOW_RE.match(s):
             raise SystemExit(f"--data_window 형식 오류: '{args.data_window}'. 예: 2005-01:2020-12 또는 '2005-01:' / ':2020-12'")
     # bootstrap 입력
-    if args.method in ("hjb", "rule", "rl") and args.market_mode == "bootstrap":
+    if args.market_mode == "bootstrap":
         if not args.market_csv and not args.data_profile:
             raise SystemExit("market_mode=bootstrap 사용 시 --market_csv 또는 --data_profile(dev|full) 필요.")
     # rule baseline 필수
@@ -401,6 +410,7 @@ def _inject_meta(out: Dict[str, Any], args) -> None:
             "w_floor": getattr(args, "bias_w_floor", 0.0),
             "w_cap_shock": getattr(args, "bias_w_cap_shock", 0.0),
         })
+        meta.setdefault("verbose", getattr(args, "verbose", "off"))
     except Exception:
         pass
 
@@ -432,21 +442,40 @@ def _compute_es95_from_losses(losses: List[float] | None, alpha: float = 0.95) -
     return float(np.mean(tail))
 
 
+def _route_mode(args) -> str:
+    """
+    mode 해석:
+      - explicit: once/rl/calib이면 그대로
+      - auto: method와 calib을 참고
+        * calib=on → calib
+        * method=rl → rl
+        * 그 외 → once
+    """
+    mode = str(getattr(args, "mode", "auto")).lower()
+    if mode in ("once", "rl", "calib"):
+        return mode
+    if str(getattr(args, "calib", "off")).lower() == "on":
+        return "calib"
+    if str(getattr(args, "method", "hjb")).lower() == "rl":
+        return "rl"
+    return "once"
+
+
 def _run_core(args) -> Dict[str, Any] | Any:
     """실제 실행 경로(학습/평가/보정)를 분리 — stdout은 여기서 절대 출력하지 않음."""
     want_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
 
-    # routing
-    if str(getattr(args, "calib", "off")).lower() == "on":
+    route = _route_mode(args)
+
+    if route == "calib":
         out = calibrate_lambda(args)
         if isinstance(out, dict) and "es_mode" not in out:
             out["es_mode"] = str(getattr(args, "es_mode", "wealth")).lower()
-    else:
-        if args.method == "rl":
-            out = run_rl(args)
-        else:
-            res = run_once(args)
-            out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"), want_paths=want_paths)
+    elif route == "rl":
+        out = run_rl(args)
+    else:  # "once"
+        res = run_once(args)
+        out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args, "es_mode", "wealth"), want_paths=want_paths)
 
     # meta
     if isinstance(out, dict):
@@ -501,6 +530,10 @@ def main():
     if parsed_w_grid is not None:
         args.hjb_w_grid = parsed_w_grid
 
+    # alias: h_fx → h_FX (미지정 시에만)
+    if getattr(args, "h_FX", None) is None and getattr(args, "h_fx", None) is not None:
+        args.h_FX = args.h_fx
+
     _apply_data_profile_defaults(args)
     _validate_args(args)
 
@@ -525,7 +558,6 @@ def main():
         print(f"[ETA] predictor skipped ({type(_e).__name__})", file=sys.stderr, flush=True)
 
     # -------- 핵심: **모든 실행 구간의 stdout 캡처** (순수 JSON 보장) --------
-    # quiet 여부와 상관없이, 외부 모듈이 실수로 stdout을 찍어도 여기서 잡아서 버립니다.
     captured_stdout = io.StringIO()
     with contextlib.redirect_stdout(captured_stdout):
         out = _run_core(args)
@@ -536,11 +568,10 @@ def main():
         out["time_total_s"] = round(elapsed, 3)
         out["time_total_hms"] = fmt_hms(elapsed)
 
-    # summary 모드: 텍스트 요약만 stdout (JSON 아님). 요구사항상 그대로 유지.
+    # summary 모드: 텍스트 요약만 stdout (JSON 아님).
     if str(getattr(args, "print_mode", "full")).lower() == "summary":
         if isinstance(out, dict):
             metrics = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
-            # summary는 사용자 육안 확인용이므로 JSON 강제 제외(요청 사양 유지)
             _print_metrics_summary(metrics)
         else:
             print("[warn] summary mode but no metrics dict available.")
