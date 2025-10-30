@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿# run.py (refactored)
+from __future__ import annotations
 
 import contextlib
 import os
@@ -29,7 +30,6 @@ try:
     from project.policy.behavioral import parse_behavioral_from_args as _parse_bh, describe as _bh_describe  # type: ignore
 except Exception:
     _parse_bh = None
-
     def _bh_describe(_spec) -> Dict[str, Any]:  # type: ignore
         try:
             return {
@@ -518,11 +518,90 @@ def _looks_degenerate_wt(xs) -> bool:
         return True
 
 
+def _compute_metrics_from_wt(wt, es_mode: str, alpha: float, F_target: float) -> Dict[str, Any]:
+    """WT 샘플에서 EW/ES95/Ruin 재계산(wealth/loss 모드 모두 지원)."""
+    out = {}
+    if not isinstance(wt, (list, tuple)) or len(wt) == 0:
+        return {"EW": None, "mean_WT": None, "ES95": None, "Ruin": None}
+    ew = float(_np.mean(wt))
+    ruin = float(_np.mean(_np.asarray(wt, dtype=float) <= 0.0))
+    if es_mode == "wealth":
+        es95 = _es_tail_mean(wt, alpha=alpha)
+    else:
+        es95 = _cvar_loss_from_wealth(wt, F_target=F_target, alpha=alpha)
+    out.update({"EW": ew, "mean_WT": ew, "ES95": es95, "Ruin": ruin})
+    return out
+
+
+# --------------------------
+# ★ 공용 평가 루틴
+# --------------------------
+def _standard_evaluate(cfg: SimConfig, actor_like: Any, args: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    모든 방법론(rule/hjb/rl)에서 동일 포맷으로 평가·지표 산출:
+      1) evaluate(..., return_paths=True) 시도
+      2) eval_WT 있으면 EW/ES95/Ruin을 eval_WT 기준으로 재계산
+      3) 없거나 퇴화 시 local rollout 보조 (print_mode=full & no_paths=False일 때만)
+    """
+    es_mode = str(getattr(args, "es_mode", "wealth")).lower()
+    alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
+    F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
+
+    m, extras = _call_evaluate(cfg, actor_like, es_mode=es_mode)
+
+    need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
+    wt_from_eval = (extras or {}).get("eval_WT", None)
+
+    if (not isinstance(wt_from_eval, (list, tuple))) or _looks_degenerate_wt(wt_from_eval):
+        if need_paths:
+            n_paths = getattr(args, "n_paths", None)
+            if n_paths is None or int(n_paths) <= 0:
+                n_paths = int(getattr(cfg, "n_paths_eval", 0)) or 500  # 기본 500으로 통일
+            try:
+                WTs = _rollout_terminal_wealths(cfg, _to_actor(actor_like), int(n_paths))
+                extras = extras or {}
+                extras["eval_WT"] = [float(x) for x in WTs]
+                wt_from_eval = extras["eval_WT"]
+            except Exception as _e:
+                extras = extras or {}
+                extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
+
+    # WT가 있으면 항상 재계산
+    if isinstance(wt_from_eval, (list, tuple)) and len(wt_from_eval) > 0 and (not _looks_degenerate_wt(wt_from_eval)):
+        recalc = _compute_metrics_from_wt(wt_from_eval, es_mode=es_mode, alpha=alpha, F_target=F_target)
+        m.update(recalc)
+        m["es95_source"] = f"computed_from_eval_WT_{es_mode}"
+
+    # 시장/믹스 메타 복제
+    try:
+        _mixed = getattr(cfg, "data_ret_series", None)
+        _rf = getattr(cfg, "data_rf_series", None)
+        _dates = getattr(cfg, "data_dates", None)
+        _a_mix = getattr(cfg, "alpha_mix", None)
+        _hfx = getattr(cfg, "h_FX", None)
+        m.setdefault("market_len_ret", _len1d(_mixed))
+        m.setdefault("market_len_rf", _len1d(_rf))
+        m.setdefault("market_len_dates", _len1d(_dates))
+        m.setdefault("ret_mean", float(_np.nanmean(_mixed)) if _mixed is not None else None)
+        m.setdefault("rf_mean", float(_np.nanmean(_rf)) if _rf is not None else None)
+        if _a_mix is not None:
+            m.setdefault("alpha_mix_used", tuple(map(float, _a_mix)))
+        if _hfx is not None:
+            m.setdefault("h_FX_used", float(_hfx))
+        fx_cost_ann = getattr(cfg, "fx_hedge_cost_annual", None)
+        if fx_cost_ann is not None:
+            m.setdefault("fx_hedge_cost_annual", float(fx_cost_ann))
+    except Exception:
+        pass
+
+    return m, (extras or {})
+
+
 def run_once(args) -> Dict[str, Any]:
     """
     rule/hjb 경로:
-      - build_actor(cfg,args) 내부에서 액션-레이어 편향 래퍼(behavioral_bias)가 필요한 경우에만 단일 적용됨.
-      - 여기서는 추가로 감싸지지 않음(이중 적용 방지).
+      - actors.build_actor가 필요 시 편향 래퍼 단일 적용(이중 적용 방지).
+      - 평가는 ★공용 루틴(_standard_evaluate)★로 강제.
     """
     t_all_0 = time.perf_counter()
 
@@ -558,26 +637,12 @@ def run_once(args) -> Dict[str, Any]:
         actor = build_actor(cfg, args)   # ← actors.build_actor가 필요 시 래퍼 단일 적용
         time_build_actor = time.perf_counter() - t3
 
+        # ★ 공용 평가
         t4 = time.perf_counter()
-        m, extras = _call_evaluate(cfg, actor, es_mode=getattr(args, "es_mode", "wealth"))
+        m, extras = _standard_evaluate(cfg, actor, args)
         time_eval = time.perf_counter() - t4
 
-    extras = extras or {}
-    need_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
-    wt_from_eval = extras.get("eval_WT", None)
-    if (not isinstance(wt_from_eval, (list, tuple))) or _looks_degenerate_wt(wt_from_eval):
-        if need_paths:
-            n_paths = getattr(args, "n_paths", None)
-            if n_paths is None or int(n_paths) <= 0:
-                n_paths = int(getattr(cfg, "n_paths_eval", 0)) or 100
-            try:
-                WTs = _rollout_terminal_wealths(cfg, _to_actor(actor), int(n_paths))
-                extras["eval_WT"] = [float(x) for x in WTs]
-                m.setdefault("mean_WT", float(_np.mean(WTs)))
-                m.setdefault("EW", float(_np.mean(WTs)))
-            except Exception as _e:
-                extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
-
+    # ann 메타/행동편향 메타
     if isinstance(m, dict):
         y_ann = float(getattr(cfg, "y_ann", 0.0) or 0.0)
         a_fac = float(getattr(cfg, "ann_a_factor", 0.0) or 0.0)
@@ -588,13 +653,35 @@ def run_once(args) -> Dict[str, Any]:
             "a_factor": a_fac if a_fac != 0.0 else 0.0,
             "P": P_val if P_val != 0.0 else 0.0,
         })
-
         if _parse_bh is not None:
             try:
                 m.update(_bh_describe(bh_spec))  # type: ignore
             except Exception:
                 pass
 
+    # 시장/믹스 메타도 metrics에 일부 복제(요약 스크립트 편의)
+    try:
+        _mixed = getattr(cfg, "data_ret_series", None)
+        _rf = getattr(cfg, "data_rf_series", None)
+        _dates = getattr(cfg, "data_dates", None)
+        _a_mix = getattr(cfg, "alpha_mix", None)
+        _hfx = getattr(cfg, "h_FX", None)
+        m.setdefault("market_len_ret", _len1d(_mixed))
+        m.setdefault("market_len_rf", _len1d(_rf))
+        m.setdefault("market_len_dates", _len1d(_dates))
+        m.setdefault("ret_mean", float(_np.nanmean(_mixed)) if _mixed is not None else None)
+        m.setdefault("rf_mean", float(_np.nanmean(_rf)) if _rf is not None else None)
+        if _a_mix is not None:
+            m.setdefault("alpha_mix_used", tuple(map(float, _a_mix)))
+        if _hfx is not None:
+            m.setdefault("h_FX_used", float(_hfx))
+        fx_cost_ann = getattr(cfg, "fx_hedge_cost_annual", None)
+        if fx_cost_ann is not None:
+            m.setdefault("fx_hedge_cost_annual", float(fx_cost_ann))
+    except Exception:
+        pass
+
+    # n_paths 계산(가능한 한 실제 WT 샘플 수로)
     n_paths_total = len(extras.get("eval_WT", [])) or (
         (getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) or 0) * max(1, len(getattr(cfg, "seeds", [])))
     )
@@ -610,9 +697,12 @@ def run_once(args) -> Dict[str, Any]:
         "total_hms": _fmt_hms(time_total),
     }
 
+    method_norm = str(getattr(args, "method", "") or "").lower()
+    es_mode_norm = str(getattr(args, "es_mode", "wealth")).lower()
+
     out = dict(
         asset=getattr(cfg, "asset", None),
-        method=getattr(args, "method", ""),
+        method=method_norm,
         baseline=getattr(args, "baseline", ""),
         metrics=m,
         w_max=getattr(cfg, "w_max", None),
@@ -620,7 +710,7 @@ def run_once(args) -> Dict[str, Any]:
         lambda_term=getattr(cfg, "lambda_term", None),
         alpha=getattr(cfg, "alpha", None),
         F_target=getattr(cfg, "F_target", None),
-        es_mode=getattr(args, "es_mode", "wealth"),
+        es_mode=es_mode_norm,
         n_paths=int(n_paths_total),
         args=slim_args(args),
         extra=extras,
@@ -641,6 +731,7 @@ def run_once(args) -> Dict[str, Any]:
     if meta_bh:
         out["meta"]["behavioral"] = meta_bh
 
+    # 중앙 로그 메타
     metrics_csv = os.path.join(args.outputs, "_logs", "metrics.csv")
     meta = {
         "tag": getattr(args, "tag", None),
@@ -664,8 +755,8 @@ def run_once(args) -> Dict[str, Any]:
 
     # (B) 기존 자동 CSV 경로 유지
     try:
-        setattr(cfg, "method", getattr(args, "method", ""))
-        setattr(cfg, "es_mode", getattr(args, "es_mode", "wealth"))
+        setattr(cfg, "method", method_norm)
+        setattr(cfg, "es_mode", es_mode_norm)
         save_metrics_autocsv(out.get("metrics", {}), cfg, outputs=args.outputs)
     except Exception:
         pass
@@ -812,9 +903,10 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
 
     out = {
         "eval_WT": WT,
+        "episodes": int(n_episodes),
+        # 디버그 값은 메타로만 유지하고 최종 extras에서는 제거할 것
         "eval_return_mean": float(_np.mean(returns)) if len(returns) else 0.0,
         "eval_return_std": float(_np.std(returns)) if len(returns) else 0.0,
-        "episodes": int(n_episodes),
         "eval_seed_mode": "jitter" if eval_seed_jitter else "fixed",
         "eval_seed_base": int(base_seed),
     }
@@ -826,7 +918,8 @@ def run_rl(args):
     RL 경로:
       - 학습(train)에는 액션-레이어 편향을 적용하지 않음.
       - 평가(evaluate) 시에만 make_bias_wrapper(args, env)로 보정된 (q,w)를 사용.
-      - 중앙 로그/태그별 metrics.*에 편향 파라미터 메타를 함께 기록.
+      - ★공용 산출 형식★: eval_WT 기반 EW/ES95/Ruin 재계산 & 메타 주입은 rule/hjb와 동일.
+      - 디버그 수치(eval_return_mean/std)는 최종 extras에서 제거(메타로만 보존).
     """
     t_all_0 = time.perf_counter()
 
@@ -909,48 +1002,34 @@ def run_rl(args):
         trainer.train()
         time_train_call = time.perf_counter() - t3
 
-        # 5) 평가 (WT 수집 + ES/EW 산출) — ★ 편향은 여기서만 적용
+        # 5) 평가 (WT 수집 + ES/EW 산출) — ★ RL도 공용 지표 스펙으로 산출
         t4 = time.perf_counter()
+        n_eval = int(getattr(args, "rl_n_paths_eval", 0) or 0)
+        if n_eval <= 0:
+            n_eval = 500  # 기본 500으로 통일
         extras_dict = _evaluate_collect_WT(
             trainer,
             env_factory,
-            int(getattr(args, "rl_n_paths_eval", 64) or 64),
+            n_eval,
             eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower() == "on"),
             args=args,
         )
+        # 디버그 값은 최종 extras에서 제거 (메타로만 남김)
+        debug_eval_mean = extras_dict.pop("eval_return_mean", None)
+        debug_eval_std  = extras_dict.pop("eval_return_std", None)
+        eval_seed_mode  = extras_dict.get("eval_seed_mode")
+        eval_seed_base  = extras_dict.get("eval_seed_base")
         time_eval = time.perf_counter() - t4
 
-        # ---- metrics from eval_WT ----
+        # ---- metrics from eval_WT (항상 재계산) ----
         wt = extras_dict.get("eval_WT", []) or []
         alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
         es_mode = str(getattr(args, "es_mode", "wealth")).lower()
         F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
 
-        metrics_dict: Dict[str, Any] = {}
-        if len(wt) > 0:
-            ew = float(_np.mean(wt))
-            ruin = float(_np.mean(_np.asarray(wt, dtype=float) <= 0.0))
-            if es_mode == "wealth":
-                es95 = _es_tail_mean(wt, alpha=alpha)
-            else:
-                es95 = _cvar_loss_from_wealth(wt, F_target=F_target, alpha=alpha)
-            metrics_dict.update({
-                "EW": ew,
-                "mean_WT": ew,
-                "ES95": es95,
-                "Ruin": ruin,
-                "es95_source": f"computed_from_eval_WT_{es_mode}",
-                "eval_episodes": int(extras_dict.get("episodes", 0)),
-            })
-        else:
-            metrics_dict.update({
-                "EW": None,
-                "mean_WT": None,
-                "ES95": None,
-                "Ruin": None,
-                "es95_source": "no_eval_WT",
-                "eval_episodes": int(extras_dict.get("episodes", 0)),
-            })
+        metrics_dict: Dict[str, Any] = _compute_metrics_from_wt(wt, es_mode=es_mode, alpha=alpha, F_target=F_target)
+        metrics_dict["es95_source"] = f"computed_from_eval_WT_{es_mode}"
+        metrics_dict["eval_episodes"] = int(extras_dict.get("episodes", 0))
 
         # 시장 통계 일부도 metrics에
         try:
@@ -998,7 +1077,7 @@ def run_rl(args):
             alpha=getattr(cfg, "alpha", None),
             F_target=getattr(cfg, "F_target", None),
             es_mode=es_mode,
-            n_paths=int(getattr(args, "rl_n_paths_eval", 64) or 64),
+            n_paths=int(len(wt)),
             args=slim_args(args) | {
                 "rl_q_cap": getattr(args, "rl_q_cap", None),
                 "teacher_eps0": getattr(args, "teacher_eps0", None),
@@ -1021,8 +1100,13 @@ def run_rl(args):
         _inject_market_meta(cfg, args, out)
         try:
             out.setdefault("meta", {})
-            out["meta"]["eval_seed_mode"] = extras_dict.get("eval_seed_mode")
-            out["meta"]["eval_seed_base"] = extras_dict.get("eval_seed_base")
+            out["meta"]["eval_seed_mode"] = eval_seed_mode
+            out["meta"]["eval_seed_base"] = eval_seed_base
+            # 디버그 수치(평균/표준편차)는 메타로만 보존
+            if debug_eval_mean is not None:
+                out["meta"]["eval_return_mean"] = float(debug_eval_mean)
+            if debug_eval_std is not None:
+                out["meta"]["eval_return_std"] = float(debug_eval_std)
             out["meta"].update({
                 "market_len_ret": metrics_dict.get("market_len_ret"),
                 "market_len_rf": metrics_dict.get("market_len_rf"),

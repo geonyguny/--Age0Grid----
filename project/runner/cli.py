@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿# project/runner/cli.py
+from __future__ import annotations
 
 import argparse
 import json
@@ -9,8 +10,6 @@ import sys
 import io
 import contextlib
 from typing import Any, Dict, List
-
-import numpy as np  # ES95 임시 계산에 사용
 
 from ..config import (
     CVAR_TARGET_DEFAULT,
@@ -24,7 +23,7 @@ from .calibrate import calibrate_lambda
 # ETA / CVaR / stdout packing
 from .eta_utils import (
     fmt_hms, parse_hms_to_seconds,
-    eta_db_path, eta_load_db, predict_eta_from_history, eta_record,
+    eta_db_path, eta_load_db, predict_eta_from_history, eta_record,  # noqa: F401
 )
 from .cvar_utils import fixup_metrics_with_cvar
 from .pack_utils import prune_for_stdout, maybe_evaluate_with_es_mode
@@ -122,14 +121,37 @@ def _json_fallback(x: Any) -> Any:
     return str(x)
 
 
+def _parse_block(s: str | int | None) -> int:
+    """
+    '6m', '12', '90d', '2y' 등을 월 단위 정수로 변환.
+    - m: months (기본)
+    - y: years  (×12)
+    - d: days   (~30일=1개월로 근사)
+    """
+    if s is None:
+        return 24  # 기존 기본값 유지
+    if isinstance(s, int):
+        return int(s)
+    txt = str(s).strip().lower()
+    m = re.fullmatch(r'(\d+)\s*([dmy]?)', txt)
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid block spec: {s}")
+    n = int(m.group(1))
+    unit = m.group(2) or 'm'
+    if unit == 'm':
+        return max(1, n)
+    if unit == 'y':
+        return max(1, n * 12)
+    if unit == 'd':
+        # 30일 ≈ 1개월 근사
+        return max(1, round(n / 30))
+    raise argparse.ArgumentTypeError(f"invalid unit in block spec: {s}")
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
 
     # --- High-level execution mode ---
-    # auto: (기본) method에 따라 once/rl 라우팅, calib=off면 평가 실행
-    # once: run_once 강제(rule/hjb)
-    # rl:   run_rl 강제
-    # calib: CVaR 보정 루트(calibrate_lambda) 강제
     p.add_argument("--mode", type=str, default="auto", choices=["auto", "once", "rl", "calib"])
 
     # Core
@@ -152,7 +174,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     p.add_argument("--seed", type=int, default=None, help="단일 시드(지정 시 seeds=[seed]로 사용)")
     p.add_argument("--n_paths", type=int, default=100)
-    p.add_argument("--es_mode", type=str, default="wealth", choices=["wealth", "loss"])
+
+    # ⚠️ ES 정의 안내
+    p.add_argument("--es_mode", type=str, default="wealth", choices=["wealth", "loss"],
+                   help="ES95는 통일(손실 = −W_T). 'loss' 선택 시 EL만 추가 보고.")
+
     p.add_argument("--outputs", type=str, default="./outputs")
 
     # HJB
@@ -174,7 +200,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # Market
     p.add_argument("--market_mode", choices=["iid", "bootstrap"], default="iid")
     p.add_argument("--market_csv", type=str, default=None)
-    p.add_argument("--bootstrap_block", type=int, default=24)
+    # ▼ 변경: 문자열 입력 허용('6m','12','90d','2y' 등)
+    p.add_argument("--bootstrap_block", type=str, default="24",
+                   help="블록 길이. 예: '6m', '12'(개월), '90d'(일→월 근사), '2y'(년→월). 내부적으로 월 단위 정수로 변환.")
     p.add_argument("--use_real_rf", choices=["on", "off"], default="on")
 
     # Mortality
@@ -197,7 +225,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--F_min", type=float, default=None)
     p.add_argument("--F_max", type=float, default=None)
 
-    # autosave
+    # autosave (run_once 내부/평가단에서 처리)
     p.add_argument("--autosave", choices=["on", "off"], default="off")
 
     # RL
@@ -286,7 +314,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # stdout control
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full")
     p.add_argument("--metrics_keys", type=str,
-                   default="EW,ES95,EL,Ruin,mean_WT,es_mode,EU,EU_per_year,delta_annual,F_target_used")
+                   default="EW,ES95,EL,Ruin,mean_WT,es_mode,es95_source,EU,EU_per_year,delta_annual,F_target_used")
     p.add_argument("--no_paths", action="store_true")
     p.add_argument("--validate", choices=["on","off"], default="off")
     p.add_argument("--return_actor", choices=["on", "off"], default="off")
@@ -328,7 +356,7 @@ def _validate_args(args) -> None:
     if args.method == "rule" and not args.baseline:
         raise SystemExit("method=rule 사용 시 --baseline (4pct|cpb|vpw|kgr) 필수.")
 
-    # --- Behavioral (utility-layer) sanity checks (경고 위주) ---
+    # --- Behavioral sanity checks (경고 위주) ---
     def _warn(msg: str):
         print(f"[warn] {msg}", file=sys.stderr, flush=True)
 
@@ -390,7 +418,7 @@ def _inject_meta(out: Dict[str, Any], args) -> None:
     meta.setdefault("asset", getattr(args, "asset", None))
     meta.setdefault("outputs_abs", getattr(args, "outputs", None))
 
-    # 행동/효용 편향 스펙 메타 기록
+    # 행동/효용 편향 스펙 메타 기록 (안전하게)
     try:
         if parse_behavioral_from_args and _bh_describe:
             _spec = parse_behavioral_from_args(args)
@@ -426,20 +454,6 @@ def _inject_meta(out: Dict[str, Any], args) -> None:
                 meta.update({k: vi.get(k) for k in ("git_commit", "py_ver", "np_ver")})
         except Exception:
             pass
-
-
-def _compute_es95_from_losses(losses: List[float] | None, alpha: float = 0.95) -> float | None:
-    """
-    간단 ES(CVaR) 계산기. '손실'이 클수록 나쁨이라는 전제.
-    프로젝트의 표준 정의와 다르면 cvar_utils.fixup 단계에서 덮어씁니다.
-    """
-    if not losses:
-        return None
-    x = np.asarray(losses, dtype=float)
-    x = np.sort(x)  # 오름차순
-    k = max(1, int(np.ceil(len(x) * alpha)))
-    tail = x[-k:]   # 상위 손실 꼬리(큰 값이 손실이라는 가정)
-    return float(np.mean(tail))
 
 
 def _route_mode(args) -> str:
@@ -485,7 +499,7 @@ def _run_core(args) -> Dict[str, Any] | Any:
         out.setdefault("outputs_abs", getattr(args, "outputs", None))
         _inject_meta(out, args)
 
-    # ES95(CVaR) fixup (best-effort)
+    # ES95(CVaR) fixup
     try:
         if isinstance(out, dict):
             out = fixup_metrics_with_cvar(args, out)
@@ -534,6 +548,12 @@ def main():
     if getattr(args, "h_FX", None) is None and getattr(args, "h_fx", None) is not None:
         args.h_FX = args.h_fx
 
+    # ▼ bootstrap_block 파싱 (문자열 → 월 단위 정수)
+    try:
+        args.bootstrap_block = _parse_block(getattr(args, "bootstrap_block", None))
+    except argparse.ArgumentTypeError as e:
+        sys.exit(f"--bootstrap_block 오류: {e}")
+
     _apply_data_profile_defaults(args)
     _validate_args(args)
 
@@ -568,7 +588,7 @@ def main():
         out["time_total_s"] = round(elapsed, 3)
         out["time_total_hms"] = fmt_hms(elapsed)
 
-    # summary 모드: 텍스트 요약만 stdout (JSON 아님).
+    # summary 모드
     if str(getattr(args, "print_mode", "full")).lower() == "summary":
         if isinstance(out, dict):
             metrics = out["metrics"] if "metrics" in out and isinstance(out["metrics"], dict) else out
@@ -583,15 +603,12 @@ def main():
         keys = [s.strip() for s in str(getattr(args, "metrics_keys","")).split(",") if s.strip()]
         if keys:
             m = {k: m.get(k, None) for k in keys}
-        _safe_print_json(m)  # ← 순수 JSON 한 방
+        _safe_print_json(m)
     else:
         to_print = prune_for_stdout(args, out) if isinstance(out, dict) else out
-        _safe_print_json(to_print)  # ← 순수 JSON 한 방
+        _safe_print_json(to_print)
 
     # 참고: captured_stdout.getvalue()에는 내부 모듈이 찍은 stdout이 담김.
-    # 디버깅 목적으로 남기고 싶다면 파일에 남기세요(여긴 콘솔 깨끗하게 유지).
-    # with open(os.path.join(args.outputs, "_logs", "stdout_captured.txt"), "a", encoding="utf-8") as f:
-    #     f.write(captured_stdout.getvalue())
 
 
 if __name__ == "__main__":

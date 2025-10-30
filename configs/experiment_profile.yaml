@@ -1,0 +1,9 @@
+# 재현성 기본값 (필요시 runner에서 읽어 기본값으로 사용)
+eval:
+  seed_list: [0]
+  n_paths_eval: 1000
+  window: "FULL"
+  hedge: 0.0
+freeze:
+  data_profile: "dev"         # 데이터 슬라이스/버전 라벨
+  commit_hash: ""             # 깃 해시 주입 가능

@@ -211,3 +211,7 @@ python -m pytest -q
 * **dev 프로필**: 리포 내에서 즉시 실행 가능한 축약 CSV 파이프라인
 
 > 질문/이슈는 PR 또는 이슈 트래커로 남겨주세요.
+
+# 가상환경 파이썬 명령어
+.\.venv\Scripts\python.exe
+import os; os.system('cls')

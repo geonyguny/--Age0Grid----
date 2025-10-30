@@ -1,4 +1,4 @@
-﻿# project/eval.py
+﻿# project/eval.py 
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -47,6 +47,44 @@ except Exception:
                 eu += (delta_m ** t_idx) * (u_scale * _crra_u(float(c_t), gamma))
         return float(eu)
 
+# ======================================================
+# ✅ ES95 통일: wealth → loss(-W) 변환 기반 (폴백/외부모듈)
+# ======================================================
+try:
+    # 있으면 프로젝트 공통 모듈 사용
+    from .metrics import es95_loss_from_wealth as _es95_loss_from_wealth
+except Exception:
+    # 폴백(이 파일 내부에서 안전하게 사용)
+    def _as_array(x) -> _np.ndarray:
+        a = _np.asarray(list(x), dtype=float)
+        if a.ndim != 1:
+            a = a.reshape(-1)
+        return a[_np.isfinite(a)]
+
+    def _var_at_p(values, p: float = 0.95, tail: str = "left") -> float:
+        v = _as_array(values)
+        if v.size == 0:
+            return float("nan")
+        q = 1.0 - p if tail == "right" else p
+        # numpy >=1.22: interpolation 인자 제거됨 → method="linear"로 대체
+        return float(_np.quantile(v, q, method="linear"))
+
+    def _es_at_p(values, p: float = 0.95, tail: str = "left") -> tuple[float, int]:
+        v = _as_array(values)
+        if v.size == 0:
+            return float("nan"), 0
+        var = _var_at_p(v, p=p, tail=tail)
+        sel = v[v <= var] if tail == "left" else v[v >= var]
+        if sel.size == 0:
+            return float("nan"), 0
+        return float(sel.mean()), int(sel.size)
+
+    def _es95_loss_from_wealth(wealth) -> tuple[float, int]:
+        w = _as_array(wealth)
+        loss = -w
+        return _es_at_p(loss, p=0.95, tail="left")
+
+    _es95_loss_from_wealth = _es95_loss_from_wealth  # alias
 
 # =========================
 # Constants (CSV header)
@@ -74,7 +112,6 @@ _METRICS_HEADER: list[str] = [
     # (NEW) utility/reporting config & loss baseline audit
     "crra_gamma", "u_scale", "report_utility", "F_target_used",
 ]
-
 
 # =========================
 # Helpers
@@ -137,7 +174,6 @@ def _stderr(msg: str) -> None:
     except Exception:
         pass
 
-
 # =========================
 # Core episode
 # =========================
@@ -197,35 +233,18 @@ def run_episode(
     }
     return _np.asarray(W_hist, dtype=float), _np.asarray(C_hist, dtype=float), bool(early_hit), ep_stats
 
-
 # =========================
-# Metrics
+# (Deprecated) Per-mode metric helpers
+#  - 내부 사용은 통일 ES95로 대체
 # =========================
 
-def metrics_wealth(WT_samples: _np.ndarray, alpha: float = 0.95) -> Dict[str, float]:
-    """ES95 = 하위 (1-α) 분위수 이하의 평균(자산 관점)."""
+def _compute_EL_with_baseline(WT_samples: _np.ndarray, F: float = 1.0) -> float:
+    """EL = E[max(F − W_T, 0)]"""
     WT = _np.asarray(WT_samples, dtype=float)
     if WT.size == 0:
-        return dict(EW=0.0, ES95=0.0)
-    EW = float(WT.mean())
-    q = _np.quantile(WT, 1.0 - alpha)  # 5th pct of wealth
-    tail = WT[WT <= q]
-    ES_tail_mean = float(tail.mean()) if tail.size > 0 else float(q)
-    return dict(EW=EW, ES95=ES_tail_mean)
-
-
-def metrics_loss(WT_samples: _np.ndarray, F: float = 1.0, alpha: float = 0.95) -> Dict[str, float]:
-    """Loss = max(F − W_T, 0). ES95는 손실분포의 α-조건부기대치(CVaR_α)."""
-    WT = _np.asarray(WT_samples, dtype=float)
-    if WT.size == 0:
-        return dict(EW=0.0, EL=0.0, ES95=0.0)
+        return 0.0
     L = _np.maximum(F - WT, 0.0)
-    EL = float(L.mean())
-    qL = _np.quantile(L, alpha)      # VaR_α
-    tail = L[L >= qL]
-    ES = float(tail.mean()) if tail.size > 0 else float(qL)
-    return dict(EW=float(WT.mean()), EL=EL, ES95=ES)
-
+    return float(L.mean())
 
 # =========================
 # Soft assertions (consumption / wealth)
@@ -263,9 +282,8 @@ def _soft_assert_streams(WT_arr: _np.ndarray, C_all: List[_np.ndarray], quiet: b
         _stderr("[warn] soft-assert: " + "; ".join(warns))
     return warns
 
-
 # =========================
-# Evaluation (wealth/loss + consumption bands + EU)
+# Evaluation (unified ES95 on loss from wealth)
 # =========================
 
 def evaluate(
@@ -281,16 +299,17 @@ def evaluate(
     cfg : Any
     actor : policy callable
     es_mode : "wealth" | "loss"
+        ※ 이제 ES95는 모드와 무관하게 통일( loss = -W_T 기준 ). loss 모드에서는 EL만 추가 보고.
     return_paths : bool
         True면 (metrics, {"eval_WT": [...]}) 튜플 반환. False면 metrics만 반환.
 
     Returns
     -------
     metrics : dict
-        EW, ES95, EL(손실모드), Ruin, mean_WT, 소비 밴드 등 요약 메트릭
+        EW, ES95(통일), EL(손실모드일 때), Ruin, mean_WT, 소비 밴드 등 요약 메트릭
         + es_mode, es95_source(진단) + (옵션) EU, EU_per_year, delta_annual
     extras? : dict (optional)
-        eval_WT : list[float]  # 경로별 최종자산 (CLI의 CVaR 재계산에 사용)
+        eval_WT : list[float]  # 경로별 최종자산 (CLI의 재계산/감사에 사용)
         ruin_flags : list[bool]
         T : int
     """
@@ -398,8 +417,20 @@ def evaluate(
         early_fin = early_arr[finite_mask] if early_arr.size == finite_mask.size else early_arr
         ruin_rate = float(_np.mean(_np.logical_or(early_fin, WT_fin <= 0.0))) if WT_fin.size > 0 else 0.0
 
+        # ✅ ES95: 통일된 방식( loss = -W )으로 계산
+        es95_unified, es_n = _es95_loss_from_wealth(WT_fin)
+        EW = float(WT_fin.mean()) if WT_fin.size > 0 else 0.0
+
+        m = {
+            "EW": EW,
+            "ES95": float(es95_unified),
+            "mean_WT": EW,
+            "es95_source": "unified_loss_from_wealth",
+            "F_target_used": None,
+        }
+
+        # 🔹 loss 모드일 때: EL(평균손실)만 추가로 보고 (ES95는 통일값 유지)
         if str(es_mode).lower() == "loss":
-            # loss 기준선 선택(명시 없으면 1.0로 fallback) + 감사 로깅
             F_raw = getattr(cfg, "F_target", None)
             if F_raw is None:
                 F = 1.0
@@ -408,17 +439,10 @@ def evaluate(
                 F = float(F_raw)
                 if F == 0.0:
                     es_note_msgs.append("F_target_explicit_zero")
-            alpha = float(getattr(cfg, "alpha", 0.95))
-            m = metrics_loss(WT_fin, F=F, alpha=alpha)
-            m["mean_WT"] = float(WT_fin.mean()) if WT_fin.size > 0 else 0.0
-            m["es95_source"] = "computed_in_evaluate_loss"
+            m["EL"] = _compute_EL_with_baseline(WT_fin, F=F)
             m["F_target_used"] = float(F)
         else:
-            alpha = float(getattr(cfg, "alpha", 0.95))
-            m = metrics_wealth(WT_fin, alpha=alpha)
-            m["mean_WT"] = m["EW"]
-            m["es95_source"] = "computed_in_evaluate_wealth"
-            m["F_target_used"] = None
+            m["EL"] = 0.0  # 호환용 필드(손실모드가 아닐 때 0)
 
     m["Ruin"] = ruin_rate
     m["es_mode"] = str(es_mode).lower()
@@ -524,7 +548,6 @@ def evaluate(
         }
         return m, extras
     return m
-
 
 # =========================
 # Autosave (+ header auto-migration)
@@ -685,7 +708,6 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
 
     return csv_path
 
-
 # =========================
 # (Optional) Frontier plot
 # =========================
@@ -714,7 +736,7 @@ def plot_frontier_from_csv(csv_path: str, out_path: Optional[str] = None) -> Opt
         plt.figure()
         plt.scatter(xs, ys, s=16)
         plt.xlabel("EW (Expected Terminal Wealth)")
-        plt.ylabel("ES95")
+        plt.ylabel("ES95 (unified: loss from wealth)")
         plt.title("EW–ES95 frontier (from metrics.csv)")
 
         if out_path is None:
