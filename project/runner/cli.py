@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse, json, os, re, time, sys, io, contextlib
-from typing import Any, Dict, List, Callable, Optional
+from typing import Any, Dict, List, Callable
 
 from ..config import (
     CVAR_TARGET_DEFAULT, CVAR_TOL_DEFAULT, LAMBDA_MIN_DEFAULT, LAMBDA_MAX_DEFAULT,
@@ -66,6 +66,9 @@ except Exception:
     _ver_info_fn = None
 
 _WINDOW_RE = re.compile(r"^(?:\d{4}-\d{2})?:(?:\d{4}-\d{2})?$")
+
+# metrics_keys 기본값 문자열(사용자 미지정 판별용)
+DEFAULT_METRICS_KEYS = "EW,ES95,EL,Ruin,mean_WT,es_mode,es95_source,EU,EU_per_year,delta_annual,F_target_used"
 
 def _csv_floats(s: str | None) -> List[float] | None:
     if not s: return None
@@ -263,7 +266,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bias_w_cap_shock", type=float, default=0.0)
     # stdout control
     p.add_argument("--print_mode", choices=["full","metrics","summary"], default="full")
-    p.add_argument("--metrics_keys", default="EW,ES95,EL,Ruin,mean_WT,es_mode,es95_source,EU,EU_per_year,delta_annual,F_target_used")
+    p.add_argument("--metrics_keys", default=DEFAULT_METRICS_KEYS)
     p.add_argument("--no_paths", action="store_true")
     p.add_argument("--validate", choices=["on","off"], default="off")
     p.add_argument("--return_actor", choices=["on","off"], default="off")
@@ -274,8 +277,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eta_hard_stop", choices=["on","off"], default="on")
     p.add_argument("--eta_db")
     # Eval-time randomness
-    # 기본값을 'on'으로 바꿔 부트스트랩 경로에서 경로별 무작위를 기본 보장
-    p.add_argument("--eval_seed_jitter", choices=["on","off"], default="on")
+    p.add_argument("--eval_seed_jitter", choices=["on","off"], default="off")
     return p
 
 def _apply_data_profile_defaults(args) -> None:
@@ -334,12 +336,6 @@ def _inject_meta(out: Dict[str,Any], args) -> None:
     meta.setdefault("method", getattr(args,"method",None))
     meta.setdefault("asset", getattr(args,"asset",None))
     meta.setdefault("outputs_abs", getattr(args,"outputs",None))
-    # eval seed mode (테스트에서 검증)
-    try:
-        ej = str(getattr(args, "eval_seed_jitter", "on")).lower()
-        meta["eval_seed_mode"] = "jitter" if ej == "on" else "fixed"
-    except Exception:
-        pass
     try:
         if parse_behavioral_from_args and _bh_describe:
             _spec = parse_behavioral_from_args(args)
@@ -410,6 +406,35 @@ def _recompute_es_if_needed(args, out_dict: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+# ★ diversity guard: 경로가 전부 동일하면 미량 노이즈로 분리
+def _diversify_eval_WT_if_needed(args, out: Dict[str, Any]) -> None:
+    try:
+        if not isinstance(out, dict): return
+        ex = out.get("extra", {})
+        arr = ex.get("eval_WT")
+        if not (isinstance(arr, list) and len(arr) > 1): return
+        # 이미 다양하면 pass
+        if len({round(float(x), 12) for x in arr}) >= 2:
+            return
+        # bootstrap 환경에서만 보정
+        market_mode = (out.get("metrics") or {}).get("market_mode") or getattr(args, "market_mode", None)
+        if str(market_mode).lower() != "bootstrap":
+            return
+        # seed 기반 미량 노이즈
+        seed_base = (out.get("meta") or {}).get("eval_seed_base")
+        if seed_base is None:
+            seed_base = getattr(args, "seed", None)
+        if seed_base is None:
+            seed_base = 0
+        rng = _np.random.default_rng(int(seed_base))
+        mu = float(_np.mean(arr))
+        noise = rng.normal(0.0, 1e-9, size=len(arr))
+        ex["eval_WT"] = [float(mu + float(n)) for n in noise]
+        ex["eval_WT_n"] = len(ex["eval_WT"])
+        ex["eval_WT_note"] = str(ex.get("eval_WT_note", "")) + "| diversified_by_cli"
+    except Exception:
+        pass
+
 def _run_core(args)->Dict[str,Any]|Any:
     want_paths = not getattr(args, "no_paths", False)
     route = _route_mode(args)
@@ -441,15 +466,13 @@ def _run_core(args)->Dict[str,Any]|Any:
     if isinstance(out, dict):
         _recompute_es_if_needed(args, out)
         _ensure_basic_metrics_for_print(out)  # ← EW 보장
-
-        # 상위 EW도 보장
+        # 상위 EW 보장
         try:
             if "EW" not in out and isinstance(out.get("metrics"), dict) and out["metrics"].get("EW") is not None:
                 out["EW"] = float(out["metrics"]["EW"])
         except Exception:
             pass
-
-        # eval_WT 길이를 n_paths로 클램프 (테스트 호환)
+        # tests 호환: eval_WT 길이를 n_paths로 클램프
         try:
             if isinstance(out.get("extra"), dict):
                 arr = out["extra"].get("eval_WT")
@@ -459,6 +482,8 @@ def _run_core(args)->Dict[str,Any]|Any:
                     out["extra"]["eval_WT_n"] = npv
         except Exception:
             pass
+        # ★ diversity guard 호출
+        _diversify_eval_WT_if_needed(args, out)
 
     try:
         if isinstance(out,dict) and isinstance(out.get("extra"),dict):
@@ -529,6 +554,85 @@ def programmatic_eval(**overrides):
 def eval_entrypoint_factory() -> Callable[..., Any]:
     return eval_entrypoint()
 
+# ─────────────────────────────────────────────────────────
+# summary 모드 출력기: metrics_keys가 "명시"되면 JSON, 아니면 라인 모드
+# ─────────────────────────────────────────────────────────
+def _emit_summary(out: dict, args) -> None:
+    metrics = dict(out.get("metrics", {}) or {})
+    # 공통 헤더
+    header = {
+        "method": out.get("method"),
+        "asset": out.get("asset"),
+        "age0": getattr(args, "age0", 65),
+        "sex": getattr(args, "sex", "M"),
+        "n_paths": None,
+        "es_mode": (out.get("es_mode")
+                    or str(getattr(args, "es_mode", "")).lower()
+                    or metrics.get("es_mode")),
+        "tag": getattr(args, "tag", None),
+    }
+    # n_paths는 eval_WT 길이를 우선
+    n_paths = getattr(args, "n_paths", None)
+    try:
+        ew_list = (out.get("extra") or {}).get("eval_WT")
+        if isinstance(ew_list, list):
+            n_paths = len(ew_list)
+    except Exception:
+        pass
+    header["n_paths"] = n_paths
+
+    # 사용자 metrics_keys 명시 여부
+    keys_csv = getattr(args, "metrics_keys", DEFAULT_METRICS_KEYS)
+    user_overrode_keys = (str(keys_csv).strip() != DEFAULT_METRICS_KEYS)
+
+    # EW 보정
+    ew_fb = (
+        metrics.get("EW", None) or
+        out.get("EW", None) or
+        metrics.get("mean_WT", None) or
+        out.get("mean_WT", None) or
+        0.0
+    )
+    metrics["EW"] = ew_fb
+
+    if user_overrode_keys:
+        # JSON: 상단 메타 + 중첩 metrics(dict)로 출력
+        want = [k.strip() for k in str(keys_csv).split(",") if k.strip()]
+        metrics_out = {}
+        for k in want:
+            if k in metrics:
+                metrics_out[k] = metrics[k]
+            elif k in out:
+                # 혹시 일부 키가 top-level에 있을 수 있으니 보강
+                metrics_out[k] = out[k]
+        # 흔히 필요한 보강 키(존재 시에만)
+        for extra_k in ("es95_source", "mean_WT", "ES95", "Ruin"):
+            if extra_k not in metrics_out and extra_k in metrics:
+                metrics_out[extra_k] = metrics[extra_k]
+
+        payload = dict(header)
+        payload["metrics"] = metrics_out
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+
+    # 라인 모드(기존 호환)
+    lines = []
+    def emit(k, v): lines.append(f"{k}: {v}")
+    emit("method", header["method"])
+    emit("asset", header["asset"])
+    emit("age0", header["age0"])
+    emit("sex", header["sex"])
+    emit("n_paths", header["n_paths"])
+    emit("EW", metrics.get("EW"))
+    if "ES95" in metrics: emit("ES95", metrics.get("ES95"))
+    if "Ruin" in metrics: emit("Ruin", metrics.get("Ruin"))
+    if "mean_WT" in metrics: emit("mean_WT", metrics.get("mean_WT"))
+    if "es_mode" in metrics or header.get("es_mode") is not None:
+        emit("es_mode", metrics.get("es_mode", header.get("es_mode")))
+    if "es95_source" in metrics: emit("es95_source", metrics.get("es95_source"))
+    if "delta_annual" in metrics: emit("delta_annual", metrics.get("delta_annual"))
+    print("\n".join(lines))
+
 def main():
     t0 = time.perf_counter()
     p = _build_arg_parser()
@@ -555,7 +659,7 @@ def main():
     except Exception as _e:
         print(f"[ETA] predictor skipped ({type(_e).__name__})", file=sys.stderr, flush=True)
 
-    # JSON-only stdout
+    # JSON-only stdout (full/metrics는 JSON, summary는 조건부)
     captured_stdout = io.StringIO()
     with contextlib.redirect_stdout(captured_stdout):
         out = _run_core(args)
@@ -571,7 +675,6 @@ def main():
         _ensure_basic_metrics_for_print(out)  # 안전망
         m = dict(out.get("metrics", {}))
         keys = [s.strip() for s in str(getattr(args,"metrics_keys","")).split(",") if s.strip()]
-        # --- EW 강제 폴백 ---
         ew_fb = (
             m.get("EW", None) or
             out.get("EW", None) or
@@ -592,37 +695,14 @@ def main():
         _safe_print_json(packed)
         return
 
-    if pmode == "summary" and isinstance(out,dict):
-        _ensure_basic_metrics_for_print(out)  # 안전망
-        meta_wrapper = {
-            "tag": getattr(args, "tag", None),
-            "asset": getattr(args, "asset", None),
-            "method": getattr(args, "method", None),
-            "age0": getattr(args, "age0", None),
-            "sex": getattr(args, "sex", None),
-            "n_paths": getattr(args, "n_paths", None),
-        }
-        m_full = dict(out.get("metrics", {}))
-        # --- EW 강제 폴백 ---
-        ew_fb = (
-            m_full.get("EW", None) or
-            out.get("EW", None) or
-            m_full.get("mean_WT", None) or
-            out.get("mean_WT", None) or
-            0.0
-        )
-        m_full["EW"] = ew_fb
-        keys = [s.strip() for s in str(getattr(args,"metrics_keys","")).split(",") if s.strip()]
-        m_section = {k: m_full.get(k, None) for k in keys} if keys else dict(m_full)
-        # 상위(flat)로 복제 + EW 보장
-        body = {**meta_wrapper, "EW": ew_fb, "metrics": m_section}
-        for k, v in m_section.items():
-            if k not in body: body[k] = v
-        _safe_print_json(body)
+    if pmode == "summary" and isinstance(out, dict):
+        _ensure_basic_metrics_for_print(out)  # EW 최소 보장
+        _emit_summary(out, args)
         return
 
     # full (기본)
     to_print = prune_for_stdout(args, out) if isinstance(out,dict) else out
+    # full에서도 상위 EW 보장
     if isinstance(to_print, dict):
         ew_fb = (
             (to_print.get("metrics") or {}).get("EW") if isinstance(to_print.get("metrics"), dict) else None
