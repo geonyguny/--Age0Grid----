@@ -223,7 +223,7 @@ def do_autosave(metrics: dict, cfg, args, out_payload: dict) -> None:
     """
     try:
         try:
-            from ..eval import save_metrics_autocsv  # optional
+            from ..evaluation import save_metrics_autocsv  # optional
             csv_path = save_metrics_autocsv(metrics, cfg, outputs=cfg.outputs)
             print(f"[autosave] metrics -> {csv_path}")
         except Exception:

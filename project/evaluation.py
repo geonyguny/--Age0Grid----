@@ -16,14 +16,19 @@ import pandas as pd
 from .env.retirement_env import RetirementEnv
 
 # ✅ EU 계산 유틸 (행동편향 반영)
+# NOTE: 이 파일은 project/evaluation.py (루트)이므로 '..evaluation' 같은 상위 상대임포트는 사용할 수 없음.
 try:
+    # 권장: project/eval/utility.py 로 모듈 분리 후 여기서 불러옴
     from .eval.utility import (
-        crra_u as _crra_u,                         # backward-compat shim
+        crra_u as _crra_u,                # backward-compat shim
         monthly_discount_from_annual,
         path_expected_utility,
     )
 except Exception:
     # 안전 폴백(유틸 모듈이 없을 경우): 기존 구현과 동등
+    import numpy as _np
+    from typing import Optional
+
     def _crra_u(c: float, gamma: float) -> float:
         c = max(float(c), 1e-12)
         if abs(float(gamma) - 1.0) < 1e-12:
@@ -206,7 +211,18 @@ def run_episode(
         raw_state = env._obs() if hasattr(env, "_obs") else {"t": 0.0, "W": getattr(env, "W", 0.0)}
         state = _as_nd_state(raw_state, env)   # 상태 어댑터
         q, w = actor(state)
-        _, _, done, _, info = env.step(q=q, w=w)
+        ret = env.step(q=q, w=w)
+        # 4-튜플 (obs, reward, done, info) 혹은
+        # 5-튜플 (obs, reward, done, truncated, info) 둘 다 지원
+        if isinstance(ret, tuple):
+            if len(ret) == 5:
+                _, _, done, _, info = ret
+            elif len(ret) == 4:
+                _, _, done, info = ret
+            else:
+                raise ValueError(f"env.step returned unexpected tuple length: {len(ret)}")
+        else:
+            raise TypeError("env.step must return a tuple")
 
         W_hist.append(float(env.W))
         C_hist.append(float((info or {}).get("consumption", 0.0)))

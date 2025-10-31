@@ -11,7 +11,7 @@ import csv as _csv
 
 import numpy as _np
 
-from project.eval import evaluate, save_metrics_autocsv  # ← 절대경로
+from project.evaluation import evaluate, save_metrics_autocsv  # ← 절대경로
 from project.config import SimConfig
 from project.runner.config_build import make_cfg
 from project.runner.actors import build_actor

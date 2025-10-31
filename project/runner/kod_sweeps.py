@@ -7,7 +7,7 @@ from typing import Dict, Any, Iterable, List, Tuple, Optional
 
 from .cli import _build_arg_parser  # 기본값 네임스페이스 생성용
 from .run import run_once, run_rl
-from ..eval import evaluate
+from ..evaluation import evaluate
 
 # -------------------------------
 # 유틸
