@@ -1,7 +1,3 @@
-아래 내용으로 `README.md`를 **완전히 교체**하면 됩니다. (짧은 Quickstart 포함, dev 프로필/프리플라이트/스모크 검증/옵션 요약/트러블슈팅 정리)
-
----
-
 # KR Decumulation Simulation (v2)
 
 * HJB(2D: **q, w**) 및 RL 기반 인출 시뮬레이션.
