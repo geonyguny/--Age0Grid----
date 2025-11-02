@@ -1,26 +1,19 @@
 # scripts/make_heatmaps.py
-<<<<<<< HEAD
 from __future__ import annotations
 
 import argparse
 import pathlib as p
 import re
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-# 백엔드 설정은 반드시 import pyplot 전에
-=======
-import argparse, pathlib as p
-import numpy as np
-import pandas as pd
->>>>>>> f7103a2 (report)
+# pyplot import 전에 백엔드 지정
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-<<<<<<< HEAD
 
 # ─────────────────────────────────────────────────────────
 # Helpers
@@ -33,14 +26,7 @@ TAG_PATTERNS = [
 
 def parse_mix(s: str) -> Tuple[float, float, float]:
     """
-    alpha_mix 가 'kr,us,gold' 순서일 때 (us, kr, gold) 를 반환.
-    기존 코드 호환 목적.
-=======
-def parse_mix(s: str):
-    """
-    alpha_mix가 'kr,us,gold' 순서라면 us,kr,gold를 반환해
-    (질문 맥락의 기존 코드 호환: (us, kr, gold) 리턴)
->>>>>>> f7103a2 (report)
+    alpha_mix 가 'kr,us,gold' 순서일 때 (us, kr, gold) 를 반환 (기존 코드 호환).
     """
     try:
         a, b, c = [float(x) for x in str(s).split(",")]
@@ -48,17 +34,12 @@ def parse_mix(s: str):
     except Exception:
         return np.nan, np.nan, np.nan
 
-<<<<<<< HEAD
 
 def coerce_numeric(df: pd.DataFrame, cols: Iterable[str]) -> None:
-=======
-def coerce_numeric(df: pd.DataFrame, cols):
->>>>>>> f7103a2 (report)
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-<<<<<<< HEAD
 
 def _fmt_tick(v) -> str:
     return f"{v:g}" if isinstance(v, (int, float, np.floating)) else str(v)
@@ -119,12 +100,6 @@ def _pivot(df: pd.DataFrame, x: str, y: str, val: str, agg: str) -> pd.DataFrame
     aggfunc = {"mean": "mean", "median": "median"}[agg]
     piv = df.pivot_table(index=y, columns=x, values=val, aggfunc=aggfunc)
     # 숫자 인덱스/컬럼은 숫자 정렬 적용
-=======
-def plot_heat(df, x, y, val, title, outpng):
-    # 피벗(평균) → 값이 있는 축만 사용, 축 눈금은 숫자 정렬
-    piv = df.pivot_table(index=y, columns=x, values=val, aggfunc="mean")
-    # 정렬: x/y가 숫자라면 숫자 정렬
->>>>>>> f7103a2 (report)
     try:
         piv = piv.sort_index(axis=0)
     except Exception:
@@ -133,8 +108,37 @@ def plot_heat(df, x, y, val, title, outpng):
         piv = piv.sort_index(axis=1)
     except Exception:
         pass
-<<<<<<< HEAD
     return piv
+
+
+def _parse_vmin_max(s: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    """
+    'ES95:0.25,1.0;EW:0.25,1.25;CompositeScore:-0.6,1.9'
+      → {'ES95': (0.25,1.0), 'EW': (0.25,1.25), 'CompositeScore': (-0.6,1.9)}
+    빈칸/부적절 값은 None으로 처리.
+    """
+    out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    if not s:
+        return out
+    for part in str(s).split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            continue
+        k, rng = part.split(":", 1)
+        k = k.strip()
+        vmin, vmax = None, None
+        try:
+            xs = [t.strip() for t in rng.split(",")]
+            if len(xs) >= 1 and xs[0] != "":
+                vmin = float(xs[0])
+            if len(xs) >= 2 and xs[1] != "":
+                vmax = float(xs[1])
+        except Exception:
+            pass
+        out[k] = (vmin, vmax)
+    return out
 
 
 def plot_heat(
@@ -148,17 +152,19 @@ def plot_heat(
     figsize: Tuple[float, float],
     dpi: int,
     cmap_name: str,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ) -> None:
-    # NaN 마스킹 후 회색으로 표시
+    # NaN 마스킹 후 회색 처리
     data = np.array(piv.values, dtype=float)
     mask = np.isnan(data)
     mdata = np.ma.masked_array(data, mask=mask)
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    cmap = getattr(plt.cm, cmap_name, plt.cm.viridis)
-    cmap = cmap.copy()
+    cmap = getattr(plt.cm, cmap_name, plt.cm.viridis).copy()
     cmap.set_bad("lightgray")
-    im = ax.imshow(mdata, aspect="auto", origin="lower", cmap=cmap)
+
+    im = ax.imshow(mdata, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
 
     xt = list(range(len(piv.columns)))
     yt = list(range(len(piv.index)))
@@ -177,14 +183,6 @@ def plot_heat(
                 if not mask[i, j]:
                     ax.text(j, i, f"{mdata[i, j]:.2f}", ha="center", va="center", fontsize=8)
 
-=======
-
-    fig, ax = plt.subplots(figsize=(6.0, 4.6), dpi=180)
-    im = ax.imshow(piv.values, aspect="auto", origin="lower")
-    ax.set_xticks(range(len(piv.columns))); ax.set_xticklabels([f"{v:g}" if isinstance(v, (int,float,np.floating)) else str(v) for v in piv.columns])
-    ax.set_yticks(range(len(piv.index)));   ax.set_yticklabels([f"{v:g}" if isinstance(v, (int,float,np.floating)) else str(v) for v in piv.index])
-    ax.set_xlabel(x); ax.set_ylabel(y); ax.set_title(title)
->>>>>>> f7103a2 (report)
     cbar = plt.colorbar(im, ax=ax)
     cbar.ax.set_ylabel(val, rotation=90, va="center")
 
@@ -193,7 +191,6 @@ def plot_heat(
     plt.close(fig)
     print(f"[OK] {outpng}")
 
-<<<<<<< HEAD
 
 # ─────────────────────────────────────────────────────────
 # Pipeline
@@ -212,6 +209,7 @@ def build_heatmaps(
     dpi: int,
     figsize: Tuple[float, float],
     cmap: str,
+    vmin_max: Optional[str],
 ) -> None:
     df = pd.read_csv(src)
 
@@ -250,6 +248,9 @@ def build_heatmaps(
         if c not in df.columns:
             raise SystemExit(f"[ERR] 데이터에 '{c}' 컬럼이 없음. --x/--y와 원본 컬럼명을 확인하세요.")
 
+    # vmin/vmax 파싱
+    vmm = _parse_vmin_max(vmin_max)
+
     # 진단
     print(
         f"[INFO] rows={len(df)} | x={x} y={y} | zlist={list(zlist)} | "
@@ -270,7 +271,7 @@ def build_heatmaps(
 
         piv = _pivot(sub, x, y, z, agg)
 
-        # 원하면 피벗 CSV도 남김
+        # 피벗 CSV 저장 옵션
         if save_pivots:
             csv_path = outdir_path / f"heatmap_{tag_startswith}_{x}_vs_{y}_{z}_pivot.csv"
             csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,6 +279,7 @@ def build_heatmaps(
             print(f"[OK] {csv_path}")
 
         outpng = outdir_path / f"heatmap_{tag_startswith}_{x}_vs_{y}_{z}.png"
+        vmin, vmax = vmm.get(z, (None, None))
         plot_heat(
             piv,
             x,
@@ -289,6 +291,8 @@ def build_heatmaps(
             figsize=figsize,
             dpi=dpi,
             cmap_name=cmap,
+            vmin=vmin,
+            vmax=vmax,
         )
 
 
@@ -303,14 +307,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--y", default="hedge_sigma_k", help="y축 컬럼명")
     ap.add_argument(
         "--zlist",
-        default="EW,ES95",
+        default="EW,ES95,CompositeScore",
         help="콤마 구분 메트릭 목록 (예: EW,ES95,CompositeScore)",
     )
     ap.add_argument("--outdir", default=r".\outputs\figs")
     ap.add_argument(
-        "--infer_from_tag",
-        choices=["on", "off"],
-        default="on",
+        "--infer_from_tag", choices=["on", "off"], default="on",
         help="alpha_mix/hedge 컬럼 없을 때 태그에서 (us,h) 추론",
     )
     ap.add_argument("--annotate", choices=["on", "off"], default="off", help="각 셀에 값 표기")
@@ -320,6 +322,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fig_w", type=float, default=6.6)
     ap.add_argument("--fig_h", type=float, default=4.8)
     ap.add_argument("--cmap", default="viridis", help="matplotlib 컬러맵 이름")
+    ap.add_argument(
+        "--vmin_max",
+        default="",
+        help="지표별 색상 스케일: 'ES95:0.25,1.0;EW:0.25,1.25;CompositeScore:-0.6,1.9' 형식",
+    )
     args = ap.parse_args()
 
     # normalize flags
@@ -348,60 +355,9 @@ def main() -> None:
         dpi=args.dpi,
         figsize=(args.fig_w, args.fig_h),
         cmap=args.cmap,
+        vmin_max=args.vmin_max,
     )
 
 
 if __name__ == "__main__":
     main()
-=======
-ap = argparse.ArgumentParser()
-ap.add_argument("--src", default=r".\outputs\_summary_scored.csv")
-ap.add_argument("--tag_startswith", default="2D_", help="이 접두사로 시작하는 tag만 사용")
-ap.add_argument("--x", default="mix_us", help="x축 컬럼명 (예: mix_us, hedge_sigma_k 등)")
-ap.add_argument("--y", default="hedge_sigma_k", help="y축 컬럼명")
-ap.add_argument("--zlist", default="EW,ES95", help="콤마 구분 메트릭 목록 (예: EW,ES95,CompositeScore)")
-ap.add_argument("--outdir", default=r".\outputs\figs")
-args = ap.parse_args()
-
-df = pd.read_csv(args.src)
-
-# 태그 필터
-df = df[df["tag"].astype(str).str.startswith(args.tag_startswith)]
-
-# 파생/보정 컬럼
-if "alpha_mix" in df.columns:
-    us, kr, au = zip(*df["alpha_mix"].map(parse_mix))
-    df["mix_us"]   = np.round(us, 2)
-    df["mix_kr"]   = np.round(kr, 2)
-    df["mix_gold"] = np.round(au, 2)
-
-# hedge_sigma_k 대체: hedge_ratio가 있으면 그것으로 채움
-if "hedge_sigma_k" not in df.columns and "hedge_ratio" in df.columns:
-    df["hedge_sigma_k"] = pd.to_numeric(df["hedge_ratio"], errors="coerce")
-
-# 숫자화 가능 항목 숫자화
-coerce_numeric(df, [args.x, args.y, "EW", "ES95", "CompositeScore", "Ruin", "hedge_ratio", "hedge_sigma_k"])
-
-# 유효성 체크
-need = [args.x, args.y]
-for c in need:
-    if c not in df.columns:
-        raise SystemExit(f"[ERR] 데이터에 '{c}' 컬럼이 없음. --x/--y 설정과 원본 컬럼명을 확인하세요.")
-
-zcols = [z.strip() for z in args.zlist.split(",") if z.strip()]
-if not zcols:
-    raise SystemExit("[ERR] zlist가 비어 있음")
-
-outdir = p.Path(args.outdir)
-
-for z in zcols:
-    if z not in df.columns:
-        print(f"[SKIP] '{z}' 컬럼 없음")
-        continue
-    sub = df[[args.x, args.y, z]].dropna()
-    if sub.empty:
-        print(f"[SKIP] '{z}' 데이터 없음")
-        continue
-    outpng = outdir / f"heatmap_{args.tag_startswith}_{args.x}_vs_{args.y}_{z}.png"
-    plot_heat(sub, args.x, args.y, z, f"Heatmap: {z} ({args.x} × {args.y})", outpng)
->>>>>>> f7103a2 (report)

@@ -1,4 +1,5 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
 [CmdletBinding()]
 Param(
   [Parameter()][string]$Py      = ".\.venv\Scripts\python.exe",
@@ -12,12 +13,23 @@ Param(
   [string]$Metrics = ".\outputs\_logs\metrics.csv",
   [string]$Winners = ".\outputs\_winners.csv"
 >>>>>>> f7103a2 (report)
+=======
+[CmdletBinding()]
+Param(
+  [Parameter()][string]$Py      = ".\.venv\Scripts\python.exe",
+  [Parameter()][string]$Cli     = "project.runner.cli",
+  [Parameter()][string]$Metrics = ".\outputs\_logs\metrics.csv",
+  [Parameter()][string]$Winners = ".\outputs\_winners.csv"
+>>>>>>> 1c82e5f (batch)
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 1c82e5f (batch)
 # ── Helpers (Approved verbs 사용)
 function Test-Property {
   [CmdletBinding()]
@@ -26,6 +38,7 @@ function Test-Property {
     [Parameter(Mandatory)][string]$Name
   )
   return $InputObject.PSObject.Properties.Match($Name).Count -gt 0
+<<<<<<< HEAD
 }
 
 function Get-PropertyValue {
@@ -89,29 +102,68 @@ function Get-PropVal($row, $name) {
 }
 function Add-Arg([ref]$A, [string]$name, [string]$val) {
   if (-not [string]::IsNullOrWhiteSpace($val)) { $A.Value += @($name, $val) }
+=======
+>>>>>>> 1c82e5f (batch)
 }
 
-# 0) metrics.csv에서 tag->method 맵 구축
-$methodMap = @{}
-if (Test-Path $Metrics) {
-  try {
-    $M = Import-Csv $Metrics | Where-Object { $_.tag -and $_.method }
-    foreach ($m in $M) {
-      $t = [string]$m.tag
-      $md = [string]$m.method
-      if ($t -and $md -and -not $methodMap.ContainsKey($t)) { $methodMap[$t] = $md }
-    }
-  } catch { }
+function Get-PropertyValue {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][object]$InputObject,
+    [Parameter(Mandatory)][string]$Name
+  )
+  if (Test-Property -InputObject $InputObject -Name $Name) { return [string]$InputObject.$Name }
+  return $null
 }
 
-function Infer-Method-FromMetrics([string]$baseTag) {
-  if ([string]::IsNullOrWhiteSpace($baseTag)) { return $null }
-  if ($methodMap.ContainsKey($baseTag)) { return $methodMap[$baseTag] }
-  if (Test-Path $Metrics) {
+function Add-Argument {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][ref]$TargetArray,
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter()][string]$Value
+  )
+  if (-not [string]::IsNullOrWhiteSpace($Value)) {
+    $TargetArray.Value += @($Name, $Value)
+  }
+}
+
+function Get-MethodMap {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$MetricsPath)
+  $map = @{}
+  if (Test-Path $MetricsPath) {
     try {
+<<<<<<< HEAD
       $M = Import-Csv $Metrics | Where-Object { $_.tag -and $_.method }
       $cand = $M | Where-Object { $_.tag -like "*$baseTag*" } | Select-Object -First 1
 >>>>>>> f7103a2 (report)
+=======
+      $rows = Import-Csv $MetricsPath | Where-Object { $_.tag -and $_.method }
+      foreach ($r in $rows) {
+        $t = [string]$r.tag; $m = [string]$r.method
+        if ($t -and $m -and -not $map.ContainsKey($t)) { $map[$t] = $m }
+      }
+    } catch { }
+  }
+  return $map
+}
+
+function Get-MethodFromMetrics {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$BaseTag,
+    [Parameter()][hashtable]$MethodMap,
+    [Parameter()][string]$MetricsPath
+  )
+  if ([string]::IsNullOrWhiteSpace($BaseTag)) { return $null }
+  if ($MethodMap -and $MethodMap.ContainsKey($BaseTag)) { return $MethodMap[$BaseTag] }
+
+  if (Test-Path $MetricsPath) {
+    try {
+      $rows = Import-Csv $MetricsPath | Where-Object { $_.tag -and $_.method }
+      $cand = $rows | Where-Object { $_.tag -like "*$BaseTag*" } | Select-Object -Last 1
+>>>>>>> 1c82e5f (batch)
       if ($cand) { return [string]$cand.method }
     } catch { }
   }
@@ -119,10 +171,14 @@ function Infer-Method-FromMetrics([string]$baseTag) {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 1c82e5f (batch)
 # ── 0) metrics.csv에서 tag→method 맵
 $methodMap = Get-MethodMap -MetricsPath $Metrics
 
 # ── 1) 완료된 tag 집합
+<<<<<<< HEAD
 $doneTags = New-Object 'System.Collections.Generic.HashSet[string]'
 if (Test-Path $Metrics) {
   try {
@@ -157,32 +213,45 @@ foreach ($row in $W) {
     else                                                         { $method = "hjb" } # 보수 기본값
 =======
 # 1) 완료된 tag 집합
+=======
+>>>>>>> 1c82e5f (batch)
 $doneTags = New-Object 'System.Collections.Generic.HashSet[string]'
 if (Test-Path $Metrics) {
   try {
-    (Import-Csv $Metrics | Where-Object { $_.tag }) | ForEach-Object { [void]$doneTags.Add($_.tag) }
+    (Import-Csv $Metrics | Where-Object { $_.tag }) | ForEach-Object {
+      [void]$doneTags.Add([string]$_.tag)
+    }
   } catch { }
 }
 
-# 2) 우승 후보 로드
-if (!(Test-Path $Winners)) { throw "Winners CSV not found: $Winners" }
-$W = Import-Csv $Winners | Sort-Object {[double]$_.CompositeScore} -Descending | Select-Object -First 15
+# ── 2) 우승 후보 로드(CompositeScore 내림차순 Top 15)
+if (-not (Test-Path $Winners)) { throw "Winners CSV not found: $Winners" }
+$W = Import-Csv $Winners |
+     Sort-Object { [double]($_.CompositeScore) } -Descending |
+     Select-Object -First 15
 
-# 3) seed 세트
+# ── 3) seed 세트
 $seeds = 11,12,13,14,15
 
+# ── 4) 실행 루프
 foreach ($row in $W) {
-  $baseTag = Get-PropVal $row "tag"
+  $baseTag = Get-PropertyValue -InputObject $row -Name "tag"
   if ([string]::IsNullOrWhiteSpace($baseTag)) { continue }
 
-  # method 우선순위: winners 값 → metrics 유추 → 태그 휴리스틱
-  $method = Get-PropVal $row "method"
-  if ([string]::IsNullOrWhiteSpace($method)) { $method = Infer-Method-FromMetrics $baseTag }
+  # method 우선순위: winners → metrics 유추 → 태그 휴리스틱 → 기본 hjb
+  $method = Get-PropertyValue -InputObject $row -Name "method"
   if ([string]::IsNullOrWhiteSpace($method)) {
-    if ($baseTag -like "rob_*")                   { $method = "hjb" }
+    $method = Get-MethodFromMetrics -BaseTag $baseTag -MethodMap $methodMap -MetricsPath $Metrics
+  }
+  if ([string]::IsNullOrWhiteSpace($method)) {
+    if ($baseTag -like "rob_*")                                  { $method = "hjb" }
     elseif ($baseTag -like "*_rl_*" -or $baseTag -like "*mini*") { $method = "rl" }
+<<<<<<< HEAD
     else                                          { $method = "hjb" } # 보수 기본값
 >>>>>>> f7103a2 (report)
+=======
+    else                                                         { $method = "hjb" } # 보수 기본값
+>>>>>>> 1c82e5f (batch)
   }
 
   foreach ($s in $seeds) {
@@ -193,12 +262,18 @@ foreach ($row in $W) {
     }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
     # ← $args(자동변수) 대신 $cliArgs 사용
     $cliArgs = @(
       "-m",              $Cli,
 =======
     $args = @(
 >>>>>>> f7103a2 (report)
+=======
+    # ← $args(자동변수) 대신 $cliArgs 사용
+    $cliArgs = @(
+      "-m",              $Cli,
+>>>>>>> 1c82e5f (batch)
       "--method",        $method,
       "--data_profile",  "full",
       "--market_mode",   "bootstrap",
@@ -210,6 +285,9 @@ foreach ($row in $W) {
     )
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 1c82e5f (batch)
     # 선택 인자
     Add-Argument ([ref]$cliArgs) "--baseline"        (Get-PropertyValue -InputObject $row -Name "baseline")
     Add-Argument ([ref]$cliArgs) "--es_mode"         (Get-PropertyValue -InputObject $row -Name "es_mode")
@@ -217,6 +295,7 @@ foreach ($row in $W) {
     Add-Argument ([ref]$cliArgs) "--q_floor"         (Get-PropertyValue -InputObject $row -Name "q_floor")
     Add-Argument ([ref]$cliArgs) "--lambda_term"     (Get-PropertyValue -InputObject $row -Name "lambda_term")
     Add-Argument ([ref]$cliArgs) "--theta_ambiguity" (Get-PropertyValue -InputObject $row -Name "theta_ambiguity")
+<<<<<<< HEAD
 
     # mix (kr,us,gold 순으로 csv에 존재할 때만)
     $mk = Get-PropertyValue -InputObject $row -Name "mix_kr"
@@ -242,22 +321,31 @@ foreach ($row in $W) {
     Add-Arg ([ref]$args) "--q_floor"         (Get-PropVal $row "q_floor")
     Add-Arg ([ref]$args) "--lambda_term"     (Get-PropVal $row "lambda_term")
     Add-Arg ([ref]$args) "--theta_ambiguity" (Get-PropVal $row "theta_ambiguity")
+=======
+>>>>>>> 1c82e5f (batch)
 
-    # mix
-    $mk = Get-PropVal $row "mix_kr"
-    $mu = Get-PropVal $row "mix_us"
-    $mg = Get-PropVal $row "mix_gold"
+    # mix (kr,us,gold 순으로 csv에 존재할 때만)
+    $mk = Get-PropertyValue -InputObject $row -Name "mix_kr"
+    $mu = Get-PropertyValue -InputObject $row -Name "mix_us"
+    $mg = Get-PropertyValue -InputObject $row -Name "mix_gold"
     if ($mk -and $mu -and $mg) {
-      $args += @("--alpha_mix", ("{0},{1},{2}" -f $mk,$mu,$mg))
+      $cliArgs += @("--alpha_mix", ("{0},{1},{2}" -f $mk,$mu,$mg))
     }
 
     # hedge
-    $hr = Get-PropVal $row "hedge_ratio"
-    if ($hr) { $args += @("--hedge","on","--hedge_mode","sigma","--hedge_sigma_k",$hr) }
+    $hr = Get-PropertyValue -InputObject $row -Name "hedge_ratio"
+    if ($hr) {
+      $cliArgs += @("--hedge","on","--hedge_mode","sigma","--hedge_sigma_k",$hr)
+    }
 
+<<<<<<< HEAD
     Write-Host ">> $Py -m $Cli $($args -join ' ')" -ForegroundColor Cyan
     & $Py -m $Cli @args
 >>>>>>> f7103a2 (report)
+=======
+    Write-Host ">> $Py $($cliArgs -join ' ')" -ForegroundColor Cyan
+    & $Py @cliArgs
+>>>>>>> 1c82e5f (batch)
     [void]$doneTags.Add($tag)
   }
 }
