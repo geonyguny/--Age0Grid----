@@ -177,6 +177,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hedge_cost", type=float, default=0.005)
     p.add_argument("--hedge_sigma_k", type=float, default=0.20)
     p.add_argument("--hedge_tx", type=float, default=0.0)
+    # Ambiguity (Hansen–Sargent θ) — 모델 미결합이어도 기록/로깅용으로 받음
+    p.add_argument("--theta_ambiguity", type=float, default=None,
+                   help="Hansen–Sargent ambiguity parameter θ (meta/metrics에 기록; 모델 연결 전이라도 사용 가능)")
     # Market
     p.add_argument("--market_mode", choices=["iid","bootstrap"], default="iid")
     p.add_argument("--market_csv")
@@ -358,6 +361,10 @@ def _inject_meta(out: Dict[str,Any], args) -> None:
         meta.setdefault("verbose", getattr(args,"verbose","off"))
     except Exception:
         pass
+    # θ ambiguity 기록
+    ta = getattr(args, "theta_ambiguity", None)
+    if ta is not None:
+        meta["theta_ambiguity"] = float(ta)
     if _cfg_hash_fn:
         try: meta["config_hash"] = _cfg_hash_fn(vars(args))
         except Exception: pass
@@ -453,6 +460,10 @@ def _run_core(args)->Dict[str,Any]|Any:
         out.setdefault("asset", getattr(args,"asset",None))
         out.setdefault("outputs_abs", getattr(args,"outputs",None))
         _inject_meta(out,args)
+        # θ ambiguity를 metrics에도 기록(컬럼 생성 목적)
+        ta = getattr(args, "theta_ambiguity", None)
+        if ta is not None:
+            out.setdefault("metrics", {}).setdefault("theta_ambiguity", float(ta))
     try:
         if isinstance(out,dict):
             out = fixup_metrics_with_cvar(args,out)
@@ -595,6 +606,11 @@ def _emit_summary(out: dict, args) -> None:
     )
     metrics["EW"] = ew_fb
 
+    # θ ambiguity 라인/JSON 출력 보강
+    ta = getattr(args, "theta_ambiguity", None)
+    if ta is not None:
+        metrics.setdefault("theta_ambiguity", float(ta))
+
     if user_overrode_keys:
         # JSON: 상단 메타 + 중첩 metrics(dict)로 출력
         want = [k.strip() for k in str(keys_csv).split(",") if k.strip()]
@@ -603,10 +619,8 @@ def _emit_summary(out: dict, args) -> None:
             if k in metrics:
                 metrics_out[k] = metrics[k]
             elif k in out:
-                # 혹시 일부 키가 top-level에 있을 수 있으니 보강
                 metrics_out[k] = out[k]
-        # 흔히 필요한 보강 키(존재 시에만)
-        for extra_k in ("es95_source", "mean_WT", "ES95", "Ruin"):
+        for extra_k in ("es95_source", "mean_WT", "ES95", "Ruin", "theta_ambiguity"):
             if extra_k not in metrics_out and extra_k in metrics:
                 metrics_out[extra_k] = metrics[extra_k]
 
@@ -631,6 +645,7 @@ def _emit_summary(out: dict, args) -> None:
         emit("es_mode", metrics.get("es_mode", header.get("es_mode")))
     if "es95_source" in metrics: emit("es95_source", metrics.get("es95_source"))
     if "delta_annual" in metrics: emit("delta_annual", metrics.get("delta_annual"))
+    if "theta_ambiguity" in metrics: emit("theta_ambiguity", metrics.get("theta_ambiguity"))
     print("\n".join(lines))
 
 def main():
@@ -683,6 +698,10 @@ def main():
             0.0
         )
         m["EW"] = ew_fb
+        # θ ambiguity 보강
+        ta = getattr(args, "theta_ambiguity", None)
+        if ta is not None:
+            m.setdefault("theta_ambiguity", float(ta))
         m_print = {k: m.get(k, None) for k in keys} if keys else m
         packed = {
             "tag": getattr(args, "tag", None),
@@ -709,6 +728,10 @@ def main():
         ) or to_print.get("EW") or \
             (to_print.get("metrics") or {}).get("mean_WT") or to_print.get("mean_WT") or 0.0
         to_print["EW"] = ew_fb
+        # θ ambiguity 보강
+        ta = getattr(args, "theta_ambiguity", None)
+        if ta is not None:
+            (to_print.setdefault("metrics", {}))["theta_ambiguity"] = float(ta)
     _safe_print_json(to_print)
 
 if __name__ == "__main__":
