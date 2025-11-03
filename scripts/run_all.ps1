@@ -118,7 +118,7 @@ try {
     '--dpi','180','--fig_w','6.6','--fig_h','4.8'
   )
 
-  # ── 5) 리포트 ──────────────────────────────────────────
+  # ── 5) 리포트인데 ──────────────────────────────────────────
   $ReportTag = "${TagPrefix}_report"
   RunPy ("Make report ({0})" -f $ReportTag) @(
     '.\scripts\make_decum_report.py',
