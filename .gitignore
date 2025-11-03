@@ -21,4 +21,5 @@ outputs/
 project/data/market/*.csv
 !project/data/market/sample_market_600m.csv
 !project/data/market/kr_us_gold_bootstrap_mini.csv
-!project/data/market/kr_us_gold_bootstrap_full.csv
+!project/data/market/kr_us_gold_bootstrap_full.csvDECUM_backup.zip
+*.zip
