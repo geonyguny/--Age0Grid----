@@ -211,3 +211,7 @@ python -m pytest -q
 # 가상환경 파이썬 명령어
 .\.venv\Scripts\python.exe
 import os; os.system('cls')
+
+
+# 밤샘 대량 : run_all.ps1 heatmap, oat, snapshot
+powershell -ExecutionPolicy Bypass -File .\scripts\run_all.ps1 -Mode overnight
