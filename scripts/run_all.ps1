@@ -34,8 +34,8 @@ switch ($Mode) {
   }
   'overnight' {
     $profile    = 'full'
-    # RL 경로 수는 환경에 맞게 여기서만 조정
-    $nPathsRL   = 8000     # (너무 커서 병목이면 8k~15k 권장)
+    # RL 경로 수는 환경에 맞게 조정
+    $nPathsRL   = 8000      # 8k~15k 권장
     $nPathsHJB  = 30000
     $Seeds      = @(11,21,31)
     $TagPrefix  = 'OVN'
@@ -87,7 +87,7 @@ try {
     }
   }
 
-  # ── 3) 스냅샷 작성(히트맵/라인의 소스로 사용) ─────────
+  # ── 3) 스냅샷 작성(히트맵/라인의 단일 소스) ───────────
   $SnapCsv = Join-Path $OutRoot ("{0}_metrics_snapshot.csv" -f $TagPrefix)
   $ps = @"
 `$m = Import-Csv '$LogDir\metrics.csv' |
@@ -99,6 +99,9 @@ try {
   Write-Host "[OK] Snapshot -> $SnapCsv" -ForegroundColor Green
 
   # ── 4) 시각화 ──────────────────────────────────────────
+  # (선택) 지표별 컬러 스케일 — 필요 시 값 넣고 아래 args에 추가
+  $VminMax = ""    # 예시: "ES95:0.25,1.0;EW:0.25,1.25;CompositeScore:-0.6,1.9"
+
   # OAT 라인 (스냅샷 기반)
   RunPy 'OAT lines' @(
     '.\scripts\make_oat_lines.py',
@@ -108,7 +111,7 @@ try {
   )
 
   # 2D 히트맵 (스냅샷 기반, median + annotate + pivot 저장)
-  RunPy '2D heatmaps (median)' @(
+  $hmArgs = @(
     '.\scripts\make_heatmaps.py',
     '--src',$SnapCsv,
     '--tag_startswith',("${TagPrefix}_2D_"),
@@ -117,8 +120,10 @@ try {
     '--annotate','on','--agg','median','--save_pivots','on',
     '--dpi','180','--fig_w','6.6','--fig_h','4.8'
   )
+  if ($VminMax -ne "") { $hmArgs += @('--vmin_max', $VminMax) }
+  RunPy '2D heatmaps (median)' $hmArgs
 
-  # ── 5) 리포트인데 ──────────────────────────────────────────
+  # ── 5) 리포트 ──────────────────────────────────────────
   $ReportTag = "${TagPrefix}_report"
   RunPy ("Make report ({0})" -f $ReportTag) @(
     '.\scripts\make_decum_report.py',
@@ -126,7 +131,6 @@ try {
   )
 
   # ── 6) 드리프트 체크(dev↔full, wealth) ────────────────
-  # overnight 모드에선 의미가 덜할 수 있지만 일관성 있게 실행
   RunPy 'Compare dev vs full (wealth)' @(
     '.\scripts\compare_dev_full.py',
     '--tag_startswith',("${TagPrefix}_2D_"),

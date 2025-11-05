@@ -19,8 +19,7 @@ import matplotlib.pyplot as plt
 # Helpers
 # ─────────────────────────────────────────────────────────
 TAG_PATTERNS = [
-    # 예) 2D_us0.6_h0.5  또는  2D_us0.6_h0.5_anything
-    re.compile(r"^2D_us(?P<u>[0-9.]+)_h(?P<h>[0-9.]+)(?:_.+)?$"),
+    re.compile(r".*2D_us(?P<u>[0-9.]+)_h(?P<h>[0-9.]+)(?:_.+)?$"),
 ]
 
 def parse_mix(s: str) -> Tuple[float, float, float]:
