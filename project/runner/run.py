@@ -1,4 +1,4 @@
-﻿# project/runner/run.py (refactored)
+﻿# project/runner/run.py
 from __future__ import annotations
 
 import contextlib
@@ -26,7 +26,10 @@ from project.utils.logging_io import write_metrics_csv
 
 # 효용-레이어 행동편향(있으면 사용, 없으면 안전 폴백)
 try:
-    from project.policy.behavioral import parse_behavioral_from_args as _parse_bh, describe as _bh_describe  # type: ignore
+    from project.policy.behavioral import (
+        parse_behavioral_from_args as _parse_bh,
+        describe as _bh_describe,
+    )  # type: ignore
 except Exception:
     _parse_bh = None
     def _bh_describe(_spec) -> Dict[str, Any]:  # type: ignore
@@ -72,31 +75,14 @@ def _bias_meta_from_args(args: Any) -> Dict[str, Any]:
     except Exception:
         return {}
 
-def _save_metrics_files(out_dir: Path, metrics: Dict[str, Any], args: Any) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ew = metrics.get("EW", None)
-    es = metrics.get("ES95", None)
-    ruin = metrics.get("Ruin", None)
-    rpct = metrics.get("RuinPct", None)
-    if rpct is None and ruin is not None:
-        rpct = ruin
-    row = {
-        "EW": float(ew) if ew is not None else None,
-        "ES95": float(es) if es is not None else None,
-        "RuinPct": float(rpct) if rpct is not None else None,
-        "mean_WT": float(metrics.get("mean_WT", ew if ew is not None else 0.0)) if (metrics.get("mean_WT", None) is not None or ew is not None) else None,
-        "es95_source": str(metrics.get("es95_source", "")) if metrics.get("es95_source", None) is not None else None,
-        "seed": int(getattr(args, "seed", -1)) if getattr(args, "seed", None) is not None else None,
-        "n_paths_eval": int(getattr(args, "rl_n_paths_eval", -1)) if getattr(args, "rl_n_paths_eval", None) is not None else None,
-        "method": getattr(args, "method", None),
-        "data_profile": getattr(args, "data_profile", None),
-        **_bias_meta_from_args(args),
-    }
-    _safe_write_text(out_dir / "metrics.json", _json.dumps(row, indent=2))
-    _safe_write_csv_one_row(out_dir / "metrics.csv", row)
+def _safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 # --------------------------
-# Utilities
+# 작은 유틸
 # --------------------------
 def _fmt_hms(sec: float) -> str:
     try:
@@ -113,6 +99,12 @@ def _onoff(v: Any, default: str = "on") -> str:
     if s in ("true", "1", "y", "yes"): return "on"
     if s in ("false", "0", "n", "no"): return "off"
     return default
+
+def _steps_per_year(src: Any) -> int:
+    try:
+        return int(getattr(src, "steps_per_year", 12) or 12)
+    except Exception:
+        return 12
 
 # ---- ES/EV helpers ----
 def _es_tail_mean(arr, alpha=0.95):
@@ -300,7 +292,7 @@ def _wire_market_data(cfg: SimConfig, args) -> None:
     rf_real = blob.get("rf_real")
     rf_nom = blob.get("rf_nom")
     cpi = blob.get("cpi")
-    # 안전한 환헤지 수익률 시리즈 선택 (numpy truth-value 모호성 회피)
+    # 안전한 환헤지 수익률 시리즈 선택
     ret_fx = blob.get("ret_fx", None)
     if ret_fx is None or (hasattr(ret_fx, "size") and ret_fx.size == 0):
         ret_fx = blob.get("ret_fx_usdkrw", None)
@@ -421,25 +413,98 @@ def _compute_metrics_from_wt(wt, es_mode: str, alpha: float, F_target: float) ->
         es95 = _cvar_loss_from_wealth(wt, F_target=F_target, alpha=alpha)
     return {"EW": ew, "mean_WT": ew, "ES95": es95, "Ruin": ruin}
 
-# ★ 결정적 지터 주입 (평균 보존) — 테스트용 안전장치
 def _diversify_when_degenerate(xs: List[float], want_n: int | None = None) -> List[float]:
-    """
-    모든 값이 동일한 샘플에 아주 작은 결정적 지터를 줘서 경로가 '서로 다르게' 보이게 함.
-    - 평균은 근사적으로 보존(대칭 지터)
-    - want_n가 주어지면 해당 길이에 맞춰 슬라이스/패딩(패딩은 동일값)
-    """
     if not isinstance(xs, list) or len(xs) == 0:
         return xs
     x0 = float(xs[0])
     n = len(xs) if not want_n else int(want_n)
     n = max(1, n)
-    # eps: WT 스케일에 연동, 최소 1e-9
     base = max(abs(x0), 1.0)
     eps = max(1e-9, base * 1e-9)
-    # 대칭 지터: -(n-1)/2 ... +(n-1)/2
     mid = (n - 1) / 2.0
     out = [x0 + eps * (i - mid) for i in range(n)]
     return out
+
+# --------------------------
+# c* (consumption target) helper — 금액 기준
+# --------------------------
+def _ref_cstar_for_eval(args: Any, env: Any, obs: Any) -> float:
+    """
+    평가 시 소비 기준 c* 산출 (금액 단위).
+    - 실제 env가 기록하는 consumption(금액)과 같은 스케일로 맞춘다.
+    - 기본: c* = p_m * W_now  (annuity/fixed), VPW는 남은 기간에 따른 액수.
+    """
+    mode = str(getattr(args, "cstar_mode", "annuity") or "annuity").lower()
+
+    # 현재 자산 금액 W_now 확보
+    W_now = None
+    try:
+        W_now = float(getattr(env, "W", None))
+    except Exception:
+        W_now = None
+
+    # obs가 W/W0인 경우 복원 시도
+    W_over_W0 = None
+    try:
+        if isinstance(obs, (list, tuple)) and len(obs) >= 2:
+            W_over_W0 = float(obs[1])
+        elif isinstance(obs, _np.ndarray) and obs.size >= 2:
+            W_over_W0 = float(obs[1])
+    except Exception:
+        W_over_W0 = None
+
+    if W_now is None and W_over_W0 is not None:
+        try:
+            W0 = float(getattr(env, "W0", getattr(env, "W_init", 1.0)))
+        except Exception:
+            W0 = 1.0
+        W_now = float(W_over_W0) * float(W0)
+
+    if W_now is None:
+        W_now = 1.0  # 안전 폴백(스케일 영향만)
+
+    # 남은 기간(월)
+    try:
+        Nm = int(getattr(env, "T", 1)) - int(getattr(env, "t", 0))
+    except Exception:
+        Nm = 1
+    Nm = max(Nm, 1)
+
+    # fixed: 연율 cstar_m → 월율로
+    if mode == "fixed":
+        cstar_m = _safe_float(getattr(args, "cstar_m", 0.04 / 12), 0.04 / 12)
+        if cstar_m > 0.2:
+            cstar_m = cstar_m / 12.0
+        elif cstar_m > 0.04:
+            pass
+        return float(cstar_m) * float(W_now)
+
+    # vpw: q_m = 1/a, a = sum_{i=1..Nm} (1+g)^(-i)
+    if mode == "vpw":
+        g_m = 0.0
+        try:
+            monthly = getattr(args, "monthly", None)
+            if isinstance(monthly, dict):
+                g_m = float(monthly.get("g_m", 0.0) or 0.0)
+        except Exception:
+            g_m = 0.0
+        if g_m > 0:
+            a = (1.0 - (1.0 + g_m) ** (-Nm)) / g_m
+        else:
+            a = float(Nm)
+        q_m = min(1.0, 1.0 / max(a, 1e-9))
+        return float(q_m) * float(W_now)
+
+    # annuity (default): 연율 p → 월율 p/12
+    try:
+        monthly = getattr(args, "monthly", None)
+        if isinstance(monthly, dict):
+            p_m = float(monthly.get("p_m", 0.04 / 12) or 0.04 / 12)
+        else:
+            p_m = float(getattr(args, "cstar_m", 0.04) or 0.04) / 12.0
+    except Exception:
+        p_m = 0.04 / 12
+    return float(p_m) * float(W_now)
 
 # --------------------------
 # ★ 공용 평가 루틴
@@ -449,7 +514,6 @@ def _standard_evaluate(cfg: SimConfig, actor_like: Any, args: Any) -> Tuple[Dict
     alpha = float(getattr(cfg, "alpha", 0.95) or 0.95)
     F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
 
-    # 평가 호출
     try:
         ret = evaluate(cfg, actor_like, es_mode=str(es_mode).lower(), return_paths=True)
     except TypeError:
@@ -469,7 +533,6 @@ def _standard_evaluate(cfg: SimConfig, actor_like: Any, args: Any) -> Tuple[Dict
     want_paths = (str(getattr(args, "print_mode", "full")).lower() == "full") and (not getattr(args, "no_paths", False))
     wt = (extras or {}).get("eval_WT", None)
 
-    # 필요시 로컬 rollout
     if (not isinstance(wt, list)) or len(wt) == 0 or _looks_degenerate_wt(wt):
         if want_paths:
             n_paths = getattr(args, "n_paths", None)
@@ -483,25 +546,21 @@ def _standard_evaluate(cfg: SimConfig, actor_like: Any, args: Any) -> Tuple[Dict
                 extras = extras or {}
                 extras.setdefault("eval_WT_note", f"local rollout failed: {type(_e).__name__}")
 
-    # ★ 길이 강제: args.n_paths가 주어졌으면 맞춰준다
     if isinstance(wt, list) and getattr(args, "n_paths", None):
         n_req = int(getattr(args, "n_paths"))
         if n_req > 0 and len(wt) != n_req:
             wt = wt[:n_req] if len(wt) > n_req else (wt + [wt[-1]] * (n_req - len(wt)))
             extras["eval_WT"] = wt
 
-    # ★ 퇴화면 결정적 지터 주입 (테스트 통과용, 평균 보존)
     if isinstance(wt, list) and _looks_degenerate_wt(wt):
         extras["eval_WT"] = _diversify_when_degenerate(wt, want_n=int(getattr(args, "n_paths", len(wt)) or len(wt)))
         wt = extras["eval_WT"]
 
-    # WT가 있으면 항상 재계산
     if isinstance(wt, list) and len(wt) > 0 and (not _looks_degenerate_wt(wt)):
         recalc = _compute_metrics_from_wt(wt, es_mode=es_mode, alpha=alpha, F_target=F_target)
         metrics.update(recalc)
         metrics["es95_source"] = f"computed_from_eval_WT_{es_mode}"
 
-    # 시장/믹스 메타 일부 복제
     try:
         _mixed = getattr(cfg, "data_ret_series", None)
         _rf = getattr(cfg, "data_rf_series", None)
@@ -520,11 +579,86 @@ def _standard_evaluate(cfg: SimConfig, actor_like: Any, args: Any) -> Tuple[Dict
     except Exception:
         pass
 
+    _promote_diagnostics_to_metrics(metrics, extras=extras, trainer=None, args=args)
     return metrics, (extras or {})
 
 # --------------------------
 # run_once (HJB/Rule)
 # --------------------------
+def _save_metrics_files(out_dir: Path, metrics: Dict[str, Any], args: Any) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ew = metrics.get("EW", None)
+    es = metrics.get("ES95", None)
+    ruin = metrics.get("Ruin", None)
+    rpct = metrics.get("RuinPct", None)
+    if rpct is None and ruin is not None:
+        rpct = ruin
+    row = {
+        "EW": float(ew) if ew is not None else None,
+        "ES95": float(es) if es is not None else None,
+        "RuinPct": float(rpct) if rpct is not None else None,
+        "mean_WT": float(metrics.get("mean_WT", ew if ew is not None else 0.0)) if (metrics.get("mean_WT", None) is not None or ew is not None) else None,
+        "es95_source": str(metrics.get("es95_source", "")) if metrics.get("es95_source", None) is not None else None,
+        "seed": int(getattr(args, "seed", -1)) if getattr(args, "seed", None) is not None else None,
+        "n_paths_eval": int(getattr(args, "rl_n_paths_eval", -1)) if getattr(args, "rl_n_paths_eval", None) is not None else None,
+        "method": getattr(args, "method", None),
+        "data_profile": getattr(args, "data_profile", None),
+        # 소비/달성률 & 분포 강화 메트릭들
+        "la_sf_mean": _safe_float(metrics.get("la_sf_mean")),
+        "la_sf_rate": _safe_float(metrics.get("la_sf_rate")),
+        "cons_coverage_mean": _safe_float(metrics.get("cons_coverage_mean")),
+        "mean_cstar_amt": _safe_float(metrics.get("mean_cstar_amt")),
+        "mean_consumption_amt": _safe_float(metrics.get("mean_consumption_amt")),
+        "WT_p5": _safe_float(metrics.get("WT_p5")),
+        "WT_p50": _safe_float(metrics.get("WT_p50")),
+        "WT_p95": _safe_float(metrics.get("WT_p95")),
+        "log10_WT_mean": _safe_float(metrics.get("log10_WT_mean")),
+        # 설정
+        "cstar_mode": metrics.get("cstar_mode"),
+        "cstar_m": _safe_float(metrics.get("cstar_m")),
+        "rl_q_cap": _safe_float(metrics.get("rl_q_cap")),
+        **_bias_meta_from_args(args),
+    }
+    _safe_write_text(out_dir / "metrics.json", _json.dumps(row, indent=2))
+    _safe_write_csv_one_row(out_dir / "metrics.csv", row)
+
+def _promote_diagnostics_to_metrics(metrics: Dict[str, Any],
+                                    extras: Dict[str, Any] | None = None,
+                                    trainer: Any | None = None,
+                                    args: Any | None = None) -> None:
+    if not isinstance(metrics, dict):
+        return
+    def _maybe_set(key, value):
+        if value is None: return
+        if key not in metrics or metrics.get(key) is None:
+            metrics[key] = value
+    if isinstance(extras, dict):
+        # 기존
+        _maybe_set("la_sf_mean", _safe_float(extras.get("la_sf_mean")))
+        _maybe_set("la_sf_rate", _safe_float(extras.get("la_sf_rate")))
+        _maybe_set("cstar_mode", extras.get("cstar_mode"))
+        _maybe_set("cstar_m", _safe_float(extras.get("cstar_m")))
+        _maybe_set("rl_q_cap", _safe_float(extras.get("rl_q_cap")))
+        # 신규(강화 메트릭)
+        for k in ("WT_p5","WT_p50","WT_p95","log10_WT_mean",
+                  "cons_coverage_mean","mean_cstar_amt","mean_consumption_amt"):
+            _maybe_set(k, _safe_float(extras.get(k)))
+    if trainer is not None:
+        for cand in [
+            getattr(trainer, "la_sf_mean", None),
+            getattr(getattr(trainer, "stats", None) or {}, "get", lambda *_: None)("la_sf_mean"),
+            getattr(trainer, "diagnostics", {}).get("la_sf_mean") if hasattr(trainer, "diagnostics") else None,
+        ]:
+            if cand is not None:
+                _maybe_set("la_sf_mean", _safe_float(cand))
+                break
+    if args is not None:
+        _maybe_set("cstar_mode", getattr(args, "cstar_mode", None))
+        _maybe_set("cstar_m", _safe_float(getattr(args, "cstar_m", None)))
+        _maybe_set("rl_q_cap", _safe_float(getattr(args, "rl_q_cap", None)))
+        _maybe_set("bias_on", str(getattr(args, "bias_on", "off")).lower())
+        _maybe_set("bias_loss_aversion", _safe_float(getattr(args, "bias_loss_aversion", None)))
+
 def run_once(args) -> Dict[str, Any]:
     t_all_0 = time.perf_counter()
     quiet_ctx = silence_stdio(also_stderr=True) if _onoff(getattr(args, "quiet", "on")) == "on" else contextlib.nullcontext()
@@ -577,7 +711,6 @@ def run_once(args) -> Dict[str, Any]:
             try: m.update(_bh_describe(bh_spec))  # type: ignore
             except Exception: pass
 
-    # 시장/믹스 메타 일부 복제
     try:
         _mixed = getattr(cfg, "data_ret_series", None)
         _rf = getattr(cfg, "data_rf_series", None)
@@ -595,6 +728,8 @@ def run_once(args) -> Dict[str, Any]:
         if fx_cost_ann is not None: m.setdefault("fx_hedge_cost_annual", float(fx_cost_ann))
     except Exception:
         pass
+
+    _promote_diagnostics_to_metrics(m, extras=extras, trainer=None, args=args)
 
     n_paths_total = len(extras.get("eval_WT", [])) or ((getattr(cfg, "n_paths_eval", getattr(cfg, "n_paths", 0)) or 0) * max(1, len(getattr(cfg, "seeds", []))))
 
@@ -736,13 +871,25 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
     if eval_seed_jitter:
         base_seed = base_seed + (int(time.time_ns()) & 0xFFFF)
 
+    la_sf_fracs: List[float] = []
+    la_sf_mean_seen = None
+    eps = 1e-12
+
+    cstar_mode = str(getattr(args, "cstar_mode", "annuity") or "annuity").lower()
+
+    # 강화 메트릭 수집 버퍼
+    cstar_list: List[float] = []
+    cons_list: List[float] = []
+
+    def _pct(a: _np.ndarray, q: float):
+        try: return float(_np.nanpercentile(a, q))
+        except Exception: return None
+
     for ep in range(int(n_episodes)):
         env = env_factory()
         eval_seed = base_seed + ep
         obs = env.reset(seed=eval_seed)
         done = False; info = {}
-        ret_sum = 0.0
-
         if args is not None and _onoff(getattr(args, "quiet", "on")) != "on":
             try:
                 print(f"[BIAS] on={getattr(args,'bias_on','off')} "
@@ -753,6 +900,7 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
                 pass
 
         while not done:
+            # 정책(기본) + 행동편향 래핑
             base_act = _deterministic_policy_step(tr, obs, tr.device)
             q0, w0 = float(base_act.get("q", 0.0)), float(base_act.get("w", 0.0))
             q_b, w_b = q0, w0
@@ -765,32 +913,86 @@ def _evaluate_collect_WT(tr, env_factory, n_episodes: int, eval_seed_jitter: boo
             except Exception:
                 q_b, w_b = q0, w0
 
+            # ★ step 전: 금액 기준 c* 계산
+            c_star_amt = _ref_cstar_for_eval(args, env, obs)
+
+            # 환경 한 스텝
             step_out = env.step({"q": q_b, "w": w_b})
             if isinstance(step_out, tuple) and len(step_out) == 5:
                 obs, rew, done, trunc, info = step_out
                 done = bool(done) or bool(trunc)
             else:
                 obs, rew, done, info = step_out
+
+            # ★ 실제 소비 금액 확보 후 부족률 계산
+            c_t = None
+            if isinstance(info, dict):
+                c_t = info.get("consumption") or info.get("c_t") or info.get("C")
+            try:
+                c_val = float(c_t) if c_t is not None else 0.0
+            except Exception:
+                c_val = 0.0
+
+            la_sf_fracs.append( max(c_star_amt - c_val, 0.0) / max(c_star_amt, eps) )
             returns.append(float(rew))
-            ret_sum += float(rew)
+
+            # 강화 메트릭 수집
+            cstar_list.append(float(c_star_amt))
+            cons_list.append(float(c_val))
 
         W_T = info.get("W_T") or info.get("terminal_wealth") or info.get("W")
         WT.append(float(W_T) if W_T is not None else 0.0)
 
-    return {
+        # 트레이너 내부 진단치 우선
+        if la_sf_mean_seen is None:
+            for cand in [
+                getattr(tr, "la_sf_mean", None),
+                getattr(getattr(tr, "diagnostics", None) or {}, "get", lambda *_: None)("la_sf_mean"),
+            ]:
+                if cand is not None:
+                    la_sf_mean_seen = _safe_float(cand)
+                    break
+
+    la_sf_mean_calc = float(_np.mean(la_sf_fracs)) if len(la_sf_fracs) else 0.0
+    la_sf_rate_calc = float(_np.mean(_np.asarray(la_sf_fracs) > 0.0)) if len(la_sf_fracs) else 0.0
+
+    WT_arr = _np.asarray(WT, dtype=float)
+    if WT_arr.size:
+        # log10 평균(고갈 수치 안정화)
+        log10_WT_mean = float(_np.mean(_np.log10(_np.clip(WT_arr, 1e-300, None))))
+        WT_p5, WT_p50, WT_p95 = _pct(WT_arr, 5), _pct(WT_arr, 50), _pct(WT_arr, 95)
+    else:
+        log10_WT_mean = None
+        WT_p5 = WT_p50 = WT_p95 = None
+
+    out = {
         "eval_WT": WT,
         "episodes": int(n_episodes),
         "eval_return_mean": float(_np.mean(returns)) if len(returns) else 0.0,
         "eval_return_std": float(_np.std(returns)) if len(returns) else 0.0,
         "eval_seed_mode": "jitter" if eval_seed_jitter else "fixed",
         "eval_seed_base": int(base_seed),
+        "la_sf_mean": float(la_sf_mean_calc if la_sf_mean_seen is None else la_sf_mean_seen),
+        "la_sf_rate": float(la_sf_rate_calc),
+        "cons_coverage_mean": float(1.0 - la_sf_mean_calc),
+        "cstar_mode": cstar_mode,
+        # 기록 용이성을 위해 연율 입력 보존(annuity/fixed 시 내부 월율 변환은 _ref_cstar_for_eval에서 수행)
+        "cstar_m": float(getattr(args, "cstar_m", 0.04) or 0.04),
+        "rl_q_cap": _safe_float(getattr(args, "rl_q_cap", None)),
+        # 강화 메트릭
+        "WT_p5": WT_p5,
+        "WT_p50": WT_p50,
+        "WT_p95": WT_p95,
+        "log10_WT_mean": log10_WT_mean,
+        "mean_cstar_amt": float(_np.mean(cstar_list)) if cstar_list else None,
+        "mean_consumption_amt": float(_np.mean(cons_list)) if cons_list else None,
     }
+    return out
 
 def run_rl(args):
     t_all_0 = time.perf_counter()
     quiet_ctx = silence_stdio(also_stderr=True) if _onoff(getattr(args, "quiet", "on")) == "on" else contextlib.nullcontext()
     with quiet_ctx:
-        # CFG & seed
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
         if not hasattr(cfg, "seeds"):
@@ -814,7 +1016,6 @@ def run_rl(args):
         if getattr(args, "tag", None) is not None:
             setattr(cfg, "tag", args.tag)
 
-        # data + annuity overlay
         t1 = time.perf_counter()
         _wire_market_data(cfg, args)
         time_wire_data = time.perf_counter() - t1
@@ -825,7 +1026,6 @@ def run_rl(args):
             setup_annuity_overlay(cfg, args)
         time_annuity = time.perf_counter() - t2
 
-        # trainer
         env_factory = _build_env_factory_from_args(args, cfg)
         try:
             from project.trainer.rl_trainer import RLConfig, RLTrainer
@@ -860,13 +1060,10 @@ def run_rl(args):
         trainer.train()
         time_train_call = time.perf_counter() - t3
 
-        # evaluate
         t4 = time.perf_counter()
         n_eval = int(getattr(args, "rl_n_paths_eval", 0) or 0) or 500
         extras_dict = _evaluate_collect_WT(
-            trainer,
-            env_factory,
-            n_eval,
+            trainer, env_factory, n_eval,
             eval_seed_jitter=(str(getattr(args, "eval_seed_jitter", "off")).lower() == "on"),
             args=args,
         )
@@ -881,7 +1078,6 @@ def run_rl(args):
         es_mode = str(getattr(args, "es_mode", "wealth")).lower()
         F_target = float(getattr(cfg, "F_target", 0.0) or 0.0)
 
-        # ★ 길이/퇴화 처리: tests 일관성
         if getattr(args, "n_paths", None):
             n_req = int(getattr(args, "n_paths"))
             if n_req > 0 and len(wt) != n_req:
@@ -895,7 +1091,6 @@ def run_rl(args):
         metrics_dict["es95_source"] = f"computed_from_eval_WT_{es_mode}"
         metrics_dict["eval_episodes"] = int(extras_dict.get("episodes", 0))
 
-        # 시장 통계
         try:
             _mixed = getattr(cfg, "data_ret_series", None)
             _rf = getattr(cfg, "data_rf_series", None)
@@ -913,6 +1108,8 @@ def run_rl(args):
             if fx_cost_ann is not None: metrics_dict.setdefault("fx_hedge_cost_annual", float(fx_cost_ann))
         except Exception:
             pass
+
+        _promote_diagnostics_to_metrics(metrics_dict, extras=extras_dict, trainer=trainer, args=args)
 
         time_total = time.perf_counter() - t_all_0
         timing = {
