@@ -21,6 +21,13 @@ from torch.distributions import Beta
 # `from project.env.retirement_env import RetirementEnv` 로 바꿔도 됨.
 from project.env import RetirementEnv
 
+# (옵션) 효용기반 종단손실 함수가 있으면 사용, 없으면 무시
+try:
+    from project.env.reward import terminal_loss_utility  # noqa: F401
+    _HAS_UTILITY_LOSS = True
+except Exception:
+    _HAS_UTILITY_LOSS = False
+
 try:
     torch.set_num_threads(1); torch.set_num_interop_threads(1)
 except Exception:
@@ -31,6 +38,7 @@ except Exception:
 # Small helpers
 # ─────────────────────────────────────────────────────────
 def _to_f(x, default: float = 0.0) -> float:
+    """안전 부동소수 변환."""
     try:
         if x is None:
             return float(default)
@@ -73,7 +81,6 @@ class _GymShim:
             return np.array([t/float(T-1 if T > 1 else 1), W/max(W0, 1e-12), age_norm, 0.0], dtype=np.float32)
         arr = np.asarray(s, dtype=np.float32).ravel()
         if arr.size >= 2:
-            # s가 [t_norm, W] 인 경우: W를 W/W0로 교정할 수 없으니 그대로 둔다.
             if arr.size < 4:
                 pad = np.zeros((4-arr.size,), dtype=np.float32)
                 arr = np.concatenate([arr, pad], axis=0)
@@ -103,7 +110,7 @@ class _GymShim:
 
         r = _to_f(r, 0.0)
         obs = self._obs_vec(s_next)
-        # 보장: info에 W_T가 없으면 현 W를 넣어준다(터미널 단계에서 사용)
+        # W_T가 info에 없다면 best-effort로 보완
         if isinstance(info, dict) and "W_T" not in info:
             try:
                 wt = _to_f(getattr(self.base, "W", None) or (s_next.get("W") if isinstance(s_next, dict) else None), 0.0)
@@ -269,13 +276,96 @@ def teacher_action(cfg):
 
 
 # ─────────────────────────────────────────────────────────
+# Helper: c_star (reference consumption) for shaping / loss aversion
+# ─────────────────────────────────────────────────────────
+def _ref_consumption_cstar(cfg, env_shim: _GymShim, obs_vec: np.ndarray, mode: str = "annuity") -> float:
+    """
+    기준소비 c* 계산:
+      - annuity : c* = p_m * (W/W0)
+      - fixed   : c* = cstar_m * (W/W0)
+      - vpw     : 간단 근사(VPW) 기반
+    """
+    try:
+        W_over_W0 = float(obs_vec[1])
+    except Exception:
+        W_over_W0 = 1.0
+
+    mode = str(mode or "annuity").lower()
+    if mode == "fixed":
+        c_star_m = float(getattr(cfg, "cstar_m", 0.04/12) or 0.04/12)
+        return c_star_m * W_over_W0
+
+    if mode == "vpw":
+        try:
+            Nm = int(getattr(env_shim.base, "T", 1)) - int(getattr(env_shim.base, "t", 0))
+        except Exception:
+            Nm = 1
+        g_m = 0.0
+        try:
+            monthly = getattr(cfg, "monthly", None)
+            if isinstance(monthly, dict):
+                g_m = float(monthly.get("g_m", 0.0) or 0.0)
+        except Exception:
+            g_m = 0.0
+        a = (1.0 - (1.0+g_m)**(-Nm))/g_m if g_m > 0 else max(Nm, 1)
+        q_m = min(1.0, 1.0 / a)
+        return q_m * W_over_W0
+
+    # annuity (default)
+    try:
+        monthly = getattr(cfg, "monthly", None)
+        if isinstance(monthly, dict):
+            p_m = float(monthly.get("p_m", 0.04/12) or 0.04/12)
+        else:
+            p_m = float(getattr(cfg, "cstar_m", 0.04/12) or 0.04/12)
+    except Exception:
+        p_m = 0.04/12
+    return p_m * W_over_W0
+
+
+# ─────────────────────────────────────────────────────────
+# F_target 추정 (CLI 미지정 시)
+# ─────────────────────────────────────────────────────────
+def _infer_F_target(cfg) -> float:
+    """F_target을 안전하게 추정. 엔진 스케일(초기 W0=1) 가정.
+    우선순위: CLI값 > annuity-PV 근사(c* * years)
+    """
+    F_cli = getattr(cfg, "F_target", None)
+    try:
+        if F_cli is not None and float(F_cli) > 0.0:
+            return float(F_cli)
+    except Exception:
+        pass
+
+    try:
+        cstar_m = float(getattr(cfg, "cstar_m", 0.04) or 0.04)
+    except Exception:
+        cstar_m = 0.04
+
+    if cstar_m <= 0.2:  # 연간 4~10% 등으로 간주
+        years = int(getattr(cfg, "horizon_years", 35) or 35)
+        return max(1e-6, float(cstar_m) * float(years))
+    else:
+        return max(1e-6, float(cstar_m))
+
+
+# ─────────────────────────────────────────────────────────
 # Rollout
 # ─────────────────────────────────────────────────────────
 def rollout(env, policy, cfg, steps, gamma, lam, device,
             cvar_hook, lw_scale, survive_bonus, teacher_eps,
             stage_cvar: Optional[DualCVaRStage] = None, cstar_mode: str = "annuity"):
+    """
+    1 에포크 roll-out + GAE 계산.
+    ★ 손실회피 진단치: la_sf_mean (c* 대비 소비 부족률의 평균)을 함께 반환.
+    """
     obs_list, act_q, act_w, logp_list, ent_list, val_list, rew_list, done_list = ([] for _ in range(8))
     stage_L_list: List[float] = []  # for stage-wise CVaR eta update
+
+    # ★ 손실회피 진단치(평균 부족률)
+    la_sf_sum = 0.0
+    la_sf_cnt = 0
+
     obs, _ = env.reset(seed=None)
 
     q_cap = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
@@ -283,6 +373,11 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
     w_max   = float(getattr(cfg, "w_max", 1.0) or 1.0)
     gamma_crra = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
     u_scale    = float(getattr(cfg, "u_scale", 0.0) or 0.0)
+
+    # κ(손실회피) 강도
+    kappa = float(getattr(cfg, "bias_loss_aversion", 0.0) or 0.0)
+    bias_on = str(getattr(cfg, "bias_on", "off")).lower() == "on"
+    la_active = bias_on and (kappa > 0.0)
 
     for _ in range(steps):
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -307,52 +402,53 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
 
         obs2, c_t, done, trunc, info = env.step(np.array([float(q.item()), float(w.item())], dtype=np.float32))
 
-        # reward shaping
+        # reward shaping ───────────────────────────────────
         rew = 0.0
+
+        # (1) 기본 효용(선택): CRRA
         if u_scale != 0.0:
             rew += u_scale * u_crra(_to_f(c_t, 0.0), gamma=gamma_crra)
 
-        # stage-wise CVaR on consumption shortfall
+        # (2) Stage-wise CVaR (소비 단기부족) + κ 반영
         if stage_cvar is not None:
-            # cfg.cvar_stage == "on" 혹은 cvar_stage_on True 둘 다 허용
             stage_on = (str(getattr(cfg, "cvar_stage", "off")).lower() == "on") or bool(getattr(cfg, "cvar_stage_on", False))
             if stage_on:
-                mode = str(cstar_mode or "annuity").lower()
-                try:
-                    if mode == "fixed":
-                        c_star_m = float(getattr(cfg, "cstar_m", 0.04/12) or 0.04/12)
-                        c_star = c_star_m * float(obs[1])  # obs[1] ≈ W/W0 (스케일 상수로 사용)
-                    elif mode == "vpw":
-                        # 단순 근사 VPW (이 값들은 환경/구성에 따라 의미부여용)
-                        Nm = int(getattr(env.base, "T", 1)) - int(getattr(env.base, "t", 0))
-                        g = float(getattr(getattr(cfg, "monthly", lambda: {"g_m": 0.0})(), "get", lambda *_: 0.0)("g_m"))
-                        a = (1.0 - (1.0+g)**(-Nm))/g if g > 0 else max(Nm, 1)
-                        q_m = min(1.0, 1.0 / a)
-                        c_star = q_m * float(obs[1])
-                    else:
-                        p_m = float(getattr(getattr(cfg, "monthly", lambda: {"p_m": 0.04/12})(), "get", lambda *_: 0.04/12)("p_m"))
-                        c_star = p_m * float(obs[1])
-                except Exception:
-                    c_star = 0.0
+                c_star = _ref_consumption_cstar(cfg, env, obs, mode=cstar_mode)
                 L_t = max(c_star - _to_f(c_t, 0.0), 0.0)
                 stage_L_list.append(L_t)
                 lam_s = float(getattr(cfg, "lambda_stage", 0.0) or 0.0)
                 if lam_s > 0.0:
-                    rew -= lam_s * stage_cvar.penalty(L_t)
+                    lam_eff = lam_s * (max(1.0, kappa) if la_active else 1.0)
+                    rew -= lam_eff * stage_cvar.penalty(L_t)
 
+        # (3) ★ 손실회피 κ: c_t < c* 일 때 부족률 페널티 + 진단치 집계
+        #     (la_active가 아니더라도 진단치는 집계하여 la_sf_mean이 항상 정의되게)
+        c_star_la = _ref_consumption_cstar(cfg, env, obs, mode=cstar_mode)
+        if c_star_la > 0.0:
+            shortfall = max(c_star_la - _to_f(c_t, 0.0), 0.0)
+            shortfall_ratio = shortfall / max(c_star_la, 1e-12)
+            if la_active:
+                rew -= kappa * shortfall_ratio
+            la_sf_sum += float(shortfall_ratio)
+            la_sf_cnt += 1
+
+        # (4) 생존 보너스
         if not (done or trunc) and survive_bonus != 0.0:
             rew += float(survive_bonus)
+
+        # (5) 에피소드 종료 시 종단 CVaR 및 W_T shaping
         if (done or trunc):
             if cvar_hook is not None:
                 rew += float(cvar_hook(info))
             lw = float(getattr(cfg, "lw_scale", 0.0) or 0.0)
             if lw != 0.0:
                 rew += lw * _to_f(info.get("W_T", 0.0), 0.0)
+        # ─────────────────────────────────────────────────
 
         # keep graph
         obs_list.append(obs_t.squeeze(0))
         act_q.append(q.detach()); act_w.append(w.detach())
-        logp_list.append(logp)    # keep grad
+        logp_list.append(logp)
         ent_list.append(ent)
         val_list.append(v)
         rew_list.append(torch.tensor(_to_f(rew, 0.0), dtype=torch.float32, device=device))
@@ -374,12 +470,18 @@ def rollout(env, policy, cfg, steps, gamma, lam, device,
     val  = _sanitize_tensor(val,  0.0).float()
 
     adv, ret = compute_gae(rews, val, dones, gamma, lam)
+
+    # ★ 진단치: 에포크 내 평균 부족률
+    la_sf_mean = (la_sf_sum / max(la_sf_cnt, 1)) if la_sf_cnt > 0 else 0.0
+
     return {
         "obs": obs_t,
         "q": torch.stack(act_q), "w": torch.stack(act_w),
         "logp": logp, "ent": ent, "val": val,
         "adv": adv.detach(), "ret": ret.detach(),
         "stage_L": np.asarray(stage_L_list, dtype=np.float64),
+        # ★ 손실회피 평균 부족률(진단)
+        "la_sf_mean": float(la_sf_mean),
     }
 
 
@@ -405,16 +507,29 @@ def evaluate_mean_policy(make_env_fn, policy: PolicyNet, cfg, n_paths=300, devic
     Ws = np.asarray(Ws, dtype=np.float64)
     EW = float(np.mean(Ws)) if Ws.size > 0 else 0.0
 
-    F_t = float(getattr(cfg, "F_target", 1.0) or 1.0)
-    L = np.maximum(F_t - Ws, 0.0)
-    k = max(1, int(0.05 * max(0, L.size)))
-    if k > 0 and L.size >= k:
-        tail_idx = np.argsort(L)[-k:]
-        ES95_loss = float(np.mean(L[tail_idx]))
+    # ES95 계산 단위 선택: wealth vs utility(있을 때)
+    F_t = _infer_F_target(cfg)
+    unit = str(getattr(cfg, "cvar_unit", "wealth")).lower()
+    if unit == "utility" and _HAS_UTILITY_LOSS:
+        L_u = terminal_loss_utility(Ws, F_t, cfg)  # κ, u_scale 내부 반영 가정
+        L_u = np.asarray(L_u, dtype=float)
+        k = max(1, int(0.05 * max(0, L_u.size)))
+        if k > 0 and L_u.size >= k:
+            tail_idx = np.argsort(L_u)[-k:]
+            ES95 = float(np.mean(L_u[tail_idx]))
+        else:
+            ES95 = float(np.mean(L_u)) if L_u.size > 0 else 0.0
     else:
-        ES95_loss = float(np.mean(L)) if L.size > 0 else 0.0
+        L = np.maximum(F_t - Ws, 0.0)
+        k = max(1, int(0.05 * max(0, L.size)))
+        if k > 0 and L.size >= k:
+            tail_idx = np.argsort(L)[-k:]
+            ES95 = float(np.mean(L[tail_idx]))
+        else:
+            ES95 = float(np.mean(L)) if L.size > 0 else 0.0
+
     Ruin = float(np.mean(Ws <= 0.0)) if Ws.size > 0 else 0.0
-    return {"EW": EW, "ES95": ES95_loss, "Ruin": Ruin, "mean_WT": EW, "eval_WT": Ws.tolist()}
+    return {"EW": EW, "ES95": ES95, "Ruin": Ruin, "mean_WT": EW, "eval_WT": Ws.tolist()}
 
 
 # ─────────────────────────────────────────────────────────
@@ -505,10 +620,12 @@ def replay_tail_paths(make_env_fn, policy: PolicyNet, cfg, outputs, k=8, device=
 def append_metrics_csv(outputs_dir: str, fields: Dict[str, Any]):
     out_logs = Path(outputs_dir) / "_logs"; out_logs.mkdir(parents=True, exist_ok=True)
     dest = out_logs / "metrics.csv"; write_header = (not dest.exists())
+    # 헤더 고정성 보장을 위해 fieldnames를 명시적으로 정렬
     safe = {k: v for k, v in fields.items()
             if isinstance(v, (int, float, str, bool)) or v is None}
+    fieldnames = list(safe.keys())
     with dest.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=safe.keys())
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             w.writeheader()
         w.writerow(safe)
@@ -579,7 +696,12 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
     # CVaR dual (terminal)
     cvar = DualCVaR(alpha=float(getattr(cfg, "alpha", 0.95) or 0.95), eta_init=0.0, tau=0.3)
     lambda_term = float(getattr(cfg, "lambda_term", 0.0) or 0.0)
-    F_target    = float(getattr(cfg, "F_target", 1.0) or 1.0)
+    F_target    = _infer_F_target(cfg)
+
+    # κ 설정 (종단 CVaR에도 반영)
+    kappa = float(getattr(cfg, "bias_loss_aversion", 0.0) or 0.0)
+    bias_on = str(getattr(cfg, "bias_on", "off")).lower() == "on"
+    la_active = bias_on and (kappa > 0.0)
 
     def cvar_hook(info: Dict[str, Any]) -> float:
         if lambda_term == 0.0:
@@ -587,10 +709,17 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         W_T = info.get("W_T", None)
         if W_T is None:
             return 0.0
-        L = max(F_target - float(W_T), 0.0)
-        return - lambda_term * cvar.terminal_penalty(L)
+        unit = str(getattr(cfg, "cvar_unit", "wealth")).lower()
+        if unit == "utility" and _HAS_UTILITY_LOSS:
+            L_val = float(np.asarray(terminal_loss_utility(np.array([float(W_T)], dtype=float), F_target, cfg), dtype=float)[0])
+            lambda_eff = float(lambda_term)  # 효용 모드에선 내부에서 κ/u_scale 반영 가정
+        else:
+            L_val = max(F_target - float(W_T), 0.0)
+            # ★ 핵심: wealth 단위 CVaR에는 κ를 가중치로 반영
+            lambda_eff = float(lambda_term) * (max(1.0, kappa) if la_active else 1.0)
+        return - lambda_eff * cvar.terminal_penalty(L_val)
 
-    # Stage-wise CVaR (consumption) — cli의 --cvar_stage on/off 와 호환
+    # Stage-wise CVaR (consumption)
     stage_flag = (str(getattr(cfg, "cvar_stage", "off")).lower() == "on") or bool(getattr(cfg, "cvar_stage_on", False))
     stage_cvar = DualCVaRStage(alpha=float(getattr(cfg, "alpha_stage", 0.95) or 0.95), eta_init=0.0, tau=0.3) if stage_flag else None
     cstar_mode = str(getattr(cfg, "cstar_mode", "annuity") or "annuity").lower()
@@ -610,11 +739,18 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
 
     train_t0 = time.perf_counter()
     best_epoch = None
+    last_la_sf_mean = 0.0  # 마지막 에포크 진단치 (CSV/반환용)
+
     for epoch in range(int(rl_epochs)):
         eps = teacher_eps0 * (teacher_decay ** epoch)
-        batch = rollout(_make_env_local(), policy, cfg, int(steps_per_epoch), float(gamma), float(gae_lambda),
-                        device, cvar_hook, lw_scale, survive_bonus, eps,
-                        stage_cvar=stage_cvar, cstar_mode=cstar_mode)
+        batch = rollout(
+            _make_env_local(), policy, cfg,
+            int(steps_per_epoch), float(gamma), float(gae_lambda),
+            device, cvar_hook, lw_scale, survive_bonus, eps,
+            stage_cvar=stage_cvar, cstar_mode=cstar_mode
+        )
+        # 최신 진단치 보관
+        last_la_sf_mean = float(batch.get("la_sf_mean", 0.0) or 0.0)
 
         # normalize adv
         adv = (batch["adv"] - batch["adv"].mean()) / (batch["adv"].std() + 1e-8)
@@ -644,8 +780,14 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
                 W_T = float(env.W)
             Ws_tmp.append(float(_to_f(W_T, 0.0))); env.close()
         if lambda_term > 0.0 and len(Ws_tmp) > 0:
-            Ls = np.maximum(F_target - np.asarray(Ws_tmp, dtype=np.float64), 0.0)
-            cvar.update_eta_with_batch(Ls)
+            unit = str(getattr(cfg, "cvar_unit", "wealth")).lower()
+            if unit == "utility" and _HAS_UTILITY_LOSS:
+                Ls_u = terminal_loss_utility(np.asarray(Ws_tmp, dtype=float), F_target, cfg)
+                Ls_u = np.asarray(Ls_u, dtype=float)
+                cvar.update_eta_with_batch(Ls_u)
+            else:
+                Ls = np.maximum(F_target - np.asarray(Ws_tmp, dtype=np.float64), 0.0)
+                cvar.update_eta_with_batch(Ls)
 
         # stage-wise CVaR eta update
         if stage_cvar is not None:
@@ -716,9 +858,19 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
 
     # trainer-local CSV (best-effort)
     ts = time.strftime("%y%m%dT%H%M%S")
+
+    # CSV 필드 구성(필요한 진단/파라미터를 넓게 남긴다)
+    cstar_mode_csv = str(getattr(cfg, "cstar_mode", "annuity") or "annuity")
+    try:
+        cstar_m_csv = float(getattr(cfg, "cstar_m", 0.04/12) or 0.04/12)
+    except Exception:
+        cstar_m_csv = 0.04/12
+    rl_q_cap_csv = float(getattr(cfg, "rl_q_cap", 0.0) or 0.0)
+
     fields_csv = dict(
         ts=ts, asset=getattr(cfg, "asset", "US"), method="rl", baseline="",
-        es_mode="loss", F_target=F_target, w_max=getattr(cfg, "w_max", 1.0),
+        es_mode=str(getattr(cfg, "cvar_unit", "wealth")).lower(),  # wealth / utility
+        F_target=F_target, w_max=getattr(cfg, "w_max", 1.0),
         hedge_on=getattr(cfg, "hedge_on", False), hedge_mode=getattr(cfg, "hedge_mode", ""),
         hedge_sigma_k=getattr(cfg, "hedge_sigma_k", 0.0), lambda_term=lambda_term,
         fee_annual=getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", 0.0)),
@@ -731,6 +883,14 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         mortality_on=getattr(cfg, "mortality_on", False),
         market_mode=getattr(cfg, "market_mode", "iid"),
         cvar_stage_on=stage_flag,
+        bias_on=str(getattr(cfg, "bias_on", "off")),
+        bias_loss_aversion=getattr(cfg, "bias_loss_aversion", 0.0),
+        # ★ 핵심 진단치
+        la_sf_mean=float(last_la_sf_mean),
+        # ★ 참고 파라미터 추가 기록
+        cstar_mode=cstar_mode_csv,
+        cstar_m=cstar_m_csv,
+        rl_q_cap=rl_q_cap_csv,
     )
     append_metrics_csv(outputs, fields_csv)
 
@@ -747,4 +907,6 @@ def train_rl(cfg, seed_list, outputs, n_paths_eval=300, rl_epochs=60, steps_per_
         "actor": actor,
         "ckpt_path": ckpt_path,
         "eval_WT": metrics_mp.get("eval_WT"),
+        # ★ 반환에도 포함 (runner/cli가 metrics로 승격할 수 있게)
+        "la_sf_mean": float(last_la_sf_mean),
     }

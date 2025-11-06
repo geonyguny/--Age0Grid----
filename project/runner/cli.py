@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse, json, os, re, time, sys, io, contextlib
+from types import SimpleNamespace
 from typing import Any, Dict, List, Callable
 
 from ..config import (
@@ -163,7 +164,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n_paths", type=int, default=100)
     # ES mode
     p.add_argument("--es_mode", default="wealth", choices=["wealth","loss"],
-                   help="ES95 convention; 'loss' uses L=max(F−W,0) reporting")
+                   help="'loss' uses L=max(F−W,0) reporting")
+    # ★ 추가: CVaR/종단손실 단위(wealth|utility)
+    p.add_argument(
+        "--cvar_unit",
+        choices=["wealth", "utility"],
+        default="wealth",
+        help="CVaR 및 종단 손실의 측정 단위: wealth(금액) 또는 utility(효용)."
+    )
     p.add_argument("--outputs", default="./outputs")
     # HJB
     p.add_argument("--hjb_W_grid", type=int)
@@ -177,9 +185,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hedge_cost", type=float, default=0.005)
     p.add_argument("--hedge_sigma_k", type=float, default=0.20)
     p.add_argument("--hedge_tx", type=float, default=0.0)
-    # Ambiguity (Hansen–Sargent θ) — 모델 미결합이어도 기록/로깅용으로 받음
+    # Ambiguity (Hansen–Sargent θ)
     p.add_argument("--theta_ambiguity", type=float, default=None,
-                   help="Hansen–Sargent ambiguity parameter θ (meta/metrics에 기록; 모델 연결 전이라도 사용 가능)")
+                   help="Record θ in meta/metrics (even if model not wired yet)")
     # Market
     p.add_argument("--market_mode", choices=["iid","bootstrap"], default="iid")
     p.add_argument("--market_csv")
@@ -339,6 +347,8 @@ def _inject_meta(out: Dict[str,Any], args) -> None:
     meta.setdefault("method", getattr(args,"method",None))
     meta.setdefault("asset", getattr(args,"asset",None))
     meta.setdefault("outputs_abs", getattr(args,"outputs",None))
+    # ★ meta에 cvar_unit 기록
+    meta.setdefault("cvar_unit", str(getattr(args, "cvar_unit", "wealth")).lower())
     try:
         if parse_behavioral_from_args and _bh_describe:
             _spec = parse_behavioral_from_args(args)
@@ -445,28 +455,32 @@ def _diversify_eval_WT_if_needed(args, out: Dict[str, Any]) -> None:
 def _run_core(args)->Dict[str,Any]|Any:
     want_paths = not getattr(args, "no_paths", False)
     route = _route_mode(args)
+    # NOTE: args는 SimpleNamespace/argparse.Namespace 모두 속성 접근 가능
+    cfg = args  # rl/hjb/rule 엔진에서 그대로 attr 접근
     if route=="calib":
-        out = calibrate_lambda(args)
+        out = calibrate_lambda(cfg)
         if isinstance(out,dict) and "es_mode" not in out:
-            out["es_mode"] = str(getattr(args,"es_mode","wealth")).lower()
+            out["es_mode"] = str(getattr(cfg,"es_mode","wealth")).lower()
     elif route=="rl":
-        out = run_rl(args)
+        out = run_rl(cfg)
     else:
-        res = run_once(args)
-        out = maybe_evaluate_with_es_mode(res, es_mode=getattr(args,"es_mode","wealth"), want_paths=want_paths)
+        res = run_once(cfg)
+        out = maybe_evaluate_with_es_mode(res, es_mode=getattr(cfg,"es_mode","wealth"), want_paths=want_paths)
     if isinstance(out,dict):
-        out.setdefault("tag", getattr(args,"tag",None))
-        out.setdefault("method", getattr(args,"method",None))
-        out.setdefault("asset", getattr(args,"asset",None))
-        out.setdefault("outputs_abs", getattr(args,"outputs",None))
-        _inject_meta(out,args)
+        out.setdefault("tag", getattr(cfg,"tag",None))
+        out.setdefault("method", getattr(cfg,"method",None))
+        out.setdefault("asset", getattr(cfg,"asset",None))
+        out.setdefault("outputs_abs", getattr(cfg,"outputs",None))
+        # 상위에도 cvar_unit 남겨두면 로그 탐색 시 편함
+        out.setdefault("cvar_unit", str(getattr(cfg, "cvar_unit", "wealth")).lower())
+        _inject_meta(out,cfg)
         # θ ambiguity를 metrics에도 기록(컬럼 생성 목적)
-        ta = getattr(args, "theta_ambiguity", None)
+        ta = getattr(cfg, "theta_ambiguity", None)
         if ta is not None:
             out.setdefault("metrics", {}).setdefault("theta_ambiguity", float(ta))
     try:
         if isinstance(out,dict):
-            out = fixup_metrics_with_cvar(args,out)
+            out = fixup_metrics_with_cvar(cfg,out)
     except Exception as _e:
         try:
             if isinstance(out,dict):
@@ -475,7 +489,7 @@ def _run_core(args)->Dict[str,Any]|Any:
         except Exception: pass
 
     if isinstance(out, dict):
-        _recompute_es_if_needed(args, out)
+        _recompute_es_if_needed(cfg, out)
         _ensure_basic_metrics_for_print(out)  # ← EW 보장
         # 상위 EW 보장
         try:
@@ -487,14 +501,14 @@ def _run_core(args)->Dict[str,Any]|Any:
         try:
             if isinstance(out.get("extra"), dict):
                 arr = out["extra"].get("eval_WT")
-                npv = int(getattr(args, "n_paths", 0) or 0)
+                npv = int(getattr(cfg, "n_paths", 0) or 0)
                 if isinstance(arr, list) and npv > 0 and len(arr) > npv:
                     out["extra"]["eval_WT"] = arr[:npv]
                     out["extra"]["eval_WT_n"] = npv
         except Exception:
             pass
         # ★ diversity guard 호출
-        _diversify_eval_WT_if_needed(args, out)
+        _diversify_eval_WT_if_needed(cfg, out)
 
     try:
         if isinstance(out,dict) and isinstance(out.get("extra"),dict):
@@ -505,7 +519,9 @@ def _run_core(args)->Dict[str,Any]|Any:
     return out
 
 def _prepare_args(args: argparse.Namespace) -> argparse.Namespace:
+    # 출력 경로 정규화
     args.outputs = _normalize_outputs_path(getattr(args,"outputs",None))
+    # seed 단일화
     try:
         if getattr(args,"seed",None) is not None:
             args.seeds = [int(args.seed)]
@@ -513,16 +529,39 @@ def _prepare_args(args: argparse.Namespace) -> argparse.Namespace:
             args.seeds = _normalize_seeds(list(getattr(args,"seeds",[])))
     except Exception:
         args.seeds = [0]
+    # HJB grid 파싱
     parsed_w_grid = _csv_floats(getattr(args,"hjb_w_grid",None))
     if parsed_w_grid is not None: args.hjb_w_grid = parsed_w_grid
+    # FX hedge alias
     if getattr(args,"h_FX",None) is None and getattr(args,"h_fx",None) is not None:
         args.h_FX = args.h_fx
+    # bootstrap block 파싱
     try:
         args.bootstrap_block = _parse_block(getattr(args,"bootstrap_block",None))
     except argparse.ArgumentTypeError as e:
         raise SystemExit(f"--bootstrap_block 오류: {e}")
+
+    # ★★★★★ 중요: RL/HJB/Rule 보상/제약에서 참조할 월 기준소비율을 명시적으로 넘겨준다.
+    # rollout/reward는 cfg.monthly['p_m']를 찾아 쓰도록 되어 있으므로,
+    # CLI의 cstar_m(기본 0.04/12)을 monthly.p_m로 매핑한다.
+    try:
+        p_m = float(getattr(args, "cstar_m", 0.04/12))
+    except Exception:
+        p_m = 0.04/12
+    setattr(args, "monthly", {"p_m": p_m})
+
+    # 데이터 프로파일 기본값/CSV 경로
     _apply_data_profile_defaults(args)
+    # 유효성 검사
     _validate_args(args)
+
+    # 일관 스위치/단위 정리(소문자)
+    for _nm in ("bias_on","cvar_stage","xai_on","quiet","verbose","ann_on","hedge","mortality","report_utility"):
+        v = getattr(args, _nm, None)
+        if isinstance(v, str): setattr(args, _nm, v.lower())
+
+    # cfg로 사용 가능한 SimpleNamespace 복사본을 만들어도 되지만,
+    # 현재 엔진(run_once/run_rl)이 argparse.Namespace를 그대로 attr로 읽으므로 그대로 반환
     return args
 
 # ── tests 용 programmatic entrypoints
@@ -688,28 +727,72 @@ def main():
 
     if pmode == "metrics" and isinstance(out,dict):
         _ensure_basic_metrics_for_print(out)  # 안전망
-        m = dict(out.get("metrics", {}))
+        m = dict(out.get("metrics", {}) or {})
         keys = [s.strip() for s in str(getattr(args,"metrics_keys","")).split(",") if s.strip()]
+
+        # EW 보장
         ew_fb = (
-            m.get("EW", None) or
-            out.get("EW", None) or
-            m.get("mean_WT", None) or
-            out.get("mean_WT", None) or
-            0.0
+            m.get("EW") or out.get("EW") or
+            m.get("mean_WT") or out.get("mean_WT") or 0.0
         )
         m["EW"] = ew_fb
+
         # θ ambiguity 보강
         ta = getattr(args, "theta_ambiguity", None)
         if ta is not None:
             m.setdefault("theta_ambiguity", float(ta))
-        m_print = {k: m.get(k, None) for k in keys} if keys else m
+        # cvar_unit도 metrics 출력에 보존(가독 목적)
+        m.setdefault("cvar_unit", str(getattr(args, "cvar_unit", "wealth")).lower())
+
+        # ----- 다층 fallback 리졸버 -----
+        meta = out.get("meta") or {}
+        bh_bias = (meta.get("behavioral_bias") or {}) if isinstance(meta, dict) else {}
+
+        def _resolve(k: str):
+            # 1) metrics
+            if k in m and m[k] is not None:
+                return m[k]
+            # 2) 상위 out
+            if k in out and out[k] is not None:
+                return out[k]
+            # 3) meta.behavioral_bias
+            if k in bh_bias and bh_bias[k] is not None:
+                return bh_bias[k]
+            # 4) args (특수 필드 포함)
+            if hasattr(args, k):
+                val = getattr(args, k)
+                if val is not None:
+                    return val
+            # 별칭/특수 처리
+            if k == "cstar_m":
+                monthly = getattr(args, "monthly", None)
+                if isinstance(monthly, dict) and "p_m" in monthly:
+                    return monthly["p_m"]
+                return getattr(args, "cstar_m", None)
+            if k == "rl_q_cap":
+                return getattr(args, "rl_q_cap", None)
+            if k == "bias_on":
+                return getattr(args, "bias_on", None)
+            if k == "bias_loss_aversion":
+                return getattr(args, "bias_loss_aversion", None)
+            if k == "la_sf_mean":
+                # trainer가 top-level로 반환하는 경우 보정
+                return out.get("la_sf_mean", None)
+            return None
+        # --------------------------------
+
+        if keys:
+            metrics_out = {k: _resolve(k) for k in keys}
+        else:
+            metrics_out = m
+
         packed = {
             "tag": getattr(args, "tag", None),
             "asset": getattr(args, "asset", None),
             "method": getattr(args, "method", None),
             "n_paths": getattr(args, "n_paths", None),
             "EW": ew_fb,
-            **m_print,
+            **metrics_out,
         }
         _safe_print_json(packed)
         return
@@ -732,6 +815,10 @@ def main():
         ta = getattr(args, "theta_ambiguity", None)
         if ta is not None:
             (to_print.setdefault("metrics", {}))["theta_ambiguity"] = float(ta)
+        # full에도 cvar_unit 살려둠
+        (to_print.setdefault("metrics", {})).setdefault(
+            "cvar_unit", str(getattr(args, "cvar_unit", "wealth")).lower()
+        )
     _safe_print_json(to_print)
 
 if __name__ == "__main__":
