@@ -140,81 +140,94 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Retirement experiment runner (JSON-only stdout).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # High-level
-    p.add_argument("--mode", default="auto", choices=["auto","once","rl","calib"])
-    # Core
-    p.add_argument("--asset", default="KR")
-    p.add_argument("--method", default="hjb", choices=["hjb","rl","rule"])
-    p.add_argument("--baseline")
-    p.add_argument("--w_max", type=float, default=0.70)
-    p.add_argument("--fee_annual", type=float, default=0.004)
-    p.add_argument("--phi_adval", type=float, help="optional: ad-valorem fee (if set, replaces fee_annual)")
-    p.add_argument("--horizon_years", type=int, default=35)
-    p.add_argument("--alpha", type=float, default=0.95)
-    p.add_argument("--lambda_term", type=float, default=0.0)
-    p.add_argument("--F_target", type=float, default=0.0)
-    p.add_argument("--p_annual", type=float, default=0.04)
-    p.add_argument("--g_real_annual", type=float, default=0.02)
-    p.add_argument("--w_fixed", type=float, default=0.60)
-    p.add_argument("--floor_on", action="store_true")
-    p.add_argument("--f_min_real", type=float, default=0.0)
-    # Seeds/paths
-    p.add_argument("--seeds", type=int, nargs="+", default=[0,1,2,3,4])
-    p.add_argument("--seed", type=int, help="single seed (overrides --seeds)")
-    p.add_argument("--n_paths", type=int, default=100)
-    # ES mode
-    p.add_argument("--es_mode", default="wealth", choices=["wealth","loss"],
-                   help="'loss' uses L=max(F−W,0) reporting")
-    # ★ 추가: CVaR/종단손실 단위(wealth|utility)
-    p.add_argument(
-        "--cvar_unit",
-        choices=["wealth", "utility"],
-        default="wealth",
-        help="CVaR 및 종단 손실의 측정 단위: wealth(금액) 또는 utility(효용)."
-    )
-    p.add_argument("--outputs", default="./outputs")
-    # HJB
-    p.add_argument("--hjb_W_grid", type=int)
-    p.add_argument("--hjb_Nshock", type=int)
-    p.add_argument("--hjb_eta_n", type=int)
-    p.add_argument("--hjb_w_grid", help="comma-separated risky weight grid for HJB")
-    p.add_argument("--w_min_dev", type=float, help="dev: drop HJB actions with w< w_min_dev")
-    # Legacy hedge
-    p.add_argument("--hedge", choices=["on","off"], default="off")
-    p.add_argument("--hedge_mode", choices=["mu","sigma","downside"], default="sigma")
+
+    # ---------------- High-level ----------------
+    p.add_argument("--mode", default="auto", choices=["auto", "once", "rl", "calib"],
+                   help="실행 모드(배치/단발/강화학습/캘리브레이션)")
+    p.add_argument("--method", default="hjb", choices=["hjb", "rl", "rule"],
+                   help="해결 방법: HJB / RL / 규칙 기반")
+    p.add_argument("--tag", help="실험 식별용 태그(로그/출력 구분)")
+
+    # ---------------- Core ----------------
+    p.add_argument("--asset", default="KR", help="자산 국가/세트 코드")
+    p.add_argument("--baseline", help="비교 기준 정책 태그")
+    p.add_argument("--w_max", type=float, default=0.70, help="위험자산 최대 비중(limit)")
+    p.add_argument("--fee_annual", type=float, default=0.004, help="연간 총보수(비설정 시)")
+    p.add_argument("--phi_adval", type=float,
+                   help="ad-valorem fee(설정 시 fee_annual 대체)")
+    p.add_argument("--horizon_years", type=int, default=35, help="은퇴 후 시뮬레이션 연한")
+    p.add_argument("--alpha", type=float, default=0.95, help="CVaR 신뢰수준 α")
+    p.add_argument("--lambda_term", type=float, default=0.0, help="CVaR 라그랑주 승수(고정)")
+    p.add_argument("--F_target", type=float, default=0.0, help="최저소비(또는 바닥) 목표")
+    p.add_argument("--p_annual", type=float, default=0.04, help="초기 인출률(연율)")
+    p.add_argument("--g_real_annual", type=float, default=0.02, help="실질 인출 증가율")
+    p.add_argument("--w_fixed", type=float, default=0.60, help="고정 위험비중(룰베이스용)")
+    p.add_argument("--floor_on", action="store_true", help="소비 바닥 제약 사용 여부")
+    p.add_argument("--f_min_real", type=float, default=0.0, help="실질 소비 최저선")
+
+    # ---------------- Seeds/paths ----------------
+    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4],
+                   help="복수 시드(배치)")
+    p.add_argument("--seed", type=int, help="단일 시드(--seeds 무시)")
+    p.add_argument("--n_paths", type=int, default=100, help="시뮬레이션 경로 수")
+
+    # ---------------- ES/CVaR reporting ----------------
+    p.add_argument("--es_mode", default="wealth", choices=["wealth", "loss"],
+                   help="'loss'는 L=max(F−W,0) 기준 보고")
+    p.add_argument("--cvar_unit", choices=["wealth", "utility"], default="wealth",
+                   help="CVaR/종단 손실의 단위: 금액(wealth) 또는 효용(utility)")
+
+    p.add_argument("--outputs", default="./outputs", help="출력 루트 디렉터리")
+
+    # ---------------- HJB ----------------
+    p.add_argument("--hjb_W_grid", type=int, help="HJB 자산 격자 크기")
+    p.add_argument("--hjb_Nshock", type=int, help="HJB 쇼크(근사) 개수")
+    p.add_argument("--hjb_eta_n", type=int, help="HJB 적분 노드 개수")
+    p.add_argument("--hjb_w_grid", help="HJB 위험비중 격자(쉼표구분)")
+    p.add_argument("--w_min_dev", type=float, help="dev: w < w_min_dev 액션 제거")
+
+    # ---------------- Legacy hedge ----------------
+    p.add_argument("--hedge", choices=["on", "off"], default="off", help="헤지 레이어 on/off")
+    p.add_argument("--hedge_mode", choices=["mu", "sigma", "downside"], default="sigma")
     p.add_argument("--hedge_cost", type=float, default=0.005)
     p.add_argument("--hedge_sigma_k", type=float, default=0.20)
     p.add_argument("--hedge_tx", type=float, default=0.0)
-    # Ambiguity (Hansen–Sargent θ)
+
+    # ---------------- Ambiguity (Hansen–Sargent θ) ----------------
     p.add_argument("--theta_ambiguity", type=float, default=None,
-                   help="Record θ in meta/metrics (even if model not wired yet)")
-    # Market
-    p.add_argument("--market_mode", choices=["iid","bootstrap"], default="iid")
-    p.add_argument("--market_csv")
+                   help="모형 기록용 θ(미결선일 수 있음)")
+
+    # ---------------- Market ----------------
+    p.add_argument("--market_mode", choices=["iid", "bootstrap"], default="iid")
+    p.add_argument("--market_csv", help="시장 경로 CSV(선택)")
     p.add_argument("--bootstrap_block", default="24",
-                   help="block length: '6m','12','90d','2y'")
-    p.add_argument("--use_real_rf", choices=["on","off"], default="on")
-    # Mortality
-    p.add_argument("--mortality", choices=["on","off"], default="off")
-    p.add_argument("--mort_table")
+                   help="부트스트랩 블록 길이 예: '6m','12','90d','2y'")
+    p.add_argument("--use_real_rf", choices=["on", "off"], default="on")
+
+    # ---------------- Mortality ----------------
+    p.add_argument("--mortality", choices=["on", "off"], default="off")
+    p.add_argument("--mort_table", help="사망표 경로/키")
     p.add_argument("--age0", type=int, default=65)
-    p.add_argument("--sex", choices=["M","F"], default="M")
+    p.add_argument("--sex", choices=["M", "F"], default="M")
     p.add_argument("--bequest_kappa", type=float, default=0.0)
     p.add_argument("--bequest_gamma", type=float, default=1.0)
-    # CVaR Calibration
-    p.add_argument("--calib", choices=["on","off"], default="off")
-    p.add_argument("--calib_param", choices=["lambda","F"], default="lambda")
+
+    # ---------------- CVaR Calibration ----------------
+    p.add_argument("--calib", choices=["on", "off"], default="off")
+    p.add_argument("--calib_param", choices=["lambda", "F"], default="lambda")
     p.add_argument("--cvar_target", type=float, default=CVAR_TARGET_DEFAULT)
     p.add_argument("--cvar_tol", type=float, default=CVAR_TOL_DEFAULT)
     p.add_argument("--lambda_min", type=float, default=LAMBDA_MIN_DEFAULT)
     p.add_argument("--lambda_max", type=float, default=LAMBDA_MAX_DEFAULT)
-    p.add_argument("--calib_fast", choices=["on","off"], default="on")
+    p.add_argument("--calib_fast", choices=["on", "off"], default="on")
     p.add_argument("--calib_max_iter", type=int, default=8)
     p.add_argument("--F_min", type=float)
     p.add_argument("--F_max", type=float)
-    # autosave
-    p.add_argument("--autosave", choices=["on","off"], default="off")
-    # RL
+
+    # ---------------- Autosave ----------------
+    p.add_argument("--autosave", choices=["on", "off"], default="off")
+
+    # ---------------- RL core ----------------
     p.add_argument("--rl_epochs", type=int, default=60)
     p.add_argument("--rl_steps_per_epoch", type=int, default=2048)
     p.add_argument("--rl_n_paths_eval", type=int, default=300)
@@ -223,73 +236,94 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--value_coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--max_grad_norm", type=float, default=0.5)
-    p.add_argument("--rl_q_cap", type=float, default=0.0)
+    p.add_argument("--rl_q_cap", type=float, default=0.0,
+                   help="정책의 분기별 최댓값(소비/인출 상한 등)")
     p.add_argument("--teacher_eps0", type=float, default=0.0)
     p.add_argument("--teacher_decay", type=float, default=1.0)
     p.add_argument("--lw_scale", type=float, default=0.0)
     p.add_argument("--survive_bonus", type=float, default=0.0)
     p.add_argument("--crra_gamma", type=float, default=3.0)
     p.add_argument("--u_scale", type=float, default=0.0)
-    # Lite / Utility
-    p.add_argument("--q_floor", type=float)
-    p.add_argument("--beta", type=float, help="utility present-bias; 0<beta<=1")
-    p.add_argument("--report_utility", choices=["on","off"], default="off")
+
+    # ---------------- Lite / Utility overlay ----------------
+    p.add_argument("--q_floor", type=float, help="행동/소비 floor의 보조 파라미터")
+    p.add_argument("--beta", type=float, help="효용 present-bias; 0<beta<=1")
+    p.add_argument("--report_utility", choices=["on", "off"], default="off")
     p.add_argument("--delta_annual", type=float)
-    # Stage-wise CVaR
-    p.add_argument("--cvar_stage", choices=["on","off"], default="off")
+
+    # ---------------- Stage-wise CVaR & c* design ----------------
+    p.add_argument("--cvar_stage", choices=["on", "off"], default="off")
     p.add_argument("--alpha_stage", type=float, default=0.95)
     p.add_argument("--lambda_stage", type=float, default=0.0)
-    p.add_argument("--cstar_mode", choices=["fixed","annuity","vpw"], default="annuity")
-    p.add_argument("--cstar_m", type=float, default=0.04/12)
-    # XAI
-    p.add_argument("--xai_on", choices=["on","off"], default="on")
-    # Verbose/Quiet
-    p.add_argument("--quiet", choices=["on","off"], default="on")
-    p.add_argument("--verbose", choices=["on","off"], default="off")
-    # ANN overlay
-    p.add_argument("--ann_on", choices=["on","off"], default="off")
+    p.add_argument("--cstar_mode", choices=["fixed", "annuity", "vpw"], default="annuity",
+                   help="소비 규칙: 고정/연금계수/가변인출(VPW)")
+    p.add_argument("--cstar_m", type=float, default=0.04/12, help="c* 스케일(월기준)")
+
+    # ---------------- XAI / Verbosity ----------------
+    p.add_argument("--xai_on", choices=["on", "off"], default="on")
+    p.add_argument("--quiet", choices=["on", "off"], default="on")
+    p.add_argument("--verbose", choices=["on", "off"], default="off")
+
+    # ---------------- ANN overlay ----------------
+    p.add_argument("--ann_on", choices=["on", "off"], default="off")
     p.add_argument("--ann_alpha", type=float, default=0.0)
     p.add_argument("--ann_L", type=float, default=0.0)
     p.add_argument("--ann_d", type=int, default=0)
-    p.add_argument("--ann_index", choices=["real","nominal"], default="real")
-    # Data/profile/tag
-    p.add_argument("--bands", choices=["on","off"], default="on")
+    p.add_argument("--ann_index", choices=["real", "nominal"], default="real")
+
+    # ---------------- Data/profile ----------------
+    p.add_argument("--bands", choices=["on", "off"], default="on")
     p.add_argument("--data_window")
-    p.add_argument("--data_profile", choices=["dev","full"])
-    p.add_argument("--tag")
-    # Allocation & FX hedge
-    p.add_argument("--alpha_mix")
+    p.add_argument("--data_profile", choices=["dev", "full"])
+    p.add_argument("--outputs_root", help="(선택) 루트 오버라이드")
+
+    # ---------------- Allocation & FX hedge ----------------
+    p.add_argument("--alpha_mix", help="자산 혼합 벡터 문자열")
     p.add_argument("--alpha_kr", type=float)
     p.add_argument("--alpha_us", type=float)
     p.add_argument("--alpha_au", type=float)
-    p.add_argument("--h_FX", type=float)
+    p.add_argument("--h_FX", type=float, help="FX 헤지 비율")
     p.add_argument("--h_fx", type=float, help="alias for --h_FX")
     p.add_argument("--fx_hedge_cost", type=float)
-    # Action-layer bias
-    p.add_argument("--bh_on", choices=["on","off"], default="off")
-    p.add_argument("--la_k", type=float, default=1.0)
-    p.add_argument("--habit_phi", type=float, default=0.0)
-    p.add_argument("--bias_on", choices=["on","off"], default="off")
-    p.add_argument("--bias_loss_aversion", type=float, default=0.0)
-    p.add_argument("--bias_prob_gamma", type=float, default=1.0)
-    p.add_argument("--bias_myopia", type=float, default=0.0)
-    p.add_argument("--bias_w_floor", type=float, default=0.0)
-    p.add_argument("--bias_w_cap_shock", type=float, default=0.0)
-    # stdout control
-    p.add_argument("--print_mode", choices=["full","metrics","summary"], default="full")
-    p.add_argument("--metrics_keys", default=DEFAULT_METRICS_KEYS)
-    p.add_argument("--no_paths", action="store_true")
-    p.add_argument("--validate", choices=["on","off"], default="off")
-    p.add_argument("--return_actor", choices=["on","off"], default="off")
-    # ETA
-    p.add_argument("--eta_mode", choices=["off","history"], default="history")
-    p.add_argument("--eta_budget_hms")
-    p.add_argument("--eta_budget_s", type=float)
-    p.add_argument("--eta_hard_stop", choices=["on","off"], default="on")
-    p.add_argument("--eta_db")
-    # Eval-time randomness
-    p.add_argument("--eval_seed_jitter", choices=["on","off"], default="off")
+
+    # ---------------- Action-layer bias / Behavioral ----------------
+    p.add_argument("--bh_on", choices=["on", "off"], default="off",
+                   help="행동편향 레이어 on/off (정책행동단)")
+    p.add_argument("--bias_on", choices=["on", "off"], default="off",
+                   help="편향 파라미터를 활성화하고 학습/평가에 반영")
+    p.add_argument("--la_k", type=float, default=0.0, help="손실회피 κ (0이면 사용 안함)")
+    p.add_argument("--habit_phi", type=float, default=0.0, help="습관/스무딩 계수")
+    p.add_argument("--bias_loss_aversion", type=float, default=0.0,
+                   help="추가적 손실가중(필요 시)")
+    p.add_argument("--bias_prob_gamma", type=float, default=0.0,
+                   help="Prelec 가중 γ (0이면 사용 안함; 예: 0.70)")
+    p.add_argument("--bias_myopia", type=float, default=0.0,
+                   help="현재편향 강도(예: 0.92, 0.90, 0.85)")
+    p.add_argument("--bias_w_floor", type=float, default=0.0, help="소비 바닥")
+    p.add_argument("--bias_w_cap_shock", type=float, default=0.0, help="소비 캡 쇼크")
+
+    # ---------------- stdout / logging ----------------
+    p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",
+                   help="표준출력 요약 레벨")
+    p.add_argument("--metrics_keys", default=DEFAULT_METRICS_KEYS,
+                   help="metrics.csv에 반드시 기록할 키 목록(쉼표구분)")
+    p.add_argument("--no_paths", action="store_true", help="경로 데이터 출력 생략")
+    p.add_argument("--validate", choices=["on", "off"], default="off")
+    p.add_argument("--return_actor", choices=["on", "off"], default="off")
+
+    # ---------------- ETA ----------------
+    p.add_argument("--eta_mode", choices=["off", "history"], default="history")
+    p.add_argument("--eta_budget_hms", help="예상 소요시간 힌트(HH:MM:SS)")
+    p.add_argument("--eta_budget_s", type=float, help="예상 소요시간 힌트(초)")
+    p.add_argument("--eta_hard_stop", choices=["on", "off"], default="on")
+    p.add_argument("--eta_db", help="ETA 히스토리 DB 경로")
+
+    # ---------------- Eval-time randomness ----------------
+    p.add_argument("--eval_seed_jitter", choices=["on", "off"], default="off",
+                   help="평가 시드에 작은 변동 추가")
+
     return p
+
 
 def _apply_data_profile_defaults(args) -> None:
     # bootstrap인데 아무 경로/프로파일도 없으면 dev로 암묵 기본값
