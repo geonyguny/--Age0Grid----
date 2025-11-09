@@ -141,10 +141,16 @@ class RetirementEnv:
         self.floor_on = str(self._get(cfg, kwargs, "floor_on", "off") or "off").lower() == "on"
         self.f_min_real = _safe_float(self._get(cfg, kwargs, "f_min_real", 0.0), 0.0)
 
-        self.fee_annual = _safe_float(
-            self._get(cfg, kwargs, "phi_adval", self._get(cfg, kwargs, "fee_annual", 0.004)), 0.004
-        )
-        self.fee_m = self.fee_annual / self.steps_per_year
+        # ---- 수수료 체계: 연 펀드보수(지속) / annuity 프런트로딩 분리
+        self.fee_annual  = _safe_float(self._get(cfg, kwargs, "fee_annual", 0.004), 0.004)
+        self.fee_m       = self.fee_annual / self.steps_per_year
+        self.phi_adval   = _safe_float(self._get(cfg, kwargs, "phi_adval", 0.0), 0.0)  # annuity front-load(%) 입력용
+
+        # “연금 전환 후 펀드보수 0” 정책 스위치(기본 on)
+        self.ann_zero_fee_after_purchase = str(
+            self._get(cfg, kwargs, "ann_zero_fee_after_purchase", "on") or "on"
+        ).lower() == "on"
+
         self.survive_bonus = _safe_float(self._get(cfg, kwargs, "survive_bonus", 0.0), 0.0)
         self.u_scale = _safe_float(self._get(cfg, kwargs, "u_scale", 0.05), 0.05)
         self.gamma   = _safe_float(self._get(cfg, kwargs, "crra_gamma", 3.0), 3.0)
@@ -189,7 +195,7 @@ class RetirementEnv:
         self.hedge_tx_annual = _safe_float(self._get(cfg, kwargs, "hedge_tx", 0.0), 0.0)
         self.hedge_tx_m = self.hedge_tx_annual / self.steps_per_year
 
-        # --- mortality / rf (정책에서 읽음) ---
+        # --- mortality / rf ---
         self.life_table: Optional[pd.DataFrame] = None
         self.mort_table_df: Optional[pd.DataFrame] = None
         self.r_f_real_annual: Optional[float] = None
@@ -239,10 +245,30 @@ class RetirementEnv:
         """cfg 설정에 따라 생명표/실질 rf 로드."""
         mortality_on = bool(str(self._get(cfg, kwargs, "mortality", "off")).lower() == "on")
         if mortality_on:
-            path = self._get(cfg, kwargs, "mort_table", None)
-            if isinstance(path, str) and os.path.exists(path):
+            mt = self._get(cfg, kwargs, "mort_table", None)
+
+            # 1) 문자열 토큰(BASE/COHORT/COHORT_YYYY) 직접 인식
+            if isinstance(mt, str) and mt and mt.strip().lower().startswith(("base", "cohort")):
                 try:
-                    df = pd.read_csv(path)
+                    from ..annuity.mortality_gm import load_life_table  # type: ignore
+                    lt = load_life_table(
+                        str(mt),
+                        sex=str(self._get(cfg, kwargs, "sex", "M") or "M").upper(),
+                        age0=int(self._get(cfg, kwargs, "age0", 65)),
+                        horizon_years=int(self._get(cfg, kwargs, "horizon_years", 35)),
+                        steps_per_year=int(self._get(cfg, kwargs, "steps_per_year", 12)),
+                        annual_improvement=_safe_float(self._get(cfg, kwargs, "mort_imp", 0.01), 0.01),
+                    )
+                    self.life_table = lt.copy()
+                    self.mort_table_df = lt.copy()
+                    print(f"[env:mort] life_table token='{mt}' loaded: rows={len(lt)}")
+                except Exception as e:
+                    print(f"[env:mort] token load failed({mt}): {e}")
+
+            # 2) 파일 경로(csv)도 허용 (기존 호환)
+            elif isinstance(mt, str) and os.path.exists(mt):
+                try:
+                    df = pd.read_csv(mt)
                     has_age = "age" in df.columns
                     has_px  = any(c in df.columns for c in ["px", "Px"])
                     has_qx  = "qx" in df.columns
@@ -268,7 +294,7 @@ class RetirementEnv:
                     self.mort_table_df = lt
                     print(f"[env:mort] life_table loaded: rows={len(lt)}, cols={list(lt.columns)}")
                 except Exception as e:
-                    print(f"[env:mort] failed to load/parse mort_table: {e}")
+                    print(f"[env:mort] failed to load/parse mort_table file: {e}")
 
         rf_from_cfg = self._get(cfg, kwargs, "r_f_real_annual", None)
         self.r_f_real_annual = _safe_float(rf_from_cfg if (rf_from_cfg:=rf_from_cfg) is not None else 0.02, 0.02)
@@ -311,18 +337,26 @@ class RetirementEnv:
         except Exception:
             return
         try:
-            cfg = AnnuityConfig(on=True, alpha=self.ann_alpha, L=self.ann_L, d=self.ann_d, index=self.ann_index)
-            # r_f_real_annual이 있으면 전달 (함수 시그니처가 허용하면)
+            # Config: 프런트로딩(phi_adval) 및 지수방식(index) 전달
+            cfg = AnnuityConfig(
+                on=True,
+                alpha=self.ann_alpha,
+                L=self.ann_L,
+                d=self.ann_d,
+                index=self.ann_index,
+                phi_adval=self.phi_adval,                  # ← front-load (% of purchase)
+                first_payment_immediate=True,
+            )
+            # 실질 무위험 연율 전달(시그니처 지원 시)
             try:
                 W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table, self.r_f_real_annual)  # type: ignore[misc]
             except TypeError:
-                # 구버전 시그니처 호환
                 W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table)  # type: ignore[misc]
 
-            self.W = float(W_after)
-            self.y_ann = float(getattr(st, "y_ann", 0.0))
+            self.W = float(W_after)                 # 즉시 매입비용/로딩 차감 후 남은 금융자산
+            self.y_ann = float(getattr(st, "y_ann", 0.0))   # 월 연금소득
             self.ann_purchased = bool(getattr(st, "purchased", True))
-            self.ann_P = float(getattr(st, "P", 0.0))
+            self.ann_P = float(getattr(st, "P", 0.0))       # 월 지급액(명목/실질 기준)
             self.ann_a_factor = float(getattr(st, "a_factor", 0.0))
         except Exception:
             pass  # 실패 시 조용히 무시
@@ -364,7 +398,7 @@ class RetirementEnv:
         if self.market_mode == "bootstrap":
             self.path_risky, self.path_safe, self.path_cpi = self._bootstrap_path(self.T, self.rng)
         else:
-            # IID 파라메트릭 (cfg의 mu/sigma/r_safe 반영)
+            # IID 파라미트릭 (cfg의 mu/sigma/r_safe 반영)
             self.path_risky = self.rng.normal(self.mu_risky, self.sigma_risky, size=self.T)
             self.path_safe  = np.full(self.T, self.r_safe_fix)
             self.path_cpi   = np.zeros(self.T, dtype=float)
@@ -493,9 +527,15 @@ class RetirementEnv:
         W_before_fee = _safe_float(W_after_c * gross, W_after_c)
 
         # 4) fee (월차감, **기준=W_after_c**) -------------------------------
-        # 테스트 허용식: after_c*(1-fee_m) 또는 after_c*(1-((1+fee_annual)**(1/12)-1))
-        fee_m = _safe_float(getattr(self, "fee_m", 0.0), 0.0)
-        fee   = _safe_float(fee_m * W_after_c, 0.0)  # ← 기준 변경 (W_start → W_after_c)
+        #  - ann_zero_fee_after_purchase == True 이고 ann_purchased면 수수료 0
+        #  - 그렇지 않으면 기본 fee_m 적용
+        fee_m_base = _safe_float(getattr(self, "fee_m", 0.0), 0.0)
+        if self.ann_zero_fee_after_purchase and bool(getattr(self, "ann_purchased", False)):
+            fee_m_eff = 0.0
+        else:
+            fee_m_eff = fee_m_base
+
+        fee = _safe_float(fee_m_eff * W_after_c, 0.0)
         self.W = max(_safe_float(W_before_fee - fee, 0.0), 0.0)
 
         # ----- 효용 및 보상 (효용-레이어 행동편향 반영) -----
@@ -559,7 +599,8 @@ class RetirementEnv:
             "hedge_mode": str(getattr(self, "hedge_mode", "sigma")).lower(),
             "hedge_active": bool(hedge_active),
             "hedge_k": float(getattr(self, "hedge_sigma_k", 0.0)),
-            "fee_m": float(fee_m),
+            "fee_m_base": float(fee_m_base),
+            "fee_m_eff": float(fee_m_eff),
             "fee": float(fee),
             "cpi_yoy": float(_safe_float(self.cpi_yoy, 0.0)),
             "is_new_year": bool(self.is_new_year),

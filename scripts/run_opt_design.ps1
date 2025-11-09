@@ -1,12 +1,14 @@
-﻿<# ======================================================================= 
- run_opt_design.ps1  (PS5-safe, 2025-11-08, refactored)
+﻿<# =======================================================================
+ run_opt_design.ps1  (PS5-safe, 2025-11-09, refactored full)
  - 1D/2D sweeps -> snapshot -> scoring -> tables
  - Always --mode rl (even in Smoke; reduce epochs/paths only)
  - bias: always pass --bias_prob_gamma (>0), control with --bias_on
  - Flag-guards via SupportsFlag()
- - Per-run logs: outputs\_logs\<tag>.log (Start-Process redirection)
- - No inline 'if' inside array literals (PS 5.1 safe)
- - NEW: DEV_scored_clean.csv 자동 생성(빈 tag 제거)
+ - Per-run logs: outputs\_logs\<tag>.log (single redirection)
+ - DEV_scored_clean.csv 자동 생성(빈 tag 제거)
+ - FX hedge 자동 감지(--h_fx/--h_FX/--fx_hedge_ratio, --hedge/--fx_hedge_on, --fx_hedge_cost/--hedge_cost)
+ - FX 플래그 없으면 레거시 헤지로 안전 대체(--hedge on/off, hedge_mode, hedge_sigma_k 스윕)
+ - PS5.1 안전 패턴: 조건식의 -and/-or 우변에 함수 호출 금지(사전 변수 캐싱)
 ======================================================================= #>
 
 [CmdletBinding()]
@@ -29,7 +31,7 @@ param(
 
   [ValidateSet('KR','US','GLD','EQUAL3')] [string[]]$AssetMixes = @('EQUAL3','KR','US','GLD'),
   [ValidateSet('M','F')]  [string[]]$Sexes   = @('M','F'),
-  [ValidateSet('BASE','COHORT')] [string[]]$MortCfg = @('BASE','COHORT'),
+  [ValidateSet('BASE','COHORT')] [string[]]$MortCfg = @('BASE'),
 
   # Behavior / Bias
   [ValidateSet('off','on')] [string]$Bias = 'off',
@@ -38,7 +40,13 @@ param(
   # Smoke (preflight) — still rl; just smaller epochs/paths
   [switch]$Smoke,
   [int]$SmokePaths = 64,
-  [int]$SmokeEpochs = 1
+  [int]$SmokeEpochs = 1,
+
+  # ===== 레거시 헤지 기본 파라미터(대체 경로용) =====
+  [ValidateSet('sigma','mu','downside')] [string]$LegacyHedgeMode = 'sigma',
+  [double[]]$LegacyHedgeSigmas = @(0.10, 0.15, 0.20, 0.25),
+  [double]$LegacyHedgeCost = 0.005,
+  [double]$LegacyHedgeTx   = 0.000
 )
 
 # ---------- Paths ----------
@@ -67,27 +75,33 @@ function Get-SeedArgs([string]$SeedsCsv) {
 
 # Preload cli help once (for flag detection)
 $global:CLI_HELP = (& .\.venv\Scripts\python.exe -m project.runner.cli -h 2>&1 | Out-String)
-function SupportsFlag([string]$flag) { return $global:CLI_HELP -match ("--" + [regex]::Escape($flag) + "(\s|$|=)") }
+function SupportsFlag([string]$flag) {
+  $pattern = ("--" + [regex]::Escape($flag) + "(\s|$|=)")
+  return ($global:CLI_HELP -match $pattern)
+}
 
-# Asset mix → args (prefer alpha_kr/us/au; fallback alpha_mix; else skip)
+# Asset mix → args (prefer alpha_kr/us/au; fallback alpha_mix)
 function Build-MixArgs([string]$mix) {
   $a = @{}
-  if (SupportsFlag('alpha_kr') -and SupportsFlag('alpha_us') -and SupportsFlag('alpha_au')) {
+  $hasKR = SupportsFlag('alpha_kr')
+  $hasUS = SupportsFlag('alpha_us')
+  $hasAU = SupportsFlag('alpha_au')
+  $hasMix = SupportsFlag('alpha_mix')
+
+  if ($hasKR -and $hasUS -and $hasAU) {
     switch ($mix) {
       'EQUAL3' { $a['--alpha_kr']='0.3333'; $a['--alpha_us']='0.3333'; $a['--alpha_au']='0.3333' }
       'KR'     { $a['--alpha_kr']='1.0';    $a['--alpha_us']='0.0';    $a['--alpha_au']='0.0' }
       'US'     { $a['--alpha_kr']='0.0';    $a['--alpha_us']='1.0';    $a['--alpha_au']='0.0' }
       'GLD'    { $a['--alpha_kr']='0.0';    $a['--alpha_us']='0.0';    $a['--alpha_au']='1.0' }
     }
-  } elseif (SupportsFlag('alpha_mix')) {
+  } elseif ($hasMix) {
     switch ($mix) {
       'EQUAL3' { $a['--alpha_mix']='kr:0.3333,us:0.3333,au:0.3333' }
       'KR'     { $a['--alpha_mix']='kr:1.0,us:0.0,au:0.0' }
       'US'     { $a['--alpha_mix']='kr:0.0,us:1.0,au:0.0' }
       'GLD'    { $a['--alpha_mix']='kr:0.0,us:0.0,au:1.0' }
     }
-  } else {
-    Write-Warning "[mix] cli.py has no alpha_* or alpha_mix flags; skipping mix '$mix'."
   }
   return $a
 }
@@ -97,6 +111,32 @@ $MortMap = @{
   'BASE'   = @('--mortality','on','--mort_table','base')
   'COHORT' = @('--mortality','on','--mort_table','cohort_2020')
 }
+
+# ---------- FX Hedge flags (robust detection) ----------
+function Get-FxFlags {
+  $has_h_fx            = SupportsFlag('h_fx')
+  $has_h_FX            = SupportsFlag('h_FX')
+  $has_fx_hedge_ratio  = SupportsFlag('fx_hedge_ratio')
+
+  $ratio = $null
+  if     ($has_h_fx)           { $ratio = '--h_fx' }
+  elseif ($has_h_FX)           { $ratio = '--h_FX' }
+  elseif ($has_fx_hedge_ratio) { $ratio = '--fx_hedge_ratio' }
+
+  $has_hedge       = SupportsFlag('hedge')
+  $has_fx_hedge_on = SupportsFlag('fx_hedge_on')
+
+  $onoff = $null
+  if     ($has_hedge)       { $onoff = '--hedge' }
+  elseif ($has_fx_hedge_on) { $onoff = '--fx_hedge_on' }
+
+  $cost = $null
+  if     (SupportsFlag('fx_hedge_cost')) { $cost = '--fx_hedge_cost' }
+  elseif (SupportsFlag('hedge_cost'))    { $cost = '--hedge_cost' }
+
+  return @{ ratio = $ratio; onoff = $onoff; cost = $cost }
+}
+$FxFlags = Get-FxFlags
 
 # ---------- Base args builder (ALWAYS mode rl) ----------
 function New-BaseArgs {
@@ -119,16 +159,23 @@ function New-BaseArgs {
   # seeds
   $args += (Get-SeedArgs -SeedsCsv $Seeds)
 
-  # bias: always pass gamma to suppress engine warning; toggle with bias_on
-  if (SupportsFlag('bias_prob_gamma')) { $args += @('--bias_prob_gamma', ('{0:F3}' -f $BiasProbGamma)) }
-  if (SupportsFlag('bias_on'))         { $args += @('--bias_on', $(if ($Bias -eq 'on') {'on'} else {'off'})) }
+  # bias: always pass gamma; toggle ON/OFF with --bias_on
+  $has_bias_prob_gamma = SupportsFlag('bias_prob_gamma')
+  $has_bias_on         = SupportsFlag('bias_on')
+  if ($has_bias_prob_gamma) { $args += @('--bias_prob_gamma', ('{0:F3}' -f $BiasProbGamma)) }
+  if ($has_bias_on)         { $args += @('--bias_on', $(if ($Bias -eq 'on') {'on'} else {'off'})) }
 
   # Smoke: reduce workload (still rl)
+  $has_rl_epochs          = SupportsFlag('rl_epochs')
+  $has_rl_steps_per_epoch = SupportsFlag('rl_steps_per_epoch')
+  $has_n_paths            = SupportsFlag('n_paths')
+  $has_quiet              = SupportsFlag('quiet')
+
   if ($Smoke) {
-    if (SupportsFlag('rl_epochs'))          { $args += @('--rl_epochs', "$SmokeEpochs") }
-    if (SupportsFlag('rl_steps_per_epoch')) { $args += @('--rl_steps_per_epoch','128') }
-    if (SupportsFlag('n_paths'))            { $args += @('--n_paths', "$SmokePaths") }
-    if (SupportsFlag('quiet'))              { $args += @('--quiet','on') }
+    if ($has_rl_epochs)          { $args += @('--rl_epochs', "$SmokeEpochs") }
+    if ($has_rl_steps_per_epoch) { $args += @('--rl_steps_per_epoch','128') }
+    if ($has_n_paths)            { $args += @('--n_paths', "$SmokePaths") }
+    if ($has_quiet)              { $args += @('--quiet','on') }
   }
 
   foreach ($k in $MortArgs.Keys) { $args += @($k, $MortArgs[$k]) }
@@ -151,7 +198,6 @@ function Invoke-CLI {
   $log = Join-Path $Logs ("{0}.log" -f ($Tag -replace '[^\w\-\.]','_'))
   Write-Host "[RUN] $Tag  -> $log" -ForegroundColor Cyan
 
-  # PS5.1-safe: 단일 리디렉션(*>)로 모든 스트림을 파일에 합쳐 저장
   & ".\.venv\Scripts\python.exe" @args *> $log
   $ec = $LASTEXITCODE
   if ($ec -ne 0) { Add-Content -Path $log -Value "[ERR] exit=$ec  tag=$Tag" -Encoding utf8 }
@@ -185,21 +231,43 @@ if ($Smoke) {
   Write-Host "`n[STAGE 0] Smoke preflight" -ForegroundColor Green
   $fail = 0
   foreach ($sex in @('M')) {
-    $mortArgs = @{}; $m = $MortMap['BASE']; for ($i=0;$i -lt $m.Count;$i+=2) { $mortArgs[$m[$i]] = $m[$i+1] }
+    $m = $MortMap['BASE']
+    $mortArgs = @{}
+    for ($i=0;$i -lt $m.Count;$i+=2) { $mortArgs[$m[$i]] = $m[$i+1] }
 
-    # ann_alpha (ann_on only if supported)
+    # ann_alpha
+    $has_ann_on = SupportsFlag('ann_on')
     $extra1 = @{'--ann_alpha'='0.10'}
-    if (SupportsFlag('ann_on')) { $extra1['--ann_on'] = 'on' }
+    if ($has_ann_on) { $extra1['--ann_on'] = 'on' }
     $fail += (Invoke-CLI -Tag 'SMOKE_ann_0.1'   -Sex $sex -MortArgs $mortArgs -Extra $extra1)
 
     # wrisk via w_max proxy
     $fail += (Invoke-CLI -Tag 'SMOKE_wrisk_0.3' -Sex $sex -MortArgs $mortArgs -Extra @{ '--w_max'='0.30' })
 
-    # hedge (guard flags)
+    # hedge: FX 우선, 없으면 레거시 on/off 테스트
     $extra2 = @{}
-    if (SupportsFlag('h_fx'))  { $extra2['--h_fx'] = '0.50' }
-    if (SupportsFlag('hedge')) { $extra2['--hedge'] = 'on' }
-    if ($extra2.Count -eq 0) { $fail += 1 } else { $fail += (Invoke-CLI -Tag 'SMOKE_hedge_0.5' -Sex $sex -MortArgs $mortArgs -Extra $extra2) }
+    if ($FxFlags.ratio) { $extra2[$FxFlags.ratio] = '0.50' }
+    if ($FxFlags.onoff) { $extra2[$FxFlags.onoff] = 'on' }
+
+    if ($extra2.Count -gt 0) {
+      $fail += (Invoke-CLI -Tag 'SMOKE_hedge_0.5' -Sex $sex -MortArgs $mortArgs -Extra $extra2)
+    } else {
+      $has_legacy_hedge = SupportsFlag('hedge')
+      if ($has_legacy_hedge) {
+        $has_hedge_cost    = SupportsFlag('hedge_cost')
+        $has_hedge_tx      = SupportsFlag('hedge_tx')
+        $has_hedge_sigma_k = SupportsFlag('hedge_sigma_k')
+        foreach ($on in @('off','on')) {
+          $x = @{ '--hedge'=$on; '--hedge_mode'=$LegacyHedgeMode }
+          if ($has_hedge_cost)    { $x['--hedge_cost'] = ('{0:F3}' -f $LegacyHedgeCost) }
+          if ($has_hedge_tx)      { $x['--hedge_tx']   = ('{0:F3}' -f $LegacyHedgeTx) }
+          if ( ($on -eq 'on') -and $has_hedge_sigma_k) { $x['--hedge_sigma_k']='0.20' }
+          $fail += (Invoke-CLI -Tag ("SMOKE_legacy_hedge_{0}" -f $on) -Sex $sex -MortArgs $mortArgs -Extra $x)
+        }
+      } else {
+        Write-Host "[SMOKE] Skip hedge check: no FX/legacy flags found." -ForegroundColor Yellow
+      }
+    }
 
     # mix
     $mixArgs = Build-MixArgs 'EQUAL3'
@@ -219,44 +287,74 @@ if ($Smoke) {
 Write-Host "`n[STAGE 1] 1D sweeps" -ForegroundColor Green
 foreach ($sex in $Sexes) {
   foreach ($mort in $MortCfg) {
-    $mortArgs = @{}; $m = $MortMap[$mort]; for ($i=0;$i -lt $m.Count;$i+=2) { $mortArgs[$m[$i]] = $m[$i+1] }
+    $m = $MortMap[$mort]
+    $mortArgs = @{}
+    for ($i=0;$i -lt $m.Count;$i+=2) { $mortArgs[$m[$i]] = $m[$i+1] }
 
+    $has_ann_on = SupportsFlag('ann_on')
     foreach ($a in $AnnAlphaGrid) {
       $tag = Make-Tag $mort 'DEV1D_ann' $sex
       $extra = @{ '--ann_alpha' = ('{0:F2}' -f $a) }
-      if (SupportsFlag('ann_on')) { $extra['--ann_on'] = $(if ($a -gt 0) {'on'} else {'off'}) }
+      if ($has_ann_on) { $extra['--ann_on'] = $(if ($a -gt 0) {'on'} else {'off'}) }
       Invoke-CLI -Tag ("${tag}_{0:F1}" -f $a) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
     }
+
     foreach ($w in $RiskShareGrid) {
       $tag = Make-Tag $mort 'DEV1D_wrisk' $sex
       Invoke-CLI -Tag ("${tag}_{0:F1}" -f $w) -Sex $sex -MortArgs $mortArgs -Extra @{ '--w_max' = ('{0:F2}' -f $w) } | Out-Null
     }
+
     foreach ($fee in $FeeGrid) {
       $tag = Make-Tag $mort 'DEV1D_fee' $sex
       Invoke-CLI -Tag ("${tag}_{0:F4}" -f $fee) -Sex $sex -MortArgs $mortArgs -Extra @{ '--fee_annual' = ('{0:F4}' -f $fee) } | Out-Null
     }
+
     foreach ($age0 in $Age0Grid) {
       $tag = Make-Tag $mort 'DEV1D_age' $sex
       Invoke-CLI -Tag ("${tag}_${age0}") -Sex $sex -MortArgs $mortArgs -Extra @{ '--age0' = "$age0" } | Out-Null
     }
-    foreach ($hz in $HedgeGrid) {
-      $tag = Make-Tag $mort 'DEV1D_hedge' $sex
-      $extra = @{}
-      if (SupportsFlag('h_fx'))  { $extra['--h_fx'] = ('{0:F2}' -f $hz) }
-      if (SupportsFlag('hedge')) { $extra['--hedge'] = $(if ($hz -gt 0){'on'} else {'off'}) }
-      if ($extra.Count -gt 0) {
+
+    # --- Hedge 1D: FX 있으면 비율 스윕, 없으면 레거시 on/off ---
+    $hasFX     = ($FxFlags.ratio -ne $null)
+    $hasLegacy = SupportsFlag('hedge')
+
+    if ($hasFX) {
+      foreach ($hz in $HedgeGrid) {
+        $tag = Make-Tag $mort 'DEV1D_hedge' $sex
+        $extra = @{}
+        $extra[$FxFlags.ratio] = ('{0:F2}' -f $hz)
+        if ($FxFlags.onoff) { $extra[$FxFlags.onoff] = $(if ($hz -gt 0){'on'} else {'off'}) }
+        if ($FxFlags.cost -and $hz -gt 0) { $extra[$FxFlags.cost] = '0.000' }
         Invoke-CLI -Tag ("${tag}_{0:F2}" -f $hz) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
+    } elseif ($hasLegacy) {
+      $has_hedge_cost    = SupportsFlag('hedge_cost')
+      $has_hedge_tx      = SupportsFlag('hedge_tx')
+      $has_hedge_sigma_k = SupportsFlag('hedge_sigma_k')
+      foreach ($on in @('off','on')) {
+        $tag = Make-Tag $mort 'DEV1D_hedge' $sex
+        $x = @{ '--hedge'=$on; '--hedge_mode'=$LegacyHedgeMode }
+        if ($has_hedge_cost)    { $x['--hedge_cost'] = ('{0:F3}' -f $LegacyHedgeCost) }
+        if ($has_hedge_tx)      { $x['--hedge_tx']   = ('{0:F3}' -f $LegacyHedgeTx) }
+        if ( ($on -eq 'on') -and $has_hedge_sigma_k) { $x['--hedge_sigma_k'] = ('{0:F2}' -f $LegacyHedgeSigmas[0]) }
+        Invoke-CLI -Tag ("${tag}_LEGACY_{0}" -f $on) -Sex $sex -MortArgs $mortArgs -Extra $x | Out-Null
+      }
+    } else {
+      Write-Warning "[hedge] No FX nor legacy hedge flags; skipping hedge 1D."
     }
+
+    $has_cstar_mode = SupportsFlag('cstar_mode')
+    $has_cstar_m    = SupportsFlag('cstar_m')
     foreach ($vpw in $VPWGrid) {
       $tag = Make-Tag $mort 'DEV1D_vpw' $sex
       $extra = @{}
-      if (SupportsFlag('cstar_mode')) { $extra['--cstar_mode'] = 'vpw' }
-      if (SupportsFlag('cstar_m'))    { $extra['--cstar_m']    = ('{0:F3}' -f $vpw) }
+      if ($has_cstar_mode) { $extra['--cstar_mode'] = 'vpw' }
+      if ($has_cstar_m)    { $extra['--cstar_m']    = ('{0:F3}' -f $vpw) }
       if ($extra.Count -gt 0) {
         Invoke-CLI -Tag ("${tag}_{0:F3}" -f $vpw) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
     }
+
     foreach ($mix in $AssetMixes) {
       $tag = Make-Tag $mort ("DEV1D_mix_$mix") $sex
       $extra = Build-MixArgs $mix
@@ -271,31 +369,61 @@ foreach ($sex in $Sexes) {
 Write-Host "`n[STAGE 2] 2D sweeps" -ForegroundColor Green
 foreach ($sex in $Sexes) {
   foreach ($mort in $MortCfg) {
-    $mortArgs = @{}; $m = $MortMap[$mort]; for ($i=0;$i -lt $m.Count;$i+=2) { $mortArgs[$m[$i]] = $m[$i+1] }
+    $m = $MortMap[$mort]
+    $mortArgs = @{}
+    for ($i=0;$i -lt $m.Count;$i+=2) { $mortArgs[$m[$i]] = $m[$i+1] }
 
+    $has_ann_on = SupportsFlag('ann_on')
     foreach ($a in $AnnAlphaGrid) {
       foreach ($w in $RiskShareGrid) {
         $tag = Make-Tag $mort 'DEV2D_ann_wrisk' $sex
         $extra = @{ '--w_max'=('{0:F2}' -f $w); '--ann_alpha'=('{0:F2}' -f $a) }
-        if (SupportsFlag('ann_on')) { $extra['--ann_on'] = $(if ($a -gt 0) {'on'} else {'off'}) }
+        if ($has_ann_on) { $extra['--ann_on'] = $(if ($a -gt 0) {'on'} else {'off'}) }
         Invoke-CLI -Tag ("${tag}_a{0:F1}_w{1:F1}" -f $a,$w) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
     }
-    foreach ($w in $RiskShareGrid) {
-      foreach ($hz in $HedgeGrid) {
-        $tag = Make-Tag $mort 'DEV2D_wrisk_hedge' $sex
-        $extra = @{ '--w_max'=('{0:F2}' -f $w) }
-        if (SupportsFlag('h_fx'))  { $extra['--h_fx'] = ('{0:F2}' -f $hz) }
-        if (SupportsFlag('hedge')) { $extra['--hedge'] = $(if ($hz -gt 0){'on'} else {'off'}) }
-        Invoke-CLI -Tag ("${tag}_w{0:F1}_h{1:F2}" -f $w,$hz) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
+
+    # --- Hedge 2D: wrisk × (FX ratio or legacy sigma_k) ---
+    $hasFX     = ($FxFlags.ratio -ne $null)
+    $hasLegacy = SupportsFlag('hedge')
+
+    if ($hasFX) {
+      foreach ($w in $RiskShareGrid) {
+        foreach ($hz in $HedgeGrid) {
+          $tag = Make-Tag $mort 'DEV2D_wrisk_hedge' $sex
+          $extra = @{ '--w_max'=('{0:F2}' -f $w) }
+          $extra[$FxFlags.ratio] = ('{0:F2}' -f $hz)
+          if ($FxFlags.onoff) { $extra[$FxFlags.onoff] = $(if ($hz -gt 0){'on'} else {'off'}) }
+          if ($FxFlags.cost -and $hz -gt 0) { $extra[$FxFlags.cost] = '0.000' }
+          Invoke-CLI -Tag ("${tag}_w{0:F1}_h{1:F2}" -f $w,$hz) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
+        }
       }
+    } elseif ($hasLegacy) {
+      $has_hedge_cost    = SupportsFlag('hedge_cost')
+      $has_hedge_tx      = SupportsFlag('hedge_tx')
+      $has_hedge_sigma_k = SupportsFlag('hedge_sigma_k')
+      foreach ($w in $RiskShareGrid) {
+        foreach ($k in $LegacyHedgeSigmas) {
+          $tag = Make-Tag $mort 'DEV2D_wrisk_hedgeSIG' $sex
+          $extra = @{ '--w_max'=('{0:F2}' -f $w); '--hedge'='on'; '--hedge_mode'=$LegacyHedgeMode }
+          if ($has_hedge_cost)    { $extra['--hedge_cost'] = ('{0:F3}' -f $LegacyHedgeCost) }
+          if ($has_hedge_tx)      { $extra['--hedge_tx']   = ('{0:F3}' -f $LegacyHedgeTx) }
+          if ($has_hedge_sigma_k) { $extra['--hedge_sigma_k'] = ('{0:F2}' -f $k) }
+          Invoke-CLI -Tag ("${tag}_w{0:F1}_k{1:F2}" -f $w,$k) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
+        }
+      }
+    } else {
+      Write-Warning "[hedge] No FX nor legacy hedge flags; skipping wrisk×hedge 2D."
     }
+
+    $has_cstar_mode = SupportsFlag('cstar_mode')
+    $has_cstar_m    = SupportsFlag('cstar_m')
     foreach ($w in $RiskShareGrid) {
       foreach ($vpw in $VPWGrid) {
         $tag = Make-Tag $mort 'DEV2D_wrisk_c' $sex
         $extra = @{ '--w_max'=('{0:F2}' -f $w) }
-        if (SupportsFlag('cstar_mode')) { $extra['--cstar_mode'] = 'vpw' }
-        if (SupportsFlag('cstar_m'))    { $extra['--cstar_m']    = ('{0:F3}' -f $vpw) }
+        if ($has_cstar_mode) { $extra['--cstar_mode'] = 'vpw' }
+        if ($has_cstar_m)    { $extra['--cstar_m']    = ('{0:F3}' -f $vpw) }
         Invoke-CLI -Tag ("${tag}_w{0:F1}_c{1:F3}" -f $w,$vpw) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
     }
@@ -324,7 +452,7 @@ if (Test-Path $metricsCsv) {
   --es_mode "wealth" `
   --out (Join-Path $Out 'DEV_scored.csv')
 
-# --- NEW: Clean scored (drop blank tag rows)
+# --- Clean scored (drop blank tag rows)
 Export-CleanScored
 
 $OPT_Sum = Join-Path $Out 'OPT_summary_benefit.csv'
