@@ -141,12 +141,16 @@ class RetirementEnv:
         self.floor_on = str(self._get(cfg, kwargs, "floor_on", "off") or "off").lower() == "on"
         self.f_min_real = _safe_float(self._get(cfg, kwargs, "f_min_real", 0.0), 0.0)
 
-        # ---- 수수료 체계: 연 펀드보수(지속) / annuity 프런트로딩 분리
+        # ---- 수수료 체계: 연 펀드보수(지속) / annuity 프런트로딩(1회) 분리 ----
+        # (A) 포트폴리오 운용보수: 월차감 기준(잔여 금융자산 대상)
         self.fee_annual  = _safe_float(self._get(cfg, kwargs, "fee_annual", 0.004), 0.004)
         self.fee_m       = self.fee_annual / self.steps_per_year
-        self.phi_adval   = _safe_float(self._get(cfg, kwargs, "phi_adval", 0.0), 0.0)  # annuity front-load(%) 입력용
+
+        # (B) 종신연금 프런트 로딩(가입 시 1회): annuity 오버레이에서만 사용
+        self.phi_adval   = _safe_float(self._get(cfg, kwargs, "phi_adval", 0.0), 0.0)
 
         # “연금 전환 후 펀드보수 0” 정책 스위치(기본 on)
+        # → step() 구현에서 annuity 매입 후 잔여 금융자산에 대해서만 보수를 유지/중지할 때 사용
         self.ann_zero_fee_after_purchase = str(
             self._get(cfg, kwargs, "ann_zero_fee_after_purchase", "on") or "on"
         ).lower() == "on"
@@ -325,41 +329,63 @@ class RetirementEnv:
         rf = _safe_float(self.path_safe[self.t], 0.0)
         return rr, rf
 
-    # ----- annuity init at reset -----
+        # ----- annuity init at reset -----
     def _annuity_init_if_any(self):
-        """life table + ann_on=on + ann_alpha>0 → t=0 1회 매입 & y_ann 설정."""
+        """life table + ann_on='on' + ann_alpha>0 → t=0 1회 매입 & y_ann 설정."""
+        # 스위치/파라미터 체크
         if not (self.ann_on == "on" and self.ann_alpha > 0.0):
             return
         if self.life_table is None or len(self.life_table) == 0:
             return
+
         try:
             from ..annuity.overlay import AnnuityConfig, init_annuity  # type: ignore
         except Exception:
+            # annuity 모듈을 불러오지 못하면 조용히 annuity 미사용
             return
+
         try:
-            # Config: 프런트로딩(phi_adval) 및 지수방식(index) 전달
+            # L: 우선 ann_L를 사용하고, 설정이 0이면 phi_adval을 fallback으로 사용
+            raw_L = getattr(self, "ann_L", 0.0)
+            if not np.isfinite(raw_L) or float(raw_L) == 0.0:
+                raw_L = getattr(self, "phi_adval", 0.0)
+            load_L = float(_safe_float(raw_L, 0.0))
+
             cfg = AnnuityConfig(
                 on=True,
-                alpha=self.ann_alpha,
-                L=self.ann_L,
-                d=self.ann_d,
-                index=self.ann_index,
-                phi_adval=self.phi_adval,                  # ← front-load (% of purchase)
-                first_payment_immediate=True,
+                alpha=float(_safe_float(self.ann_alpha, 0.0)),
+                L=load_L,
+                d=int(getattr(self, "ann_d", 0) or 0),
+                index=str(getattr(self, "ann_index", "real") or "real"),
             )
-            # 실질 무위험 연율 전달(시그니처 지원 시)
-            try:
-                W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table, self.r_f_real_annual)  # type: ignore[misc]
-            except TypeError:
-                W_after, st = init_annuity(self.W, cfg, self.age0, self.life_table)  # type: ignore[misc]
 
-            self.W = float(W_after)                 # 즉시 매입비용/로딩 차감 후 남은 금융자산
-            self.y_ann = float(getattr(st, "y_ann", 0.0))   # 월 연금소득
-            self.ann_purchased = bool(getattr(st, "purchased", True))
-            self.ann_P = float(getattr(st, "P", 0.0))       # 월 지급액(명목/실질 기준)
-            self.ann_a_factor = float(getattr(st, "a_factor", 0.0))
-        except Exception:
-            pass  # 실패 시 조용히 무시
+            r_f_real = float(_safe_float(getattr(self, "r_f_real_annual", 0.02), 0.02))
+            steps_per_year = int(getattr(self, "steps_per_year", 12) or 12)
+
+            # overlay.init_annuity 호출
+            W_after, st = init_annuity(
+                W0=float(_safe_float(self.W, self.W0)),
+                cfg=cfg,
+                age0_years=int(self.age0),
+                life_table=self.life_table,
+                r_f_real_annual=r_f_real,
+                S=steps_per_year,
+            )
+
+            # 결과를 env 상태에 반영
+            self.W = float(_safe_float(W_after, 0.0))               # 프리미엄 차감 후 자산
+            self.y_ann = float(_safe_float(getattr(st, "y_ann", 0.0), 0.0))  # 스텝당 연금소득
+            self.ann_purchased = bool(getattr(st, "purchased", False))
+            self.ann_P = float(_safe_float(getattr(st, "P", 0.0), 0.0))       # 납입 프리미엄
+            self.ann_a_factor = float(_safe_float(getattr(st, "a_factor", 0.0), 0.0))
+
+        except Exception as e:
+            # 문제 발생 시 디버그용 로그만 남기고, annuity는 미적용 상태로 유지
+            print(f"[env:annuity] init failed: {e}")
+            self.y_ann = 0.0
+            self.ann_purchased = False
+            self.ann_P = 0.0
+            self.ann_a_factor = 0.0
 
     # ----- API -----
     def reset(self, W0: Optional[float] = None, seed: Optional[int] = None):

@@ -12,7 +12,10 @@ DEF_WEIGHTS = "0.6,0.4"          # 각 지표 가중치(합=1 권장)
 # 낮을수록 좋은 지표(위험/손실 계열). 여기 있으면 정규화 후 '반대로' 매핑(=낮을수록 1에 가깝게)
 LOWER_IS_BETTER_DEFAULT = ["ES95", "Ruin", "RuinPct", "VaR", "DD", "MDD"]
 
-_TAG_PAT = re.compile(r".*?_2D_us(?P<u>[0-9.]+)_h(?P<h>[0-9.]+)")
+# 예: DEV2D_wrisk_hedge_BASE_M_w0.5_h0.20, DEV1D_ann_BASE_M_0.0
+_PAT_ID = re.compile(r"(?i)[_\-](?P<mort>BASE|COHORT)(?:[_\-])(?P<sex>M|F)(?:[_\-]|$)")
+# 예: ..._2D_us0.6_h0.25  (기존 좌표 보강)
+_TAG_PAT_US_H = re.compile(r".*?_2D_us(?P<u>[0-9.]+)_h(?P<h>[0-9.]+)")
 
 # ─────────────────────────────────────────────────────────
 # 파서 & 유틸
@@ -87,7 +90,7 @@ def _infer_xy_from_tag(df: pd.DataFrame) -> pd.DataFrame:
     if "tag" not in df.columns:
         return df
     def _one(tag: str):
-        m = _TAG_PAT.match(str(tag))
+        m = _TAG_PAT_US_H.match(str(tag))
         if not m:
             return {}
         try:
@@ -103,10 +106,55 @@ def _infer_xy_from_tag(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = extra[c]
     return df
 
+def _infer_identity_from_tag(df: pd.DataFrame) -> pd.DataFrame:
+    """tag에서 mort_id/sex 추론 → mort_id, sex, mort_table 보강(없을 때만)."""
+    if "tag" not in df.columns:
+        # 최소 열 생성
+        for c in ("sex", "mort_id", "mort_table"):
+            if c not in df.columns:
+                df[c] = ""
+        return df
+
+    def _one(tag: str):
+        m = _PAT_ID.search(str(tag))
+        if not m:
+            return {}
+        mort = m.group("mort").upper()
+        sex  = m.group("sex").upper()
+        mort_table = "cohort_2020" if mort == "COHORT" else "base"
+        return {"mort_id": mort, "sex": sex, "mort_table": mort_table}
+
+    extra = pd.DataFrame(list(df["tag"].map(_one)))
+    for c in ("sex", "mort_id", "mort_table"):
+        if c not in df.columns and c in extra.columns:
+            df[c] = extra[c]
+
+    # 타입/정규화
+    if "sex" in df.columns:
+        df["sex"] = df["sex"].astype(str).str.upper()
+        df.loc[~df["sex"].isin(["M","F"]), "sex"] = ""
+    if "mort_id" in df.columns:
+        df["mort_id"] = df["mort_id"].astype(str).str.upper()
+        df.loc[~df["mort_id"].isin(["BASE","COHORT"]), "mort_id"] = ""
+    if "mort_table" in df.columns:
+        df["mort_table"] = df["mort_table"].astype(str).str.lower()
+        # mort_id와 일치하도록 보정(정보 상충 시 tag기반 mort_id 우선)
+        mask = df["mort_table"].isna() | (df["mort_table"].eq(""))
+        if "mort_id" in df.columns:
+            df.loc[mask & df["mort_id"].eq("BASE"), "mort_table"] = "base"
+            df.loc[mask & df["mort_id"].eq("COHORT"), "mort_table"] = "cohort_2020"
+
+    # 누락 열 보장
+    for c in ("sex", "mort_id", "mort_table"):
+        if c not in df.columns:
+            df[c] = ""
+    return df
+
 def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """수치 캐스팅 + 필수 컬럼 보강 + tag로부터 좌표 추론."""
+    """수치 캐스팅 + 필수 컬럼 보강 + tag로부터 좌표/신원 추론."""
     d = df.copy()
     d = _infer_xy_from_tag(d)
+    d = _infer_identity_from_tag(d)
 
     # 기본 수치형 캐스팅
     for c in ("EW", "ES95", "Ruin", "RuinPct", "mix_us", "hedge_sigma_k", "CompositeScore"):
@@ -120,13 +168,15 @@ def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     elif "RuinPct" in d.columns and "Ruin" not in d.columns:
         d["Ruin"] = pd.to_numeric(d["RuinPct"], errors="coerce") / 100.0
 
-    # 필수 컬럼 기본값
-    if "method" not in d.columns:
-        d["method"] = ""
-    if "es_mode" not in d.columns:
-        d["es_mode"] = ""
-    if "seed" not in d.columns:
-        d["seed"] = np.nan
+    # 필수 텍스트/메타 컬럼 기본값
+    for c in ("method", "es_mode", "seed"):
+        if c not in d.columns:
+            d[c] = "" if c != "seed" else np.nan
+
+    # 분석 편의를 위한 메타 열(없으면 생성만)
+    for c in ("market_mode", "use_real_rf"):
+        if c not in d.columns:
+            d[c] = ""
 
     return d
 
@@ -184,6 +234,9 @@ def main():
 
     df = pd.read_csv(src)
 
+    # 스키마/신원 필드 보강(먼저 실행해 열을 확보)
+    df = _ensure_schema(df)
+
     # 계산 대상 인덱스만 분리(나머지는 그대로 유지)
     idx = filter_scope(df, args.tag_startswith, args.method, args.es_mode)
 
@@ -206,9 +259,6 @@ def main():
 
     if args.round is not None and "CompositeScore" in df.columns:
         df["CompositeScore"] = pd.to_numeric(df["CompositeScore"], errors="coerce").round(args.round)
-
-    # ── 저장 전: 스키마 표준화 ─────────────────────────────
-    df = _ensure_schema(df)
 
     # 저장 경로
     if args.out == "inplace":

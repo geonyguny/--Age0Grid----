@@ -285,6 +285,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--h_FX", type=float, help="FX 헤지 비율")
     p.add_argument("--h_fx", type=float, help="alias for --h_FX")
     p.add_argument("--fx_hedge_cost", type=float)
+    # ★ 추가 (별칭 보강)
+    p.add_argument("--fx_hedge_ratio", type=float, dest="h_FX", help="alias for --h_FX (FX hedge ratio)")
+    p.add_argument("--fx_hedge_on", action="store_const", const="on", dest="hedge", help="alias: turn hedge on")
+    p.add_argument("--fx_hedge_off", action="store_const", const="off", dest="hedge", help="alias: turn hedge off")
 
     # ---------------- Action-layer bias / Behavioral ----------------
     p.add_argument("--bh_on", choices=["on", "off"], default="off",

@@ -212,6 +212,22 @@ python -m pytest -q
 .\.venv\Scripts\python.exe
 import os; os.system('cls')
 
+# ANN 현실화 비교(메인 취합용)
+- 환경: full / bootstrap / seed=7 / n_paths=1000 / rl(epochs=1, steps=256), bias_off
+- 케이스:
+  1) ANN_FAIR_FULL         = 공정가(무로딩, BASE, 실질)
+  2) ANN_REAL_FULL         = 로딩 3% + 코호트표(cohort_2020, 실질)
+  3) ANN_REAL_NOM_FULL     = 로딩 3% + 코호트표(명목연금, 명목RF)
+- 핵심지표: EW, ES95, RuinPct(=0), mean_WT
 
-# 밤샘 대량 : run_all.ps1 heatmap, oat, snapshot
-powershell -ExecutionPolicy Bypass -File .\scripts\run_all.ps1 -Mode overnight
+## 결과 요약
+- FAIR > REAL(실질) > REAL(명목)의 순서로 EW·ES95 하락.
+- 로딩/코호트 반영 시 동일 ann 비중 대비 평균부·하방가드 약화 → **최적 ann 비중이 낮아지는 방향**.
+- 명목형은 초기 캐시플로우가 커 보여도, 인플레 누적 시 위험지표가 상대적으로 악화.
+
+## 재현성
+- 공통 인자: --method rl --mode rl --rl_epochs 1 --rl_steps_per_epoch 256 --n_paths 1000 --seed 7 --eval_seed_jitter off --print_mode summary
+- 옵션:
+  - 공정가: --mortality on --mort_table BASE --phi_adval 0.0 --ann_index real
+  - 현실가: --mortality on --mort_table cohort_2020 --phi_adval 0.03 --ann_index real
+  - 명목형: --mortality on --mort_table cohort_2020 --phi_adval 0.03 --ann_index nominal --use_real_rf off
