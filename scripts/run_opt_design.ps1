@@ -1,25 +1,29 @@
 ﻿<# =======================================================================  
- run_opt_design.ps1  (PS5-safe, 2025-11-12, refactor + dedup guards)
+ run_opt_design.ps1  (PS5-safe, 2025-11-18, refactor + light/heavy + optimal json)
+ - RunProfile(light/heavy)에 따라 1D/2D grid 기본값 자동 분기
+ - 사용자가 grid 파라미터를 넘기면 RunProfile과 무관하게 그대로 사용
  - 바닥 처리: f_min_real 제거, 고정 비율 바닥(--q_floor)로 일원화(QFloorDefault=0.02)
  - 연금 로딩: --phi_adval (기본 0.05) + --ann_index (real/nominal) 자동 주입
  - RL 워크로드 명시(Epochs/Steps/NPaths), Smoke 모드 축소
  - FX 헤지 플래그 자동 감지
- - MAIN_ANN: 공정가/현실가(실질/명목) 3세트 실행
+ - MAIN_ANN: 공정가/현실가(실질/명목) 3세트 실행 + ann_alpha 주입
  - NEW: -Skip1D, -Skip2D 스위치로 단계별 실행 제어
  - NEW: 전역 태그 중복 가드(동일 tag 재실행·중복 로그 방지)
  - NEW: 스냅샷 dedup + 실패 태그 제외 후 재스코어
+ - NEW: Stage 4에서 make_1d_and_opt_report.py / make_optimal_summary.py 호출
+         → outputs/figs/optimal_points.json 생성 여부 자동 체크
 ======================================================================= #>
 
 [CmdletBinding()]
 param(
   # 실행 프로파일 / 데이터셋 / 시장 모드
-  [ValidateSet('light','heavy')] [string]$Profile      = 'light',
-  [ValidateSet('dev','full')]    [string]$DataProfile  = 'dev',
-  [ValidateSet('iid','bootstrap')] [string]$MarketMode = 'bootstrap',
+  [ValidateSet('light','heavy')]      [string]$RunProfile   = 'light',
+  [ValidateSet('dev','full')]         [string]$DataProfile  = 'dev',
+  [ValidateSet('iid','bootstrap')]    [string]$MarketMode   = 'bootstrap',
 
   # 시드 / 편향 관련
   [string]$Seeds = '7',
-  [ValidateSet('off','on')] [string]$Bias = 'off',
+  [ValidateSet('off','on')]           [string]$Bias = 'off',
   [double]$BiasProbGamma = 0.65,
 
   # RL 워크로드(일반)
@@ -37,22 +41,22 @@ param(
   [double]$QFloorDefault = 0.02,
 
   # CPI / Real-mode 정책
-  [ValidateSet('on','off')] [string]$UseRealRF = 'on',
+  [ValidateSet('on','off')]           [string]$UseRealRF = 'on',
   [switch]$CheckCpiSchema,
   [string]$BootstrapCsv = "",
   [int]$BootstrapBlock = 24,
 
   # 연금(annuity) 로딩/지수
   [double]$AnnuityPhi = 0.05,
-  [ValidateSet('real','nominal')] [string]$AnnuityIndex = 'real',
+  [ValidateSet('real','nominal')]     [string]$AnnuityIndex = 'real',
 
-  # 1D/2D 그리드
-  [double[]]$AnnAlphaGrid  = @(0..10 | ForEach-Object { $_/10.0 }),
-  [double[]]$RiskShareGrid = @(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),
-  [double[]]$FeeGrid       = @(0.0000,0.0040,0.0080),
-  [int[]]   $Age0Grid      = @(55..65),
-  [double[]]$HedgeGrid     = @(0.00,0.25,0.50,0.75,1.00),
-  [double[]]$VPWGrid       = @(0.03,0.035,0.04,0.045,0.05,0.055,0.06),
+  # 1D/2D 그리드 (기본값은 RunProfile에 따라 아래에서 다시 설정)
+  [double[]]$AnnAlphaGrid  = @(),
+  [double[]]$RiskShareGrid = @(),
+  [double[]]$FeeGrid       = @(),
+  [int[]]   $Age0Grid      = @(),
+  [double[]]$HedgeGrid     = @(),
+  [double[]]$VPWGrid       = @(),
 
   [ValidateSet('KR','US','GLD','EQUAL3')] [string[]]$AssetMixes = @('EQUAL3','KR','US','GLD'),
   [ValidateSet('M','F')]  [string[]]$Sexes   = @('M','F'),
@@ -68,10 +72,72 @@ param(
   [int]$MainANNEpochs = 1,
   [int]$MainANNStepsPerEpoch = 256,
   [int]$MainANNPaths = 1000,
+  [double]$MainANNAlpha = 0.3,
   [double]$MainANNPhi = 0.03,
   [ValidateSet('BASE','cohort_2020')] [string]$MainANNMortFair = 'BASE',
   [ValidateSet('BASE','cohort_2020')] [string]$MainANNMortReal = 'cohort_2020'
 )
+
+# ---------- RunProfile별 기본 grid 설정 ----------
+# 사용자가 직접 넘긴 파라미터(PSBoundParameters에 존재)면 그대로 사용
+if (-not $PSBoundParameters.ContainsKey('AnnAlphaGrid') -or $AnnAlphaGrid.Count -eq 0) {
+  if ($RunProfile -eq 'light') {
+    # light: 거친 ann_alpha 샘플링
+    $AnnAlphaGrid = @(0.0, 0.25, 0.50, 0.75, 1.0)
+  } else {
+    # heavy: 기존 0.0~1.0, 0.1 step
+    $AnnAlphaGrid = @(0..10 | ForEach-Object { $_/10.0 })
+  }
+}
+
+if (-not $PSBoundParameters.ContainsKey('RiskShareGrid') -or $RiskShareGrid.Count -eq 0) {
+  if ($RunProfile -eq 'light') {
+    # light: wrisk 5점
+    $RiskShareGrid = @(0.20, 0.40, 0.60, 0.80, 1.00)
+  } else {
+    # heavy: 0.0~1.0, 0.1 step
+    $RiskShareGrid = @(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0)
+  }
+}
+
+if (-not $PSBoundParameters.ContainsKey('FeeGrid') -or $FeeGrid.Count -eq 0) {
+  if ($RunProfile -eq 'light') {
+    # light에서도 수수료는 3점 유지(계산비용 영향 적음)
+    $FeeGrid = @(0.0000, 0.0040, 0.0080)
+  } else {
+    $FeeGrid = @(0.0000, 0.0040, 0.0080)
+  }
+}
+
+if (-not $PSBoundParameters.ContainsKey('Age0Grid') -or $Age0Grid.Count -eq 0) {
+  if ($RunProfile -eq 'light') {
+    # light: 대표 연령 60만 사용
+    $Age0Grid = @(60)
+  } else {
+    # heavy: 55~65, 1살 단위
+    $Age0Grid = @(55..65)
+  }
+}
+
+if (-not $PSBoundParameters.ContainsKey('HedgeGrid') -or $HedgeGrid.Count -eq 0) {
+  if ($RunProfile -eq 'light') {
+    # light: 무헤지/절반/완전헤지
+    $HedgeGrid = @(0.00, 0.50, 1.00)
+  } else {
+    # heavy: 0, 25, 50, 75, 100%
+    $HedgeGrid = @(0.00, 0.25, 0.50, 0.75, 1.00)
+  }
+}
+
+if (-not $PSBoundParameters.ContainsKey('VPWGrid') -or $VPWGrid.Count -eq 0) {
+  if ($RunProfile -eq 'light') {
+    # light: 대표 인출률 3점 (3, 5, 6%)
+    $VPWGrid = @(0.03, 0.05, 0.06)
+  } else {
+    # heavy: 기존 세밀 그리드
+    $VPWGrid = @(0.03,0.035,0.04,0.045,0.05,0.055,0.06)
+  }
+}
 
 # ---------- Paths ----------
 $Root = (Get-Location).Path
@@ -83,10 +149,27 @@ $null = New-Item -ItemType Directory -Force -Path $Out,$Logs,$Figs | Out-Null
 Write-Host "[Guard] Close Excel to avoid PermissionError on CSV/XLSX." -ForegroundColor Yellow
 
 # ---------- Utils ----------
-function As-Double($x){ if($null -eq $x -or "$x" -eq ''){return $null}; try{ [double]$x } catch { $null } }
-function Sort-ByScoreDesc($rows){
-  $rows | Sort-Object @{ Expression = { $v = $_.CompositeScore_benefit; if($null -eq $v -or "$v" -eq ''){ As-Double $_.CompositeScore } else { As-Double $v } }; Descending = $true }
+function ConvertTo-Double {
+  param($x)
+  if ($null -eq $x -or "$x" -eq '') { return $null }
+  try { [double]$x } catch { $null }
 }
+
+function Sort-ByScoreDesc {
+  param($rows)
+  $rows | Sort-Object @{
+    Expression = {
+      $v = $_.CompositeScore_benefit
+      if ($null -eq $v -or "$v" -eq '') {
+        ConvertTo-Double $_.CompositeScore
+      } else {
+        ConvertTo-Double $v
+      }
+    }
+    Descending = $true
+  }
+}
+
 function Make-Tag([string]$MortId,[string]$BaseTag,[string]$Sex){ "${BaseTag}_${MortId}_${Sex}" }
 function Get-SeedArgs([string]$SeedsCsv){
   $parts = $SeedsCsv -split '[,\s]+' | Where-Object { $_ -ne '' }
@@ -164,7 +247,7 @@ function New-BaseArgs {
     [hashtable]$MortArgs = @{},
     [hashtable]$Extra    = @{}
   )
-  $args = @(
+  $argList = @(
     '-m','project.runner.cli',
     '--mode','rl','--method','rl',
     '--data_profile', $DataProfile,
@@ -174,30 +257,30 @@ function New-BaseArgs {
     '--metrics_keys','EW,ES95,Ruin,mean_WT,es_mode,use_real_rf'
   )
 
-  if(SupportsFlag('q_floor'))   { $args += @('--q_floor', ('{0:F3}' -f $QFloorDefault)) }
-  if(SupportsFlag('use_real_rf')){ $args += @('--use_real_rf', $UseRealRF) }
-  if(SupportsFlag('bias_on'))   { $args += @('--bias_on', $(if($Bias -eq 'on'){'on'} else {'off'})) }
-  if(SupportsFlag('bias_prob_gamma')) { $args += @('--bias_prob_gamma', ('{0:F3}' -f $BiasProbGamma)) }
+  if(SupportsFlag('q_floor'))       { $argList += @('--q_floor', ('{0:F3}' -f $QFloorDefault)) }
+  if(SupportsFlag('use_real_rf'))   { $argList += @('--use_real_rf', $UseRealRF) }
+  if(SupportsFlag('bias_on'))       { $argList += @('--bias_on', $(if($Bias -eq 'on'){'on'} else {'off'})) }
+  if(SupportsFlag('bias_prob_gamma')) { $argList += @('--bias_prob_gamma', ('{0:F3}' -f $BiasProbGamma)) }
 
   if($Smoke){
-    if(SupportsFlag('rl_epochs'))          { $args += @('--rl_epochs', "$SmokeEpochs") }
-    if(SupportsFlag('rl_steps_per_epoch')) { $args += @('--rl_steps_per_epoch', "$SmokeSteps") }
-    if(SupportsFlag('n_paths'))            { $args += @('--n_paths', "$SmokePaths") }
-    if(SupportsFlag('quiet'))              { $args += @('--quiet','on') }
+    if(SupportsFlag('rl_epochs'))          { $argList += @('--rl_epochs', "$SmokeEpochs") }
+    if(SupportsFlag('rl_steps_per_epoch')) { $argList += @('--rl_steps_per_epoch', "$SmokeSteps") }
+    if(SupportsFlag('n_paths'))            { $argList += @('--n_paths', "$SmokePaths") }
+    if(SupportsFlag('quiet'))              { $argList += @('--quiet','on') }
   } else {
-    if(SupportsFlag('rl_epochs'))          { $args += @('--rl_epochs', "$Epochs") }
-    if(SupportsFlag('rl_steps_per_epoch')) { $args += @('--rl_steps_per_epoch', "$StepsPerEpoch") }
-    if(SupportsFlag('n_paths'))            { $args += @('--n_paths', "$NPaths") }
+    if(SupportsFlag('rl_epochs'))          { $argList += @('--rl_epochs', "$Epochs") }
+    if(SupportsFlag('rl_steps_per_epoch')) { $argList += @('--rl_steps_per_epoch', "$StepsPerEpoch") }
+    if(SupportsFlag('n_paths'))            { $argList += @('--n_paths', "$NPaths") }
   }
 
-  if(SupportsFlag('phi_adval'))   { $args += @('--phi_adval', ('{0:F2}' -f $AnnuityPhi)) }
-  if(SupportsFlag('ann_index'))   { $args += @('--ann_index', $AnnuityIndex) }
+  if(SupportsFlag('phi_adval'))   { $argList += @('--phi_adval', ('{0:F2}' -f $AnnuityPhi)) }
+  if(SupportsFlag('ann_index'))   { $argList += @('--ann_index', $AnnuityIndex) }
 
-  $args += (Get-SeedArgs -SeedsCsv $Seeds)
+  $argList += (Get-SeedArgs -SeedsCsv $Seeds)
 
-  foreach($k in $MortArgs.Keys){ $args += @($k, $MortArgs[$k]) }
-  foreach($k in $Extra.Keys){    $args += @($k, $Extra[$k]) }
-  return ,$args
+  foreach($k in $MortArgs.Keys){ $argList += @($k, $MortArgs[$k]) }
+  foreach($k in $Extra.Keys){    $argList += @($k, $Extra[$k]) }
+  return ,$argList
 }
 
 # ---------- Core runner ----------
@@ -211,11 +294,11 @@ function Invoke-CLI {
     return 0
   }
 
-  $args = New-BaseArgs -Sex $Sex -MortArgs $MortArgs -Extra $Extra
-  if($Tag){ $args += @('--tag', $Tag) }
+  $cliArgs = New-BaseArgs -Sex $Sex -MortArgs $MortArgs -Extra $Extra
+  if($Tag){ $cliArgs += @('--tag', $Tag) }
   $log = Join-Path $Logs ("{0}.log" -f ($Tag -replace '[^\w\-\.]','_'))
   Write-Host "[RUN] $Tag  -> $log" -ForegroundColor Cyan
-  & ".\.venv\Scripts\python.exe" @args *> $log
+  & ".\.venv\Scripts\python.exe" @cliArgs *> $log
   $ec = $LASTEXITCODE
   if($ec -ne 0){ Add-Content -Path $log -Value "[ERR] exit=$ec  tag=$Tag" -Encoding utf8 }
   return $ec
@@ -235,10 +318,11 @@ function Export-CleanScored {
 }
 
 # ---------- Banners ----------
-Write-Host "[Info] Profile=$Profile Data=$DataProfile Market=$MarketMode Seeds=$Seeds"
+Write-Host "[Info] RunProfile=$RunProfile  Data=$DataProfile  Market=$MarketMode  Seeds=$Seeds"
 Write-Host "[Info] Bias=$Bias  BiasProbGamma=$BiasProbGamma  Smoke=$($Smoke.IsPresent)"
 Write-Host "[Info] use_real_rf=$UseRealRF  q_floor=$QFloorDefault"
 Write-Host "[Info] Annuity: phi_adval=$AnnuityPhi  ann_index=$AnnuityIndex"
+Write-Host "[Info] Grids: AnnAlpha=[$($AnnAlphaGrid -join ',')], wrisk=[$($RiskShareGrid -join ',')], hedge=[$($HedgeGrid -join ',')], VPW=[$($VPWGrid -join ',')]"
 if($CheckCpiSchema){ Test-CpiSchema -CsvPath $BootstrapCsv -Block $BootstrapBlock }
 
 # ===================================================
@@ -247,26 +331,39 @@ if($CheckCpiSchema){ Test-CpiSchema -CsvPath $BootstrapCsv -Block $BootstrapBloc
 if($MainANN){
   Write-Host "`n[MAIN_ANN] Annuity 현실화 비교" -ForegroundColor Green
   $Py = ".\.venv\Scripts\python.exe"
+
+  # 공통 annuity 비중(ann_alpha) 및 RL 설정
   $COMMON = @('--method','rl','--mode','rl',
               '--rl_epochs',"$MainANNEpochs",'--rl_steps_per_epoch',"$MainANNStepsPerEpoch",
               '--n_paths',"$MainANNPaths",'--seed',"$MainANNSeed",
               '--eval_seed_jitter','off','--print_mode','summary',
               '--data_profile','full','--market_mode',$MarketMode)
+
+  $alphaStr = ('{0:F2}' -f $MainANNAlpha)
+  if (SupportsFlag('ann_alpha')) { $COMMON += @('--ann_alpha', $alphaStr) }
+  if (SupportsFlag('ann_on'))    { $COMMON += @('--ann_on','on') }
+
   if(SupportsFlag('bias_on')){ $COMMON += @('--bias_on','off') }
 
-  # FAIR
-  $FAIR = @('--tag','MAIN_ANN_FAIR','--mortality','on','--mort_table',$MainANNMortFair,'--phi_adval','0.0','--ann_index','real')
+  # FAIR: 공정가(무로딩, 실질)
+  $FAIR = @('--tag','MAIN_ANN_FAIR',
+            '--mortality','on','--mort_table',$MainANNMortFair,
+            '--phi_adval','0.0','--ann_index','real')
   if(SupportsFlag('use_real_rf')){ $FAIR += @('--use_real_rf','on') }
   & $Py @('-m','project.runner.cli') @FAIR @COMMON *> (Join-Path $Logs 'MAIN_ANN_FAIR.log')
 
-  # REAL (real)
+  # REAL (real): 로딩 + 개선 생명표, 실질
   $phi = ('{0:F2}' -f $MainANNPhi)
-  $REAL = @('--tag','MAIN_ANN_REAL','--mortality','on','--mort_table',$MainANNMortReal,'--phi_adval',$phi,'--ann_index','real')
+  $REAL = @('--tag','MAIN_ANN_REAL',
+            '--mortality','on','--mort_table',$MainANNMortReal,
+            '--phi_adval',$phi,'--ann_index','real')
   if(SupportsFlag('use_real_rf')){ $REAL += @('--use_real_rf','on') }
   & $Py @('-m','project.runner.cli') @REAL @COMMON *> (Join-Path $Logs 'MAIN_ANN_REAL.log')
 
-  # REAL_NOM (nominal annuity + nominal RF)
-  $REALN = @('--tag','MAIN_ANN_REAL_NOM','--mortality','on','--mort_table',$MainANNMortReal,'--phi_adval',$phi,'--ann_index','nominal')
+  # REAL_NOM: 로딩 + 개선 생명표, 명목연금 + 명목RF
+  $REALN = @('--tag','MAIN_ANN_REAL_NOM',
+             '--mortality','on','--mort_table',$MainANNMortReal,
+             '--phi_adval',$phi,'--ann_index','nominal')
   if(SupportsFlag('use_real_rf')){ $REALN += @('--use_real_rf','off') }
   & $Py @('-m','project.runner.cli') @REALN @COMMON *> (Join-Path $Logs 'MAIN_ANN_REAL_NOM.log')
 
@@ -289,6 +386,7 @@ if($MainANN){
   $readme = @"
 # MAIN | Annuity 현실화 비교
 - 환경: data_profile=full, market_mode=$MarketMode, seed=$MainANNSeed, n_paths=$MainANNPaths, RL(epochs=$MainANNEpochs, steps=$MainANNStepsPerEpoch), bias_off
+- 공통 annuity 비중: ann_alpha = $alphaStr
 - 케이스:
   - MAIN_ANN_FAIR     = 공정가(무로딩, $MainANNMortFair, 실질)
   - MAIN_ANN_REAL     = 로딩 $phi + $MainANNMortReal (실질)
@@ -420,8 +518,6 @@ if(-not $Skip2D){
 
 # ===================================================
 # 3) Snapshot / Score / Tables
-#   - metrics.csv → DEV_metrics_snapshot.csv
-#   - dedup(동일 tag 최신 1건) → 실패 태그 제외 → 재스코어
 # ===================================================
 Write-Host "`n[STAGE 3] Snapshot / Score / Tables" -ForegroundColor Green
 $metricsCsv = Join-Path $Logs 'metrics.csv'
@@ -434,19 +530,16 @@ if(Test-Path $metricsCsv){
     Export-Csv $SnapRaw -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] snapshot => $SnapRaw"
 
-  # dedup: 동일 tag 다수 → 최신 1건
   (Import-Csv $SnapRaw | Group-Object tag | ForEach-Object { $_.Group | Select-Object -Last 1 }) |
     Export-Csv $SnapDedup -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] dedup => $SnapDedup"
 
-  # 실패 태그 수집(비정상 종료 기록된 로그)
   $failTags = Get-ChildItem $Logs\*.log |
     Where-Object { Select-String -Path $_.FullName -Pattern '[[]ERR[]] exit=' -Quiet } |
     ForEach-Object {
       (Get-Content $_.FullName | Select-String -Pattern 'tag=' | Select-Object -Last 1).Line -replace '.*tag=',''
     } | Sort-Object -Unique
 
-  # DEV*만, 실패 태그 제외한 클린 스냅샷
   (Import-Csv $SnapDedup | Where-Object { ($_.tag -like 'DEV*') -and ($failTags -notcontains $_.tag) }) |
     Export-Csv $SnapClean -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] clean snapshot => $SnapClean"
@@ -454,7 +547,6 @@ if(Test-Path $metricsCsv){
   Write-Warning "metrics.csv not found: $metricsCsv"
 }
 
-# 재스코어 입력 파일 선택(우선순위: Clean > Raw)
 $ScoreSrc = if (Test-Path $SnapClean) { $SnapClean } elseif (Test-Path $SnapRaw) { $SnapRaw } else { $null }
 if ($null -ne $ScoreSrc) {
   & .\.venv\Scripts\python.exe .\scripts\score_snapshot.py `
@@ -478,13 +570,13 @@ $BestBy  = Join-Path $Out 'DEV_OPT_best_by_sex_mort.csv'
 
 if(Test-Path $OPT_Sum){
   Import-Csv $OPT_Sum | Select-Object tag,EW,ES95,Ruin,CompositeScore_benefit |
-    Sort-Object @{Expression={ As-Double $_.CompositeScore_benefit }; Descending=$true} |
+    Sort-Object @{Expression={ ConvertTo-Double $_.CompositeScore_benefit }; Descending=$true} |
     Export-Csv $OPT_Core -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] $OPT_Core"
 }
 if(Test-Path $BH_Sum){
   Import-Csv $BH_Sum | Select-Object tag,EW,ES95,Ruin,CompositeScore_benefit |
-    Sort-Object @{Expression={ As-Double $_.CompositeScore_benefit }; Descending=$true} |
+    Sort-Object @{Expression={ ConvertTo-Double $_.CompositeScore_benefit }; Descending=$true} |
     Export-Csv $BH_Core -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] $BH_Core"
 }
@@ -495,7 +587,7 @@ if((Test-Path $OPT_Sum) -and (Test-Path $BH_Sum)){
   $opt=Import-Csv $OPT_Sum|Select-Object -Property $optProps
   $bh =Import-Csv $BH_Sum |Select-Object -Property $bhProps
   $all=$opt+$bh
-  $all | Sort-Object Room, @{Expression={ As-Double $_.CompositeScore_benefit }; Descending=$true} |
+  $all | Sort-Object Room, @{Expression={ ConvertTo-Double $_.CompositeScore_benefit }; Descending=$true} |
     Export-Csv $Compare -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] compare => $Compare"
   $optTop3 = Sort-ByScoreDesc $opt | Select-Object -First 3
@@ -517,7 +609,56 @@ if(Test-Path $OPT_Sum){
   }
 }
 
+# ===================================================
+# 4) 1D Report / Optimal Summary / optimal_points.json
+# ===================================================
+Write-Host "`n[STAGE 4] 1D report / optimal summary" -ForegroundColor Green
+$PyExe = ".\.venv\Scripts\python.exe"
+$ScoredClean = Join-Path $Out 'DEV_scored_clean.csv'
+$ScoredRaw   = Join-Path $Out 'DEV_scored.csv'
+
+# 1D/optimal 리포트용 snapshot/score 소스 선택
+$SnapshotFor1D = $null
+if (Test-Path $SnapClean) { $SnapshotFor1D = $SnapClean }
+elseif (Test-Path $SnapDedup) { $SnapshotFor1D = $SnapDedup }
+elseif (Test-Path $SnapRaw) { $SnapshotFor1D = $SnapRaw }
+
+$ScoredFor1D = $null
+if (Test-Path $ScoredClean) { $ScoredFor1D = $ScoredClean }
+elseif (Test-Path $ScoredRaw) { $ScoredFor1D = $ScoredRaw }
+
+if (Test-Path ".\scripts\make_1d_and_opt_report.py") {
+  if (($null -ne $SnapshotFor1D) -and ($null -ne $ScoredFor1D)) {
+    Write-Host "[STAGE 4] run make_1d_and_opt_report.py" -ForegroundColor Cyan
+    & $PyExe .\scripts\make_1d_and_opt_report.py `
+      --snapshot $SnapshotFor1D `
+      --scored $ScoredFor1D `
+      --outdir $Out
+    if ($LASTEXITCODE -ne 0) {
+      Write-Warning "[STAGE 4] make_1d_and_opt_report.py exit=$LASTEXITCODE (CLI 인자 확인 필요)"
+    }
+  } else {
+    Write-Warning "[STAGE 4] snapshot/scored source not found, skip make_1d_and_opt_report.py."
+  }
+} else {
+  Write-Host "[STAGE 4] make_1d_and_opt_report.py not found, skip." -ForegroundColor Yellow
+}
+
+if (Test-Path ".\scripts\make_optimal_summary.py") {
+  Write-Host "[STAGE 4] run make_optimal_summary.py" -ForegroundColor Cyan
+  & $PyExe .\scripts\make_optimal_summary.py
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "[STAGE 4] make_optimal_summary.py exit=$LASTEXITCODE (CLI 인자 확인 필요)"
+  }
+} else { 
+  Write-Host "[STAGE 4] make_optimal_summary.py not found, skip." -ForegroundColor Yellow
+}
+
 $PointsJson = Join-Path $Figs 'optimal_points.json'
-if(Test-Path $PointsJson){ Write-Host "[OK] optimal_points.json -> $PointsJson" } else { Write-Host "[Info] optimal_points.json not found." }
+if(Test-Path $PointsJson){
+  Write-Host "[OK] optimal_points.json -> $PointsJson" -ForegroundColor Green
+} else {
+  Write-Host "[Info] optimal_points.json not found (요약 스크립트 CLI를 확인하세요)." -ForegroundColor Yellow
+}
 
 Write-Host "[DONE] design/score/summary complete" -ForegroundColor Green

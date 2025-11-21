@@ -17,20 +17,25 @@ try:
     )
 except Exception:
     BehavioralSpec = None  # type: ignore
+
     def distort_utility(u: float, *, ref: float = 0.0, spec=None) -> float:  # type: ignore
         return float(u)
+
     def habit_utility(u: float, prev_u: float, *, spec=None) -> float:  # type: ignore
         return float(u)
+
 
 # ---------- helpers ----------
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
 
 def _crra_u(c: float, gamma: float) -> float:
     c = max(float(c), 1e-12)
     if abs(float(gamma) - 1.0) < 1e-12:
         return math.log(c)
     return (c ** (1.0 - float(gamma)) - 1.0) / (1.0 - float(gamma))
+
 
 def _to_monthly_rate_like(x: np.ndarray) -> np.ndarray:
     """지수면 전월대비율로, 이미 월간률이면 그대로."""
@@ -46,7 +51,13 @@ def _to_monthly_rate_like(x: np.ndarray) -> np.ndarray:
         return r
     return np.nan_to_num(x.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
 
-def _nan_guard_arr(a: np.ndarray, *, fill: float = 0.0, clip: Tuple[float, float] | None = None) -> np.ndarray:
+
+def _nan_guard_arr(
+    a: np.ndarray,
+    *,
+    fill: float = 0.0,
+    clip: Tuple[float, float] | None = None
+) -> np.ndarray:
     """배열 NaN/Inf 정화(+선택적 클리핑)."""
     arr = np.nan_to_num(np.asarray(a, dtype=float), nan=fill, posinf=fill, neginf=fill)
     if clip is not None:
@@ -55,6 +66,7 @@ def _nan_guard_arr(a: np.ndarray, *, fill: float = 0.0, clip: Tuple[float, float
     if not np.isfinite(arr).all():
         arr = np.zeros_like(arr, dtype=float)
     return arr
+
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     """스칼라 NaN/Inf 방호."""
@@ -65,6 +77,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return float(default)
     except Exception:
         return float(default)
+
 
 def _load_market_arrays(csv_path: str, use_real_rf: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -114,7 +127,7 @@ class RetirementEnv:
       cfg/kwargs에 data_ret_series, data_rf_series, data_cpi 가 있으면 CSV 대신 이를 사용.
       market_mode='bootstrap'일 때 블록부트스트랩, 'iid'면 파라메트릭 IID.
 
-    step() 반환: **(obs, reward, done, info)**  ← 테스트 호환(항상 4-튜플)
+    step() 반환: (obs, reward, done, info)  ← 테스트 호환(항상 4-튜플)
       - (기존 trunc는 info["truncated"]로 제공)
     """
 
@@ -130,7 +143,7 @@ class RetirementEnv:
     def __init__(self, cfg: Any = None, **kwargs):
         # --- time / wealth / prefs ---
         self.steps_per_year = int(max(1, self._get(cfg, kwargs, "steps_per_year", 12)))
-        self.T  = int(max(1, self._get(cfg, kwargs, "horizon_years", 15))) * self.steps_per_year
+        self.T  = int(max(1, self._get(cfg, kwargs, "horizon_years", 45))) * self.steps_per_year
         self.W0 = _safe_float(self._get(cfg, kwargs, "W0", 1.0), 1.0)
         self.w_max = _safe_float(self._get(cfg, kwargs, "w_max", 1.0), 1.0)
 
@@ -150,7 +163,6 @@ class RetirementEnv:
         self.phi_adval   = _safe_float(self._get(cfg, kwargs, "phi_adval", 0.0), 0.0)
 
         # “연금 전환 후 펀드보수 0” 정책 스위치(기본 on)
-        # → step() 구현에서 annuity 매입 후 잔여 금융자산에 대해서만 보수를 유지/중지할 때 사용
         self.ann_zero_fee_after_purchase = str(
             self._get(cfg, kwargs, "ann_zero_fee_after_purchase", "on") or "on"
         ).lower() == "on"
@@ -160,7 +172,8 @@ class RetirementEnv:
         self.gamma   = _safe_float(self._get(cfg, kwargs, "crra_gamma", 3.0), 3.0)
 
         # --- [ANN] annuity overlay params ---
-        self.ann_on    = str(self._get(cfg, kwargs, "ann_on", "off") or "off").lower()
+        # 기본값 'auto': ann_alpha>0 이면 자동으로 annuity init 시도, 'off'일 때만 강제 비활성화
+        self.ann_on    = str(self._get(cfg, kwargs, "ann_on", "auto") or "auto").lower()
         self.ann_alpha = _safe_float(self._get(cfg, kwargs, "ann_alpha", 0.0), 0.0)
         self.ann_L     = _safe_float(self._get(cfg, kwargs, "ann_L", 0.0), 0.0)
         self.ann_d     = int(self._get(cfg, kwargs, "ann_d", 0) or 0)
@@ -181,8 +194,11 @@ class RetirementEnv:
         self.use_real_rf = str(self._get(cfg, kwargs, "use_real_rf", "on") or "on").lower()
 
         # --- IID 파라미터(테스트 스텁 호환) ---
-        self.mu_risky   = _safe_float(self._get(cfg, kwargs, "mu_risky", 0.06/12), 0.06/12)
-        self.sigma_risky= max(0.0, _safe_float(self._get(cfg, kwargs, "sigma_risky", 0.18/np.sqrt(12)), 0.18/np.sqrt(12)))
+        self.mu_risky    = _safe_float(self._get(cfg, kwargs, "mu_risky", 0.06/12), 0.06/12)
+        self.sigma_risky = max(
+            0.0,
+            _safe_float(self._get(cfg, kwargs, "sigma_risky", 0.18/np.sqrt(12)), 0.18/np.sqrt(12))
+        )
         self.r_safe_fix = _safe_float(self._get(cfg, kwargs, "r_safe", 0.02/12), 0.02/12)
 
         # --- hedge params ---
@@ -226,9 +242,13 @@ class RetirementEnv:
         if inj_ret is not None and inj_rf is not None:
             self._risky    = _nan_guard_arr(inj_ret)
             self._safe     = _nan_guard_arr(inj_rf)
-            self._cpi_rate = _nan_guard_arr(inj_cpi if inj_cpi is not None else np.zeros_like(self._risky))
+            self._cpi_rate = _nan_guard_arr(
+                inj_cpi if inj_cpi is not None else np.zeros_like(self._risky)
+            )
         elif self.market_mode == "bootstrap" and os.path.exists(self.market_csv):
-            self._risky, self._safe, self._cpi_rate = _load_market_arrays(self.market_csv, self.use_real_rf)
+            self._risky, self._safe, self._cpi_rate = _load_market_arrays(
+                self.market_csv, self.use_real_rf
+            )
         else:
             # IID 파라메트릭: 테스트 인자(mu_risky, sigma_risky, r_safe) 반영
             self._risky    = self.rng.normal(self.mu_risky, self.sigma_risky, size=6000)
@@ -242,80 +262,127 @@ class RetirementEnv:
         # --- [NEW] Terminal shortfall target (옵션) ---
         self.F_target = _safe_float(self._get(cfg, kwargs, "F_target", 0.0), 0.0)
 
+        # 초기화 완료 후 기본 reset
         self.reset()
 
     # ----- mortality init -----
     def _init_mortality_if_any(self, cfg: Any, kwargs: dict):
-        """cfg 설정에 따라 생명표/실질 rf 로드."""
-        mortality_on = bool(str(self._get(cfg, kwargs, "mortality", "off")).lower() == "on")
-        if mortality_on:
-            mt = self._get(cfg, kwargs, "mort_table", None)
+        """
+        생명표/실질 rf 로드.
 
-            # 1) 문자열 토큰(BASE/COHORT/COHORT_YYYY) 직접 인식
-            if isinstance(mt, str) and mt and mt.strip().lower().startswith(("base", "cohort")):
-                try:
-                    from ..annuity.mortality_gm import load_life_table  # type: ignore
-                    lt = load_life_table(
-                        str(mt),
-                        sex=str(self._get(cfg, kwargs, "sex", "M") or "M").upper(),
-                        age0=int(self._get(cfg, kwargs, "age0", 65)),
-                        horizon_years=int(self._get(cfg, kwargs, "horizon_years", 35)),
-                        steps_per_year=int(self._get(cfg, kwargs, "steps_per_year", 12)),
-                        annual_improvement=_safe_float(self._get(cfg, kwargs, "mort_imp", 0.01), 0.01),
+        규칙:
+        - mortality='on' 인 경우, mort_table 이 반드시 지정되어야 하며
+          로딩 실패 시 예외를 발생시킨다 (무조건 반영).
+        - mortality != 'on' 이면 life_table 을 사용하지 않는다.
+        """
+        mort_flag = str(self._get(cfg, kwargs, "mortality", "off") or "off").lower()
+        mt = self._get(cfg, kwargs, "mort_table", None)
+
+        self.life_table = None
+        self.mort_table_df = None
+
+        if mort_flag != "on":
+            # mortality off → 생명표 미사용 (테스트/단순 실험용)
+            rf_from_cfg = self._get(cfg, kwargs, "r_f_real_annual", 0.02)
+            self.r_f_real_annual = _safe_float(rf_from_cfg, 0.02)
+            return
+
+        # 여기부터는 mortality='on' 이므로 mort_table 반드시 필요
+        if not isinstance(mt, str) or not mt.strip():
+            raise ValueError("[env:mort] mortality='on' 인데 mort_table 이 지정되지 않았습니다.")
+
+        mt_str = str(mt).strip()
+        loaded = False
+
+        # 1) 문자열 토큰(BASE/COHORT/COHORT_YYYY) 직접 인식
+        if mt_str.lower().startswith(("base", "cohort")) and not os.path.exists(mt_str):
+            try:
+                from ..annuity.mortality_gm import load_life_table  # type: ignore
+
+                lt = load_life_table(
+                    mt_str,
+                    sex=str(self._get(cfg, kwargs, "sex", "M") or "M").upper(),
+                    age0=int(self._get(cfg, kwargs, "age0", 65)),
+                    horizon_years=int(self._get(cfg, kwargs, "horizon_years", 45)),
+                    steps_per_year=int(self._get(cfg, kwargs, "steps_per_year", 12)),
+                    annual_improvement=_safe_float(self._get(cfg, kwargs, "mort_imp", 0.01), 0.01),
+                )
+                self.life_table = lt.copy()
+                self.mort_table_df = lt.copy()
+                loaded = True
+                print(f"[env:mort] life_table token='{mt_str}' loaded: rows={len(lt)}")
+            except Exception as e:
+                raise RuntimeError(f"[env:mort] token mort_table 로딩 실패({mt_str}): {e}") from e
+
+        # 2) 파일 경로(csv)
+        elif os.path.exists(mt_str):
+            try:
+                df = pd.read_csv(mt_str)
+                has_age = "age" in df.columns
+                has_px  = any(c in df.columns for c in ["px", "Px"])
+                has_qx  = "qx" in df.columns
+                has_mf  = all(c in df.columns for c in ["male", "female"])
+                if not has_age:
+                    raise ValueError("mort_table must contain 'age' column")
+
+                if has_qx:
+                    lt = df[["age", "qx"]].copy()
+                elif has_px:
+                    col = "px" if "px" in df.columns else "Px"
+                    lt = df[["age", col]].rename(columns={col: "px"}).copy()
+                elif has_mf:
+                    sex = self._get(cfg, kwargs, "sex", "M")
+                    col = "male" if str(sex).upper() == "M" else "female"
+                    lt = df[["age", col]].rename(columns={col: "qx"}).copy()
+                else:
+                    raise ValueError(
+                        "expected ('age' + 'qx') or ('age' + 'px/Px') or ('age' + 'male,female')"
                     )
-                    self.life_table = lt.copy()
-                    self.mort_table_df = lt.copy()
-                    print(f"[env:mort] life_table token='{mt}' loaded: rows={len(lt)}")
-                except Exception as e:
-                    print(f"[env:mort] token load failed({mt}): {e}")
 
-            # 2) 파일 경로(csv)도 허용 (기존 호환)
-            elif isinstance(mt, str) and os.path.exists(mt):
-                try:
-                    df = pd.read_csv(mt)
-                    has_age = "age" in df.columns
-                    has_px  = any(c in df.columns for c in ["px", "Px"])
-                    has_qx  = "qx" in df.columns
-                    has_mf  = all(c in df.columns for c in ["male", "female"])
-                    if not has_age:
-                        raise ValueError("mort_table must contain 'age' column")
+                lt["age"] = lt["age"].astype(int)
+                lt = lt.sort_values("age").reset_index(drop=True)
+                self.life_table = lt
+                self.mort_table_df = lt
+                loaded = True
+                print(f"[env:mort] life_table loaded: rows={len(lt)}, cols={list(lt.columns)}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"[env:mort] mort_table 파일 로딩/파싱 실패: path={mt_str}, err={e}"
+                ) from e
+        else:
+            raise FileNotFoundError(
+                f"[env:mort] mortality='on' 이지만 mort_table 경로/토큰을 인식할 수 없습니다: '{mt_str}'"
+            )
 
-                    if has_qx:
-                        lt = df[["age", "qx"]].copy()
-                    elif has_px:
-                        col = "px" if "px" in df.columns else "Px"
-                        lt = df[["age", col]].rename(columns={col: "px"}).copy()
-                    elif has_mf:
-                        sex = self._get(cfg, kwargs, "sex", "M")
-                        col = "male" if str(sex).upper() == "M" else "female"
-                        lt = df[["age", col]].rename(columns={col: "qx"}).copy()
-                    else:
-                        raise ValueError("expected ('age' + 'qx') or ('age' + 'px/Px') or ('age' + 'male,female')")
+        if not loaded or self.life_table is None or len(self.life_table) == 0:
+            raise RuntimeError(
+                f"[env:mort] mortality='on' 이지만 life_table 로딩에 실패했습니다 (mort_table={mt_str})."
+            )
 
-                    lt["age"] = lt["age"].astype(int)
-                    lt = lt.sort_values("age").reset_index(drop=True)
-                    self.life_table = lt
-                    self.mort_table_df = lt
-                    print(f"[env:mort] life_table loaded: rows={len(lt)}, cols={list(lt.columns)}")
-                except Exception as e:
-                    print(f"[env:mort] failed to load/parse mort_table file: {e}")
-
-        rf_from_cfg = self._get(cfg, kwargs, "r_f_real_annual", None)
-        self.r_f_real_annual = _safe_float(rf_from_cfg if (rf_from_cfg:=rf_from_cfg) is not None else 0.02, 0.02)
+        # 실질 rf 설정
+        rf_from_cfg = self._get(cfg, kwargs, "r_f_real_annual", 0.02)
+        self.r_f_real_annual = _safe_float(rf_from_cfg, 0.02)
 
     # ----- market path builders -----
-    def _bootstrap_path(self, T: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _bootstrap_path(
+        self,
+        T: int,
+        rng: np.random.Generator
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """블록 부트스트랩으로 길이 T의 (risky, safe, cpi) 경로 생성."""
         N = len(self._risky)
         B = max(1, self.bootstrap_block)
-        r = np.empty(T, float); s = np.empty(T, float); p = np.empty(T, float)
-        t = 0; hi = max(1, N - B + 1)
+        r = np.empty(T, float)
+        s = np.empty(T, float)
+        p = np.empty(T, float)
+        t = 0
+        hi = max(1, N - B + 1)
         while t < T:
             start = int(rng.integers(0, hi))
             take = min(B, T - t)
-            r[t:t+take] = self._risky[start:start+take]
-            s[t:t+take] = self._safe[start:start+take]
-            p[t:t+take] = self._cpi_rate[start:start+take]
+            r[t : t + take] = self._risky[start : start + take]
+            s[t : t + take] = self._safe[start : start + take]
+            p[t : t + take] = self._cpi_rate[start : start + take]
             t += take
         return _nan_guard_arr(r), _nan_guard_arr(s), _nan_guard_arr(p)
 
@@ -331,61 +398,111 @@ class RetirementEnv:
 
         # ----- annuity init at reset -----
     def _annuity_init_if_any(self):
-        """life table + ann_on='on' + ann_alpha>0 → t=0 1회 매입 & y_ann 설정."""
-        # 스위치/파라미터 체크
-        if not (self.ann_on == "on" and self.ann_alpha > 0.0):
+        """
+        life_table 있고, ann_alpha>0 이고, ann_on이 'off'가 아니면
+        t=0에서 1회 종신연금 매입 후 y_ann 설정.
+
+        - 매입비중: ann_alpha (0~1), W0의 ann_alpha 비중을 annuity 프리미엄으로 사용
+        - 가격: 종신연금은 **수수료/로딩 없이 공정가(fair price)**로 가격
+        - 지급: 매 스텝마다 고정 real 지급 y_ann (steps_per_year 기준)
+        - ann_index, phi_adval, ann_L 등은 **현 단계에서는 annuity 가격에 사용하지 않음**
+        """
+
+        # 기본값 초기화
+        self.y_ann = 0.0
+        self.ann_purchased = False
+        self.ann_P = 0.0
+        self.ann_a_factor = 0.0
+
+        # 1) annuity 사용 여부 체크 -------------------------------
+        alpha = _safe_float(getattr(self, "ann_alpha", 0.0), 0.0)
+        if alpha <= 0.0:
             return
+
+        mode = str(getattr(self, "ann_on", "auto") or "auto").lower()
+        if mode == "off":
+            return
+
+        # mortality 정보가 없으면 annuity 비활성화
         if self.life_table is None or len(self.life_table) == 0:
             return
 
-        try:
-            from ..annuity.overlay import AnnuityConfig, init_annuity  # type: ignore
-        except Exception:
-            # annuity 모듈을 불러오지 못하면 조용히 annuity 미사용
+        lt = self.life_table.copy()
+        if "age" not in lt.columns:
             return
 
-        try:
-            # L: 우선 ann_L를 사용하고, 설정이 0이면 phi_adval을 fallback으로 사용
-            raw_L = getattr(self, "ann_L", 0.0)
-            if not np.isfinite(raw_L) or float(raw_L) == 0.0:
-                raw_L = getattr(self, "phi_adval", 0.0)
-            load_L = float(_safe_float(raw_L, 0.0))
+        lt = lt.sort_values("age").reset_index(drop=True)
+        ages = lt["age"].astype(int).to_numpy()
 
-            cfg = AnnuityConfig(
-                on=True,
-                alpha=float(_safe_float(self.ann_alpha, 0.0)),
-                L=load_L,
-                d=int(getattr(self, "ann_d", 0) or 0),
-                index=str(getattr(self, "ann_index", "real") or "real"),
-            )
+        # 2) 연간 생존확률 px_year 구축 ---------------------------
+        if "px" in lt.columns:
+            px_year = np.clip(lt["px"].astype(float).to_numpy(), 0.0, 1.0)
+        elif "qx" in lt.columns:
+            qx_year = np.clip(lt["qx"].astype(float).to_numpy(), 0.0, 1.0)
+            px_year = 1.0 - qx_year
+        else:
+            # px/qx 둘 다 없으면 안전하게 annuity 비활성화
+            return
 
-            r_f_real = float(_safe_float(getattr(self, "r_f_real_annual", 0.02), 0.02))
-            steps_per_year = int(getattr(self, "steps_per_year", 12) or 12)
+        S = int(getattr(self, "steps_per_year", 12) or 12)
+        T = int(self.T)
+        age0 = int(self.age0)
 
-            # overlay.init_annuity 호출
-            W_after, st = init_annuity(
-                W0=float(_safe_float(self.W, self.W0)),
-                cfg=cfg,
-                age0_years=int(self.age0),
-                life_table=self.life_table,
-                r_f_real_annual=r_f_real,
-                S=steps_per_year,
-            )
+        # age → px_year 맵 구성 (해당 age 구간에서는 가장 최근 px 사용)
+        max_age_needed = age0 + math.ceil(T / S) + 1
+        age_px_map: Dict[int, float] = {}
+        j = 0
+        last_px = 1.0
+        for age in range(int(ages.min()), max_age_needed + 1):
+            while j + 1 < len(ages) and ages[j + 1] <= age:
+                j += 1
+            last_px = float(px_year[j]) if j < len(px_year) else last_px
+            age_px_map[age] = float(np.clip(last_px, 0.0, 1.0))
 
-            # 결과를 env 상태에 반영
-            self.W = float(_safe_float(W_after, 0.0))               # 프리미엄 차감 후 자산
-            self.y_ann = float(_safe_float(getattr(st, "y_ann", 0.0), 0.0))  # 스텝당 연금소득
-            self.ann_purchased = bool(getattr(st, "purchased", False))
-            self.ann_P = float(_safe_float(getattr(st, "P", 0.0), 0.0))       # 납입 프리미엄
-            self.ann_a_factor = float(_safe_float(getattr(st, "a_factor", 0.0), 0.0))
+        # 3) 스텝별 생존확률 S_t (t=0..T), S_0=1 -----------------
+        step_surv = np.empty(T + 1, dtype=float)
+        step_surv[0] = 1.0
+        for t in range(1, T + 1):
+            # t-1 ~ t 구간에 해당하는 연령
+            age_t = age0 + (t - 1) // S
+            px_yr = float(age_px_map.get(age_t, 1.0))
+            # 연간 px → 스텝별 q_m: 1년 생존확률 px = (1 - q_m)^S 가 되도록
+            q_m = 1.0 - px_yr ** (1.0 / float(S))
+            q_m = float(np.clip(q_m, 0.0, 1.0))
+            step_surv[t] = step_surv[t - 1] * (1.0 - q_m)
 
-        except Exception as e:
-            # 문제 발생 시 디버그용 로그만 남기고, annuity는 미적용 상태로 유지
-            print(f"[env:annuity] init failed: {e}")
-            self.y_ann = 0.0
-            self.ann_purchased = False
-            self.ann_P = 0.0
-            self.ann_a_factor = 0.0
+        # 4) 할인인자 (real rf 사용) ------------------------------
+        r_f_real = float(_safe_float(getattr(self, "r_f_real_annual", 0.02), 0.02))
+        if r_f_real <= -0.99:
+            r_f_real = 0.0
+
+        disc = np.array(
+            [(1.0 + r_f_real) ** (-t / float(S)) for t in range(1, T + 1)],
+            dtype=float,
+        )
+
+        # 지급시점별 EPV 가중치: 생존확률 * 할인인자
+        surv_pay = step_surv[1:]  # 길이 T
+        ann_factor = float(np.sum(surv_pay * disc))
+        if (not np.isfinite(ann_factor)) or ann_factor <= 0.0:
+            return
+
+        # 5) 공정가 조건으로 y_ann 결정 ---------------------------
+        W0_now = float(_safe_float(self.W, self.W0))
+        P = float(alpha * W0_now)  # 종신연금에 투입할 프리미엄
+        y_step = float(P / ann_factor)  # 매 스텝당 연금지급액
+
+        # 투자계정은 (1 - alpha) * W0_now로 시작
+        self.W = max(W0_now - P, 0.0)
+
+        self.y_ann = max(y_step, 0.0)
+        self.ann_purchased = self.y_ann > 0.0
+        self.ann_P = P
+        self.ann_a_factor = ann_factor
+
+        # ann_index, phi_adval, ann_L 등은 현재 단계에서는 가격에 반영하지 않음
+        # (annuity 효과가 확실히 보인 뒤, 필요 시 로딩/인덱싱 로직을 추가)
+        return
 
     # ----- API -----
     def reset(self, W0: Optional[float] = None, seed: Optional[int] = None):
@@ -424,7 +541,7 @@ class RetirementEnv:
         if self.market_mode == "bootstrap":
             self.path_risky, self.path_safe, self.path_cpi = self._bootstrap_path(self.T, self.rng)
         else:
-            # IID 파라미트릭 (cfg의 mu/sigma/r_safe 반영)
+            # IID 파라메트릭 (cfg의 mu/sigma/r_safe 반영)
             self.path_risky = self.rng.normal(self.mu_risky, self.sigma_risky, size=self.T)
             self.path_safe  = np.full(self.T, self.r_safe_fix)
             self.path_cpi   = np.zeros(self.T, dtype=float)
@@ -437,12 +554,19 @@ class RetirementEnv:
     def _obs(self) -> np.ndarray:
         """정규화 시간과 현재 자산을 ndarray(float32)로 반환."""
         t_norm = (self.t / max(1, self.T - 1)) if self.T > 1 else 0.0
-        return np.asarray([_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0)], dtype=np.float32)
+        return np.asarray(
+            [_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0)],
+            dtype=np.float32,
+        )
 
     # ▶ 테스트 호환: state 프로퍼티 (env.state.W 등 접근)
     @property
     def state(self):
-        return SimpleNamespace(W=float(_safe_float(self.W, 0.0)), t=int(self.t), age_years=float(self.age_years))
+        return SimpleNamespace(
+            W=float(_safe_float(self.W, 0.0)),
+            t=int(self.t),
+            age_years=float(self.age_years),
+        )
 
     # ----- floor helper -----
     def _q_min_now(self) -> float:
@@ -499,19 +623,25 @@ class RetirementEnv:
             act = args[0]
             if isinstance(act, dict):
                 try:
-                    q = float(act.get("q", 0.0)); w = float(act.get("w", 0.0))
+                    q = float(act.get("q", 0.0))
+                    w = float(act.get("w", 0.0))
                 except Exception as e:
                     raise TypeError("step(dict) expects keys {'q','w'}") from e
             else:
                 try:
-                    q = float(act[0]); w = float(act[1])
+                    q = float(act[0])
+                    w = float(act[1])
                 except Exception as e:
-                    raise TypeError("step(action) expects sequence-like [q,w] or dict {'q','w'}") from e
+                    raise TypeError(
+                        "step(action) expects sequence-like [q,w] or dict {'q','w'}"
+                    ) from e
         elif len(args) >= 2:
-            q = float(args[0]); w = float(args[1])
+            q = float(args[0])
+            w = float(args[1])
         else:
             if "q" in kwargs and "w" in kwargs:
-                q = float(kwargs["q"]); w = float(kwargs["w"])
+                q = float(kwargs["q"])
+                w = float(kwargs["w"])
             else:
                 raise TypeError("step requires (q, w) or action=[q,w] or dict {'q','w'}")
 
@@ -520,7 +650,11 @@ class RetirementEnv:
 
         # 에피소드 종료 후 호출 방지 → 4-튜플로 즉시 반환
         if self.t >= self.T:
-            info = {"W_T": float(_safe_float(self.W, 0.0)), "done_reason": "already_ended", "truncated": False}
+            info = {
+                "W_T": float(_safe_float(self.W, 0.0)),
+                "done_reason": "already_ended",
+                "truncated": False,
+            }
             return self._obs(), 0.0, True, info
 
         # 현재 스텝 시작 자산(수수료 기준 보존)
@@ -576,8 +710,11 @@ class RetirementEnv:
                 u_eff = float(u2)
             except Exception:
                 u_eff = base_u
-        reward = _safe_float(getattr(self, "u_scale", 0.0), 0.0) * _safe_float(u_eff, base_u) \
-                 + _safe_float(getattr(self, "survive_bonus", 0.0), 0.0)
+        reward = (
+            _safe_float(getattr(self, "u_scale", 0.0), 0.0)
+            * _safe_float(u_eff, base_u)
+            + _safe_float(getattr(self, "survive_bonus", 0.0), 0.0)
+        )
         reward = np.clip(reward, -100.0, 100.0)
 
         # advance time ------------------------------------------------------
@@ -601,7 +738,7 @@ class RetirementEnv:
         # ----- Bias 신호(액션-레이어 편향 모듈용) -----
         recent_ret = float(r_risky_raw)
         if self.t >= 12:
-            win = _nan_guard_arr(self.path_risky[self.t-12:self.t], fill=0.0)
+            win = _nan_guard_arr(self.path_risky[self.t - 12 : self.t], fill=0.0)
             recent_vol = float(np.std(win))
         else:
             recent_vol = 0.0
@@ -641,7 +778,10 @@ class RetirementEnv:
             W_T = float(_safe_float(self.W, 0.0))
             info.setdefault("W_T", W_T)
             info.setdefault("terminal_wealth", W_T)
-            info.setdefault("done_reason", "wealth_depleted" if W_T <= 0.0 else "horizon")
+            info.setdefault(
+                "done_reason",
+                "wealth_depleted" if W_T <= 0.0 else "horizon",
+            )
             _F = getattr(self, "F_target", None)
             try:
                 if _F is not None:
