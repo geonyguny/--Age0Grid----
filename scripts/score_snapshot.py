@@ -47,13 +47,39 @@ def minmax_scale(x: pd.Series, higher_is_better: bool) -> pd.Series:
     # NaN 보정
     return out.where(np.isfinite(out), np.nan)
 
+# ─────────────────────────────────────────────────────────
+# CRRA 효용 함수
+# ─────────────────────────────────────────────────────────
+def crra_utility(x: pd.Series, gamma: float, floor: float = 1e-8) -> pd.Series:
+    """
+    CRRA 효용 u(c) = c^(1-gamma)/(1-gamma)  (gamma != 1)
+                   = log(c)                (gamma = 1)
+    - c는 0보다 커야 하므로, floor 이하 값은 floor로 올려서 처리합니다.
+    """
+    c = pd.to_numeric(x, errors="coerce").astype(float)
+    # 아주 작거나 음수인 값은 floor로 clip
+    c = c.clip(lower=floor)
+    if abs(gamma - 1.0) < 1e-8:
+        u = np.log(c)
+    else:
+        u = (np.power(c, 1.0 - gamma) - 1.0) / (1.0 - gamma)
+    return pd.Series(u, index=x.index)
+
 def compute_composite(
     df: pd.DataFrame,
     metrics: List[str],
     weights: List[float],
     lower_is_better: List[str],
     prefix_norm: str = "norm_",
+    use_utility: bool = False,
+    gamma: float = 4.0,
+    utility_metrics: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Tuple[float, float]]]:
+    """
+    metrics / weights 기반으로 CompositeScore 계산.
+    use_utility=True 이면, 지정된 지표(utility_metrics 또는 metrics 전체)에
+    CRRA 효용 변환을 먼저 적용한 뒤 min-max 정규화 및 가중합을 수행.
+    """
     assert len(metrics) == len(weights), "metrics와 weights의 길이가 일치해야 합니다."
     df = df.copy()
 
@@ -63,16 +89,33 @@ def compute_composite(
         raise SystemExit("[ERR] weights에 유효하지 않은 값이 있습니다.")
     w = w / w.sum()
 
+    if utility_metrics is not None:
+        utility_metrics = [m.strip() for m in utility_metrics if m.strip() != ""]
+
     # 정규화 및 점수
     norms: Dict[str, pd.Series] = {}
     ranges: Dict[str, Tuple[float, float]] = {}
     for i, m in enumerate(metrics):
         if m not in df.columns:
             raise SystemExit(f"[ERR] '{m}' 컬럼이 없습니다.")
+
         higher_is_better = (m not in lower_is_better)
-        vmin, vmax = safe_minmax(df[m])
+
+        # 원본 값
+        series = df[m]
+
+        # CRRA 효용 변환을 적용할 지 여부
+        if use_utility and (utility_metrics is None or m in utility_metrics):
+            # wealth-type 지표를 효용 공간으로 옮김
+            u_col = f"u_{m}"
+            df[u_col] = crra_utility(series, gamma=gamma)
+            base_series = df[u_col]
+        else:
+            base_series = series
+
+        vmin, vmax = safe_minmax(base_series)
         ranges[m] = (vmin, vmax)
-        norms[m] = minmax_scale(df[m], higher_is_better)
+        norms[m] = minmax_scale(base_series, higher_is_better)
         df[f"{prefix_norm}{m}"] = norms[m]
 
     # CompositeScore = Σ w_i * norm_i
@@ -214,17 +257,27 @@ def filter_scope(df: pd.DataFrame, tag_startswith: str, method: str, es_mode: st
 # 메인
 # ─────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Add CompositeScore to snapshot CSV")
+    ap = argparse.ArgumentParser(description="Add CompositeScore to snapshot CSV (EW/ES95 또는 CRRA 효용 기반)")
     ap.add_argument("--src", required=True, help="입력 스냅샷 CSV (예: .\\outputs\\DEV_metrics_snapshot.csv)")
     ap.add_argument("--out", default="inplace",
                     help="출력 경로. 'inplace'면 원본 덮어쓰기, 비우면 *_scored.csv로 저장")
     ap.add_argument("--tag_startswith", default="", help="예: DEV_2D_, OVN_2D_, DEV_OAT_ …")
     ap.add_argument("--method", default="", help="필터: hjb/rl 등")
     ap.add_argument("--es_mode", default="", help="필터: wealth/cons 등")
+
     ap.add_argument("--metrics", default=DEF_METRICS, help=f"기본 '{DEF_METRICS}'")
     ap.add_argument("--weights", default=DEF_WEIGHTS, help=f"기본 '{DEF_WEIGHTS}' (합=1 권장)")
     ap.add_argument("--lower_is_better", default=",".join(LOWER_IS_BETTER_DEFAULT),
                     help="낮을수록 좋은 지표 리스트(콤마 구분)")
+
+    # CRRA 효용 관련 옵션
+    ap.add_argument("--use_utility", action="store_true",
+                    help="CRRA 효용(γ)으로 metrics를 변환한 뒤 정규화/가중합")
+    ap.add_argument("--gamma", type=float, default=4.0,
+                    help="CRRA 계수 γ (gamma=1이면 로그 효용으로 처리)")
+    ap.add_argument("--utility_metrics", default="",
+                    help="효용 변환을 적용할 지표 리스트(콤마). 비우면 --metrics 전체에 적용")
+
     ap.add_argument("--round", type=int, default=4, help="CompositeScore 소수 반올림 자리수")
     args = ap.parse_args()
 
@@ -249,9 +302,25 @@ def main():
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # 효용을 적용할 지표 목록
+    utility_metrics = parse_list(args.utility_metrics) if args.utility_metrics else None
+
+    if args.use_utility:
+        target_for_u = utility_metrics if utility_metrics is not None else metrics
+        print(f"[INFO] Using CRRA utility(gamma={args.gamma}) for metrics: {','.join(target_for_u)}")
+
     # 부분 DataFrame에 대해 계산
     part = df.loc[idx, :].copy()
-    scored, ranges = compute_composite(part, metrics, weights, lower, prefix_norm="norm_")
+    scored, ranges = compute_composite(
+        part,
+        metrics,
+        weights,
+        lower,
+        prefix_norm="norm_",
+        use_utility=args.use_utility,
+        gamma=args.gamma,
+        utility_metrics=utility_metrics,
+    )
 
     # 원본에 병합(선택 영역만 갱신)
     for c in [f"norm_{m}" for m in metrics] + ["CompositeScore"]:

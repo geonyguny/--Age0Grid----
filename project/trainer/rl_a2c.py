@@ -76,7 +76,7 @@ class _GymShim:
             W  = _to_f(s.get("W", s.get("W_t", 0.0)), 0.0)
             T  = max(getattr(self.base, "T", 1), 1)
             W0 = _to_f(getattr(self.base, "W0", 1.0), 1.0) or 1.0
-            age = _to_f(s.get("age", getattr(self.base, "age_years", 65.0)), 65.0)
+            age = _to_f(s.get("age", getattr(self.base, "age_years", 55.0)), 55.0)
             age_norm = age / 120.0
             return np.array([t/float(T-1 if T > 1 else 1), W/max(W0, 1e-12), age_norm, 0.0], dtype=np.float32)
         arr = np.asarray(s, dtype=np.float32).ravel()
@@ -655,7 +655,7 @@ def make_actor_from_policy(policy: PolicyNet, cfg: Any, device: str = "cpu") -> 
                 t_val = _to_f(state.get("t", state.get("age", 0.0)), 0.0)
                 t_norm = max(0.0, min(1.0, t_val / float(T_ref)))
             W = _to_f(state.get("W", state.get("W_t", 0.0)), 0.0)
-            age = _to_f(state.get("age", 65.0), 65.0)
+            age = _to_f(state.get("age", 55.0), 55.0)
             obs4 = np.array([t_norm, W / max(W0, 1e-12), age / 120.0, 0.0], dtype=np.float32)
         except Exception:
             obs4 = np.array([0.0, 1.0, 65.0/120.0, 0.0], dtype=np.float32)

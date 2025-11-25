@@ -31,6 +31,12 @@ def _clip01(x: float) -> float:
 
 
 def _crra_u(c: float, gamma: float) -> float:
+    """
+    CRRA utility:
+      u(c) = log c                if gamma ≈ 1
+           = (c^{1-gamma}-1)/(1-g) otherwise
+    c는 최소 1e-12로 바운드하여 수치 폭주 방지.
+    """
     c = max(float(c), 1e-12)
     if abs(float(gamma) - 1.0) < 1e-12:
         return math.log(c)
@@ -118,17 +124,26 @@ def _load_market_arrays(csv_path: str, use_real_rf: str) -> Tuple[np.ndarray, np
 class RetirementEnv:
     """
     Retirement decumulation env (월 리밸런스)
-      - state(obs): ndarray([t_norm, W_t])
-      - action: (q, w) ∈ [0,1]^2
-      - order: clipping → consumption → returns(+hedge) → fee
-      - q_floor=None → 0.0 안전처리, floor_on이면 q_min=max(q_floor, f_min_real/W)
 
-    주입 지원:
-      cfg/kwargs에 data_ret_series, data_rf_series, data_cpi 가 있으면 CSV 대신 이를 사용.
-      market_mode='bootstrap'일 때 블록부트스트랩, 'iid'면 파라메트릭 IID.
+    state(obs): ndarray([t_norm, W_t])
+    action: (q, w) ∈ [0,1]^2
+      - q: 소비 비율
+      - w: 위험자산 비중(나머지는 안전자산)
 
-    step() 반환: (obs, reward, done, info)  ← 테스트 호환(항상 4-튜플)
-      - (기존 trunc는 info["truncated"]로 제공)
+    보상 구조(기본값 기준):
+      base_reward_t = u_scale * u_CRRA(c_t; gamma) + survive_bonus
+      reward_t = base_reward_t            (beta=1, 패널티 계수=0일 때)
+
+    선택적 이론형 옵션(논문 목적함수 맞추기용):
+      - beta              : env 내부 시간할인계수 (기본 1.0 → 변경 없으면 기존과 동일)
+      - lambda_ruin       : 파산(wealth=0) 시 패널티 계수
+      - lambda_shortfall  : 만기 단기부족 L_T = max(F_target - W_T, 0)에 대한 패널티 계수
+      - ruin_penalty_once : 파산 패널티를 최초 1회만 줄지 여부("on"/"off")
+
+    최종 보상(옵션 포함):
+      reward_t = beta^t * ( base_reward_t
+                            - lambda_ruin * I{ruin}
+                            - lambda_shortfall * L_T )
     """
 
     # --- cfg/kwargs 통합 접근자 ---
@@ -167,9 +182,22 @@ class RetirementEnv:
             self._get(cfg, kwargs, "ann_zero_fee_after_purchase", "on") or "on"
         ).lower() == "on"
 
+        # 효용 관련 파라미터 (CRRA)
         self.survive_bonus = _safe_float(self._get(cfg, kwargs, "survive_bonus", 0.0), 0.0)
         self.u_scale = _safe_float(self._get(cfg, kwargs, "u_scale", 0.05), 0.05)
         self.gamma   = _safe_float(self._get(cfg, kwargs, "crra_gamma", 3.0), 3.0)
+
+        # [NEW] HJB형 목적함수 옵션: 할인계수 및 패널티 계수
+        self.beta = _safe_float(self._get(cfg, kwargs, "beta", 1.0), 1.0)
+        self.lambda_ruin = _safe_float(self._get(cfg, kwargs, "lambda_ruin", 0.0), 0.0)
+        self.lambda_shortfall = _safe_float(self._get(cfg, kwargs, "lambda_shortfall", 0.0), 0.0)
+        self.ruin_penalty_once = str(
+            self._get(cfg, kwargs, "ruin_penalty_once", "on") or "on"
+        ).lower() == "on"
+        # 내부 할인 계수 상태(에피소드별로 reset 시 1.0에서 시작)
+        self._disc_factor: float = 1.0
+        # 파산 패널티를 한 번만 줄 경우, 이미 부과했는지 여부
+        self._ruin_penalized: bool = False
 
         # --- [ANN] annuity overlay params ---
         # 기본값 'auto': ann_alpha>0 이면 자동으로 annuity init 시도, 'off'일 때만 강제 비활성화
@@ -184,7 +212,7 @@ class RetirementEnv:
         self.ann_a_factor = 0.0
 
         # --- meta ---
-        self.age0 = int(self._get(cfg, kwargs, "age0", 65))
+        self.age0 = int(self._get(cfg, kwargs, "age0", 55))
         self.age_years = float(self.age0)
 
         # --- market sources ---
@@ -302,7 +330,7 @@ class RetirementEnv:
                 lt = load_life_table(
                     mt_str,
                     sex=str(self._get(cfg, kwargs, "sex", "M") or "M").upper(),
-                    age0=int(self._get(cfg, kwargs, "age0", 65)),
+                    age0=int(self._get(cfg, kwargs, "age0", 55)),
                     horizon_years=int(self._get(cfg, kwargs, "horizon_years", 45)),
                     steps_per_year=int(self._get(cfg, kwargs, "steps_per_year", 12)),
                     annual_improvement=_safe_float(self._get(cfg, kwargs, "mort_imp", 0.01), 0.01),
@@ -396,7 +424,7 @@ class RetirementEnv:
         rf = _safe_float(self.path_safe[self.t], 0.0)
         return rr, rf
 
-        # ----- annuity init at reset -----
+    # ----- annuity init at reset -----
     def _annuity_init_if_any(self):
         """
         life_table 있고, ann_alpha>0 이고, ann_on이 'off'가 아니면
@@ -536,6 +564,10 @@ class RetirementEnv:
 
         # (효용-레이어) 이전 효용 초기화
         self._prev_u_for_habit = 0.0
+
+        # [NEW] 이론형 목적함수 관련 상태 초기화
+        self._disc_factor = 1.0
+        self._ruin_penalized = False
 
         # 경로 생성
         if self.market_mode == "bootstrap":
@@ -698,7 +730,7 @@ class RetirementEnv:
         fee = _safe_float(fee_m_eff * W_after_c, 0.0)
         self.W = max(_safe_float(W_before_fee - fee, 0.0), 0.0)
 
-        # ----- 효용 및 보상 (효용-레이어 행동편향 반영) -----
+        # ----- 효용(유틸리티) 계산 + 행동편향 훅 ---------------------------
         base_u = _crra_u(c, _safe_float(getattr(self, "crra_gamma", 3.0), 3.0))
         u_eff = base_u
         spec = getattr(self, "_bh_spec", None)
@@ -710,12 +742,12 @@ class RetirementEnv:
                 u_eff = float(u2)
             except Exception:
                 u_eff = base_u
-        reward = (
+
+        base_reward = (
             _safe_float(getattr(self, "u_scale", 0.0), 0.0)
             * _safe_float(u_eff, base_u)
             + _safe_float(getattr(self, "survive_bonus", 0.0), 0.0)
         )
-        reward = np.clip(reward, -100.0, 100.0)
 
         # advance time ------------------------------------------------------
         self.t += 1
@@ -735,7 +767,7 @@ class RetirementEnv:
 
         done = (self.t >= self.T) or (self.W <= 0.0)
 
-        # ----- Bias 신호(액션-레이어 편향 모듈용) -----
+        # ----- Bias 신호(액션-레이어 편향 모듈용) -------------------------
         recent_ret = float(r_risky_raw)
         if self.t >= 12:
             win = _nan_guard_arr(self.path_risky[self.t - 12 : self.t], fill=0.0)
@@ -774,6 +806,7 @@ class RetirementEnv:
             "truncated": False,  # 4-튜플 규약: trunc는 info에만 표시
         }
 
+        L_term = 0.0
         if done:
             W_T = float(_safe_float(self.W, 0.0))
             info.setdefault("W_T", W_T)
@@ -786,8 +819,48 @@ class RetirementEnv:
             try:
                 if _F is not None:
                     F_val = float(_safe_float(_F, 0.0))
-                    info.setdefault("L_term", float(max(F_val - W_T, 0.0)))
+                    L_term = float(max(F_val - W_T, 0.0))
+                    info.setdefault("L_term", L_term)
             except Exception:
                 pass
 
+        # ----- HJB형 패널티 및 시간 할인 반영 -----------------------------
+        ruin_flag = bool(self.W <= 0.0)
+        info["ruin_flag"] = ruin_flag
+
+        penalty = 0.0
+
+        # (1) 파산 패널티
+        lam_r = _safe_float(getattr(self, "lambda_ruin", 0.0), 0.0)
+        if lam_r > 0.0 and ruin_flag:
+            if (not self.ruin_penalty_once) or (not getattr(self, "_ruin_penalized", False)):
+                penalty -= lam_r
+                if self.ruin_penalty_once:
+                    self._ruin_penalized = True
+
+        # (2) 만기 단기부족 패널티 (있다면)
+        lam_s = _safe_float(getattr(self, "lambda_shortfall", 0.0), 0.0)
+        if lam_s > 0.0 and L_term > 0.0:
+            penalty -= lam_s * L_term
+
+        # (3) 내부 시간 할인(beta) 적용
+        beta = _safe_float(getattr(self, "beta", 1.0), 1.0)
+        disc_factor = float(getattr(self, "_disc_factor", 1.0))
+
+        reward = base_reward + penalty
+        if beta != 1.0:
+            reward = reward * disc_factor
+            self._disc_factor = disc_factor * beta
+        else:
+            self._disc_factor = disc_factor  # 유지
+
+        # reward 클리핑
+        reward = float(np.clip(reward, -100.0, 100.0))
+
+        # 모니터링용 정보 추가
+        info["base_reward"] = float(base_reward)
+        info["penalty"] = float(penalty)
+        info["beta"] = float(beta)
+        info["disc_factor"] = float(self._disc_factor)
+ 
         return self._obs(), float(reward), bool(done), info

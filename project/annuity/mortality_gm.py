@@ -146,8 +146,8 @@ def load_life_table(
     mode: str,
     *,
     sex: Sex = "M",
-    age0: int = 65,
-    horizon_years: int = 35,
+    age0: int = 55,
+    horizon_years: int = 45,
     steps_per_year: int = 12,
     annual_improvement: float = 0.01,
 ) -> pd.DataFrame:

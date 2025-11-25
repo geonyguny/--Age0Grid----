@@ -41,7 +41,7 @@ $common = @(
   "--alpha","0.95",
   "--lambda_term","0.8",
   "--beta","0.996",
-  "--mortality","on","--sex","M","--age0","65",
+  "--mortality","on","--sex","M","--age0","55",
   "--autosave","on",
   "--print_mode","summary"
 )

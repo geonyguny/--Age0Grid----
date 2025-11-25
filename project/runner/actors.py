@@ -126,7 +126,7 @@ def rule_actor_kgr(cfg: SimConfig, env: RetirementEnv, *, quiet: bool) -> Callab
     life_table_df = get_life_table_from_env(env)
     r_f_real_annual = float(getattr(env, "r_f_real_annual", 0.02) or 0.02)
     W0 = float(getattr(env, "W0", 1.0))
-    age0 = float(getattr(cfg, "age0", 65) or 65)
+    age0 = float(getattr(cfg, "age0", 55) or 55)
 
     kgr_cfg = KGRLiteConfig(
         FR_high=1.30, FR_low=0.85, delta_up=0.07, delta_dn=-0.07,
@@ -239,7 +239,7 @@ def build_hjb_actor(cfg: SimConfig, args, env: RetirementEnv):
     else:
         Wg = _np.linspace(float(getattr(cfg, "hjb_W_min", 0.0)),
                           float(getattr(cfg, "hjb_W_max", 1.5)),
-                          int(getattr(cfg, "hjb_W_grid", 65) or 65))
+                          int(getattr(cfg, "hjb_W_grid", 55) or 55))
 
     # 비정상/빈 테이블 → 상수 정책 폴백
     def _fallback_actor():

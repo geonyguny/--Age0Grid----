@@ -39,7 +39,7 @@ $common = @(
   "--alpha","0.95",
   "--lambda_term","0.8",
   "--beta","0.996",
-  "--mortality","on","--sex","M","--age0","65",
+  "--mortality","on","--sex","M","--age0","55",
   "--rl_epochs","3",                 # 초미니 에폭(빠름)
   "--rl_steps_per_epoch","1024",     # 짧은 스텝(빠름)
   "--rl_n_paths_eval","200",         # 평가 경로 축소(빠름)

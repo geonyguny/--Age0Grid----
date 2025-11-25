@@ -224,7 +224,7 @@ def init_from_sim_cfg(
     ann_alpha = float(getattr(sim_cfg, "ann_alpha", 0.0))
     ann_load = float(getattr(sim_cfg, "ann_load", 0.0))
     ann_index = str(getattr(sim_cfg, "ann_index", "real"))
-    age0 = int(getattr(sim_cfg, "age0", 65))
+    age0 = int(getattr(sim_cfg, "age0", 55))
 
     cfg = AnnuityConfig(
         on=ann_on,

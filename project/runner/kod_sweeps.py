@@ -223,7 +223,7 @@ def sweep_age_sex(tag: str = "exp_age_sex", preset: Optional[BasePreset] = None)
 
     rows: List[Dict[str, Any]] = []
     for sex in ("M", "F"):
-        for age0 in range(55, 66):  # 55~65
+        for age0 in range(55, 65):  # 55~65
             ns = _ns_from_defaults(**asdict(pr),
                                    tag=f"{tag}_RL_{sex}{age0}",
                                    sex=sex, age0=int(age0),

@@ -196,7 +196,7 @@ def make_cfg(args) -> SimConfig:
         mortality=_get(args, "mortality", getattr(cfg, "mortality", "off")),
         mortality_on=(str(_get(args, "mortality", "off")).lower() == "on"),
         mort_table=_get(args, "mort_table", getattr(cfg, "mort_table", None)),
-        age0=_get(args, "age0", getattr(cfg, "age0", 65)),
+        age0=_get(args, "age0", getattr(cfg, "age0", 55)),
         sex=_get(args, "sex", getattr(cfg, "sex", "M")),
         bequest_kappa=_get(args, "bequest_kappa", getattr(cfg, "bequest_kappa", None)),
         bequest_gamma=_get(args, "bequest_gamma", getattr(cfg, "bequest_gamma", None)),

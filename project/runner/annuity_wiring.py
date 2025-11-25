@@ -124,7 +124,7 @@ def setup_annuity_overlay(cfg: SimConfig, args) -> Optional[Dict[str, float | in
         return None
 
     spm = int(getattr(cfg, "steps_per_year", 12) or 12)
-    age0 = int(getattr(cfg, "age0", 65) or 65)
+    age0 = int(getattr(cfg, "age0", 55) or 55)
     horizon_years = int(getattr(cfg, "horizon_years", 35) or 35)
     index_mode = str(getattr(args, "ann_index", getattr(cfg, "ann_index", "real")) or "real").lower()
     first_immediate = bool(int(getattr(args, "ann_d", getattr(cfg, "ann_d", 0)) or 0) == 0)

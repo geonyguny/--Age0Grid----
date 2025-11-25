@@ -106,7 +106,7 @@ class SimConfig:
     # --- Mortality / bequest (옵션) ---
     mortality: Literal["on", "off"] = "off"
     mort_table: Optional[str] = None
-    age0: int = 65
+    age0: int = 55
     sex: Literal["M", "F"] = "M"
     bequest_kappa: float = 0.0
     bequest_gamma: float = 1.0

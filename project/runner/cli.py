@@ -207,7 +207,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # ---------------- Mortality ----------------
     p.add_argument("--mortality", choices=["on", "off"], default="off")
     p.add_argument("--mort_table", help="사망표 경로/키")
-    p.add_argument("--age0", type=int, default=65)
+    p.add_argument("--age0", type=int, default=55)
     p.add_argument("--sex", choices=["M", "F"], default="M")
     p.add_argument("--bequest_kappa", type=float, default=0.0)
     p.add_argument("--bequest_gamma", type=float, default=1.0)
@@ -651,7 +651,7 @@ def _emit_summary(out: dict, args) -> None:
     header = {
         "method": out.get("method"),
         "asset": out.get("asset"),
-        "age0": getattr(args, "age0", 65),
+        "age0": getattr(args, "age0", 55),
         "sex": getattr(args, "sex", "M"),
         "n_paths": None,
         "es_mode": (out.get("es_mode")

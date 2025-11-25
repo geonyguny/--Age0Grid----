@@ -121,7 +121,7 @@ class RetirementEnv:
         # Mortality
         mort_flag = (str(getattr(cfg, "mortality", "off")).lower() == "on") or bool(getattr(cfg, "mortality_on", False))
         self.mortality_on = bool(mort_flag)
-        self.age0 = int(getattr(cfg, "age0", 65))
+        self.age0 = int(getattr(cfg, "age0", 55))
         self.sex  = str(getattr(cfg, "sex", "M"))
         self.mort = MortalitySampler(getattr(cfg, "mort_table", None)) if self.mortality_on else None
 

@@ -832,7 +832,7 @@ def _build_env_factory_from_args(args, cfg: SimConfig):
         survive_bonus=float(getattr(args, "survive_bonus", 0.0) or 0.0),
         u_scale=float(getattr(args, "u_scale", 0.05) or 0.05),
         crra_gamma=float(getattr(args, "crra_gamma", 3.0) or 3.0),
-        age0=int(getattr(args, "age0", 65)),
+        age0=int(getattr(args, "age0", 55)),
         sex=str(getattr(args, "sex", "M")),
         F_target=float(getattr(args, "F_target", 0.0) or 0.0),
         seeds=list(getattr(cfg, "seeds", getattr(args, "seeds", [0]))),

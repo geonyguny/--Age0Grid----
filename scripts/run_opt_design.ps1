@@ -52,6 +52,7 @@ param(
 
   # 1D/2D 그리드 (기본값은 RunProfile에 따라 아래에서 다시 설정)
   [double[]]$AnnAlphaGrid  = @(),
+  [Alias('WriskGrid')]
   [double[]]$RiskShareGrid = @(),
   [double[]]$FeeGrid       = @(),
   [int[]]   $Age0Grid      = @(),
@@ -79,62 +80,46 @@ param(
 )
 
 # ---------- RunProfile별 기본 grid 설정 ----------
-# 사용자가 직접 넘긴 파라미터(PSBoundParameters에 존재)면 그대로 사용
 if (-not $PSBoundParameters.ContainsKey('AnnAlphaGrid') -or $AnnAlphaGrid.Count -eq 0) {
   if ($RunProfile -eq 'light') {
-    # light: 거친 ann_alpha 샘플링
     $AnnAlphaGrid = @(0.0, 0.25, 0.50, 0.75, 1.0)
   } else {
-    # heavy: 기존 0.0~1.0, 0.1 step
     $AnnAlphaGrid = @(0..10 | ForEach-Object { $_/10.0 })
   }
 }
 
 if (-not $PSBoundParameters.ContainsKey('RiskShareGrid') -or $RiskShareGrid.Count -eq 0) {
   if ($RunProfile -eq 'light') {
-    # light: wrisk 5점
     $RiskShareGrid = @(0.20, 0.40, 0.60, 0.80, 1.00)
   } else {
-    # heavy: 0.0~1.0, 0.1 step
     $RiskShareGrid = @(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0)
   }
 }
 
 if (-not $PSBoundParameters.ContainsKey('FeeGrid') -or $FeeGrid.Count -eq 0) {
-  if ($RunProfile -eq 'light') {
-    # light에서도 수수료는 3점 유지(계산비용 영향 적음)
-    $FeeGrid = @(0.0000, 0.0040, 0.0080)
-  } else {
-    $FeeGrid = @(0.0000, 0.0040, 0.0080)
-  }
+  $FeeGrid = @(0.0000, 0.0040, 0.0080)
 }
 
 if (-not $PSBoundParameters.ContainsKey('Age0Grid') -or $Age0Grid.Count -eq 0) {
   if ($RunProfile -eq 'light') {
-    # light: 대표 연령 60만 사용
-    $Age0Grid = @(60)
+    $Age0Grid = @(55)
   } else {
-    # heavy: 55~65, 1살 단위
-    $Age0Grid = @(55..65)
+    $Age0Grid = @(55)
   }
 }
 
 if (-not $PSBoundParameters.ContainsKey('HedgeGrid') -or $HedgeGrid.Count -eq 0) {
   if ($RunProfile -eq 'light') {
-    # light: 무헤지/절반/완전헤지
     $HedgeGrid = @(0.00, 0.50, 1.00)
   } else {
-    # heavy: 0, 25, 50, 75, 100%
     $HedgeGrid = @(0.00, 0.25, 0.50, 0.75, 1.00)
   }
 }
 
 if (-not $PSBoundParameters.ContainsKey('VPWGrid') -or $VPWGrid.Count -eq 0) {
   if ($RunProfile -eq 'light') {
-    # light: 대표 인출률 3점 (3, 5, 6%)
     $VPWGrid = @(0.03, 0.05, 0.06)
   } else {
-    # heavy: 기존 세밀 그리드
     $VPWGrid = @(0.03,0.035,0.04,0.045,0.05,0.055,0.06)
   }
 }
@@ -177,22 +162,36 @@ function Get-SeedArgs([string]$SeedsCsv){
   @('--seeds') + $parts
 }
 
-# (옵션) CPI CSV 스키마/블록 길이 점검
+# CPI CSV 스키마/블록 길이 점검(옵션)
 function Test-CpiSchema {
   param([string]$CsvPath,[int]$Block)
-  if(-not $CsvPath -or -not (Test-Path $CsvPath)){ Write-Host "[CPI] Skip schema check." -ForegroundColor Yellow; return }
+  if(-not $CsvPath -or -not (Test-Path $CsvPath)){
+    Write-Host "[CPI] Skip schema check." -ForegroundColor Yellow
+    return
+  }
   $first = Get-Content -Path $CsvPath -TotalCount 1
   if(-not $first){ Write-Warning "[CPI] Empty CSV: $CsvPath"; return }
   $hdr = $first.Split(',') | ForEach-Object { $_.Trim() }
   $need = @('date','risky_nom','tbill_nom','cpi')
-  $miss = @(); foreach($h in $need){ if($hdr -notcontains $h){ $miss += $h } }
-  if($miss.Count -gt 0){ Write-Warning ("[CPI] Missing headers: {0}" -f ($miss -join ', ')) } else { Write-Host "[CPI] Header OK." -ForegroundColor Green }
-  if($Block -ne 24){ Write-Host "[CPI] bootstrap_block=$Block (policy recommends 24)." -ForegroundColor Yellow } else { Write-Host "[CPI] bootstrap_block=24 verified." -ForegroundColor Green }
+  $miss = @()
+  foreach($h in $need){ if($hdr -notcontains $h){ $miss += $h } }
+  if($miss.Count -gt 0){
+    Write-Warning ("[CPI] Missing headers: {0}" -f ($miss -join ', '))
+  } else {
+    Write-Host "[CPI] Header OK." -ForegroundColor Green
+  }
+  if($Block -ne 24){
+    Write-Host "[CPI] bootstrap_block=$Block (policy recommends 24)." -ForegroundColor Yellow
+  } else {
+    Write-Host "[CPI] bootstrap_block=24 verified." -ForegroundColor Green
+  }
 }
 
-# CLI 도움말(플래그 감지)
+# CLI 도움말(플래그 감지) – 일부 플래그에만 사용
 $global:CLI_HELP = (& .\.venv\Scripts\python.exe -m project.runner.cli -h 2>&1 | Out-String)
-function SupportsFlag([string]$flag){ return $global:CLI_HELP -match ("--" + [regex]::Escape($flag) + "(\s|$|=)") }
+function SupportsFlag([string]$flag){
+  return $global:CLI_HELP -match ("--" + [regex]::Escape($flag) + "(\s|$|=)")
+}
 
 # Asset mix → args
 function Build-MixArgs([string]$mix){
@@ -332,7 +331,6 @@ if($MainANN){
   Write-Host "`n[MAIN_ANN] Annuity 현실화 비교" -ForegroundColor Green
   $Py = ".\.venv\Scripts\python.exe"
 
-  # 공통 annuity 비중(ann_alpha) 및 RL 설정
   $COMMON = @('--method','rl','--mode','rl',
               '--rl_epochs',"$MainANNEpochs",'--rl_steps_per_epoch',"$MainANNStepsPerEpoch",
               '--n_paths',"$MainANNPaths",'--seed',"$MainANNSeed",
@@ -345,14 +343,12 @@ if($MainANN){
 
   if(SupportsFlag('bias_on')){ $COMMON += @('--bias_on','off') }
 
-  # FAIR: 공정가(무로딩, 실질)
   $FAIR = @('--tag','MAIN_ANN_FAIR',
             '--mortality','on','--mort_table',$MainANNMortFair,
             '--phi_adval','0.0','--ann_index','real')
   if(SupportsFlag('use_real_rf')){ $FAIR += @('--use_real_rf','on') }
   & $Py @('-m','project.runner.cli') @FAIR @COMMON *> (Join-Path $Logs 'MAIN_ANN_FAIR.log')
 
-  # REAL (real): 로딩 + 개선 생명표, 실질
   $phi = ('{0:F2}' -f $MainANNPhi)
   $REAL = @('--tag','MAIN_ANN_REAL',
             '--mortality','on','--mort_table',$MainANNMortReal,
@@ -360,18 +356,17 @@ if($MainANN){
   if(SupportsFlag('use_real_rf')){ $REAL += @('--use_real_rf','on') }
   & $Py @('-m','project.runner.cli') @REAL @COMMON *> (Join-Path $Logs 'MAIN_ANN_REAL.log')
 
-  # REAL_NOM: 로딩 + 개선 생명표, 명목연금 + 명목RF
   $REALN = @('--tag','MAIN_ANN_REAL_NOM',
              '--mortality','on','--mort_table',$MainANNMortReal,
              '--phi_adval',$phi,'--ann_index','nominal')
   if(SupportsFlag('use_real_rf')){ $REALN += @('--use_real_rf','off') }
   & $Py @('-m','project.runner.cli') @REALN @COMMON *> (Join-Path $Logs 'MAIN_ANN_REAL_NOM.log')
 
-  # 스냅샷/스코어
   $metricsCsv = Join-Path $Logs 'metrics.csv'
   $snap = Join-Path $Out 'MAIN_ANN_snapshot.csv'
   if(Test-Path $metricsCsv){
-    (Import-Csv $metricsCsv | Where-Object { $_.tag -in 'MAIN_ANN_FAIR','MAIN_ANN_REAL','MAIN_ANN_REAL_NOM' } |
+    (Import-Csv $metricsCsv |
+      Where-Object { $_.tag -in 'MAIN_ANN_FAIR','MAIN_ANN_REAL','MAIN_ANN_REAL_NOM' } |
       Group-Object tag,method,seed | ForEach-Object { $_.Group | Select-Object -Last 1 }) |
       Export-Csv $snap -NoTypeInformation -Encoding UTF8
     Write-Host "[OK] snapshot => $snap"
@@ -427,45 +422,67 @@ if($Smoke){
 # 1) 1D sweeps
 # ===================================================
 if(-not $Skip1D){
-  Write-Host "`n[STAGE 1] 1D sweeps" -ForegroundColor Green
+  Write-Host "`n[STAGE 1] 1D sweeps (ann / wrisk / VPW + 기타)" -ForegroundColor Green
   foreach($sex in $Sexes){
     foreach($mort in $MortCfg){
       $m = $MortMap[$mort]; $mortArgs=@{}; for($i=0;$i -lt $m.Count;$i+=2){ $mortArgs[$m[$i]]=$m[$i+1] }
 
+      # 1D ann_alpha
       foreach($a in $AnnAlphaGrid){
         $tag = Make-Tag $mort 'DEV1D_ann' $sex
         $extra = @{ '--ann_alpha' = ('{0:F2}' -f $a) }
         if(SupportsFlag('ann_on')){ $extra['--ann_on'] = $(if($a -gt 0){'on'} else {'off'}) }
         Invoke-CLI -Tag ("${tag}_{0:F1}" -f $a) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
+
+      # 1D wrisk (w_max)
       foreach($w in $RiskShareGrid){
         $tag = Make-Tag $mort 'DEV1D_wrisk' $sex
-        Invoke-CLI -Tag ("${tag}_{0:F3}" -f $w) -Sex $sex -MortArgs $mortArgs -Extra @{ '--w_max' = ('{0:F2}' -f $w) } | Out-Null
+        $extra = @{ '--w_max' = ('{0:F2}' -f $w) }
+        Invoke-CLI -Tag ("${tag}_{0:F3}" -f $w) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
+
+      # 1D fee
       foreach($fee in $FeeGrid){
         $tag = Make-Tag $mort 'DEV1D_fee' $sex
-        Invoke-CLI -Tag ("${tag}_{0:F4}" -f $fee) -Sex $sex -MortArgs $mortArgs -Extra @{ '--fee_annual' = ('{0:F4}' -f $fee) } | Out-Null
+        $extra = @{ '--fee_annual' = ('{0:F4}' -f $fee) }
+        Invoke-CLI -Tag ("${tag}_{0:F4}" -f $fee) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
+
+      # 1D age0
       foreach($age0 in $Age0Grid){
         $tag = Make-Tag $mort 'DEV1D_age' $sex
         Invoke-CLI -Tag ("${tag}_${age0}") -Sex $sex -MortArgs $mortArgs -Extra @{ '--age0' = "$age0" } | Out-Null
       }
+
+      # 1D hedge
       foreach($hz in $HedgeGrid){
         $tag = Make-Tag $mort 'DEV1D_hedge' $sex
         $extra=@{}
         if($FxFlags.ratio){ $extra[$FxFlags.ratio]=('{0:F2}' -f $hz) }
         if($FxFlags.onoff){ $extra[$FxFlags.onoff]=$(if($hz -gt 0){'on'} else {'off'}) }
-        if($extra.Count -gt 0){ Invoke-CLI -Tag ("${tag}_{0:F2}" -f $hz) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null }
+        if($extra.Count -gt 0){
+          Invoke-CLI -Tag ("${tag}_{0:F2}" -f $hz) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
+        }
       }
+
+      # 1D VPW (cstar_mode=vpw, cstar_m)
       foreach($vpw in $VPWGrid){
         $tag = Make-Tag $mort 'DEV1D_vpw' $sex
-        $extra=@{}; if(SupportsFlag('cstar_mode')){ $extra['--cstar_mode']='vpw' }; if(SupportsFlag('cstar_m')){ $extra['--cstar_m']=('{0:F3}' -f $vpw) }
-        if($extra.Count -gt 0){ Invoke-CLI -Tag ("${tag}_{0:F3}" -f $vpw) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null }
+        $extra = @{
+          '--cstar_mode' = 'vpw'
+          '--cstar_m'    = ('{0:F3}' -f $vpw)
+        }
+        Invoke-CLI -Tag ("${tag}_{0:F3}" -f $vpw) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
       }
+
+      # 1D asset mix
       foreach($mix in $AssetMixes){
         $tag = Make-Tag $mort ("DEV1D_mix_$mix") $sex
         $extra = Build-MixArgs $mix
-        if($extra.Count -gt 0){ Invoke-CLI -Tag $tag -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null }
+        if($extra.Count -gt 0){
+          Invoke-CLI -Tag $tag -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
+        }
       }
     }
   }
@@ -482,14 +499,20 @@ if(-not $Skip2D){
     foreach($mort in $MortCfg){
       $m = $MortMap[$mort]; $mortArgs=@{}; for($i=0;$i -lt $m.Count;$i+=2){ $mortArgs[$m[$i]]=$m[$i+1] }
 
+      # 2D (ann_alpha, wrisk)
       foreach($a in $AnnAlphaGrid){
         foreach($w in $RiskShareGrid){
           $tag = Make-Tag $mort 'DEV2D_ann_wrisk' $sex
-          $extra = @{ '--w_max'=('{0:F2}' -f $w); '--ann_alpha'=('{0:F2}' -f $a) }
+          $extra = @{
+            '--w_max'     = ('{0:F2}' -f $w)
+            '--ann_alpha' = ('{0:F2}' -f $a)
+          }
           if(SupportsFlag('ann_on')){ $extra['--ann_on']=$(if($a -gt 0){'on'} else {'off'}) }
           Invoke-CLI -Tag ("${tag}_a{0:F3}_w{1:F3}" -f $a,$w) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
         }
       }
+
+      # 2D (wrisk, hedge)
       foreach($w in $RiskShareGrid){
         foreach($hz in $HedgeGrid){
           $tag = Make-Tag $mort 'DEV2D_wrisk_hedge' $sex
@@ -501,12 +524,16 @@ if(-not $Skip2D){
           }
         }
       }
+
+      # 2D (wrisk, VPW)
       foreach($w in $RiskShareGrid){
         foreach($vpw in $VPWGrid){
           $tag = Make-Tag $mort 'DEV2D_wrisk_c' $sex
-          $extra=@{ '--w_max'=('{0:F2}' -f $w) }
-          if(SupportsFlag('cstar_mode')){ $extra['--cstar_mode']='vpw' }
-          if(SupportsFlag('cstar_m')){    $extra['--cstar_m']=('{0:F3}' -f $vpw) }
+          $extra=@{
+            '--w_max'     = ('{0:F2}' -f $w)
+            '--cstar_mode'= 'vpw'
+            '--cstar_m'   = ('{0:F3}' -f $vpw)
+          }
           Invoke-CLI -Tag ("${tag}_w{0:F3}_c{1:F3}" -f $w,$vpw) -Sex $sex -MortArgs $mortArgs -Extra $extra | Out-Null
         }
       }
@@ -526,7 +553,8 @@ $SnapDedup  = Join-Path $Out 'DEV_metrics_snapshot_dedup.csv'
 $SnapClean  = Join-Path $Out 'DEV_metrics_snapshot_clean.csv'
 
 if(Test-Path $metricsCsv){
-  (Import-Csv $metricsCsv | Group-Object tag,method,sex | ForEach-Object { $_.Group | Select-Object -Last 1 }) |
+  (Import-Csv $metricsCsv |
+    Group-Object tag,method,sex | ForEach-Object { $_.Group | Select-Object -Last 1 }) |
     Export-Csv $SnapRaw -NoTypeInformation -Encoding UTF8
   Write-Host "[OK] snapshot => $SnapRaw"
 
@@ -617,7 +645,6 @@ $PyExe = ".\.venv\Scripts\python.exe"
 $ScoredClean = Join-Path $Out 'DEV_scored_clean.csv'
 $ScoredRaw   = Join-Path $Out 'DEV_scored.csv'
 
-# 1D/optimal 리포트용 snapshot/score 소스 선택
 $SnapshotFor1D = $null
 if (Test-Path $SnapClean) { $SnapshotFor1D = $SnapClean }
 elseif (Test-Path $SnapDedup) { $SnapshotFor1D = $SnapDedup }
