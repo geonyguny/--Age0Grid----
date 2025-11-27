@@ -149,10 +149,31 @@ class RetirementEnv:
     # --- cfg/kwargs 통합 접근자 ---
     @staticmethod
     def _get(cfg: Any, kwargs: dict, name: str, default: Any) -> Any:
+        # 1) kwargs 우선
         if kwargs and (name in kwargs):
             return kwargs[name]
-        if cfg is not None and hasattr(cfg, name):
-            return getattr(cfg, name)
+
+        if cfg is not None:
+            # 2) 정확히 같은 이름
+            if hasattr(cfg, name):
+                return getattr(cfg, name)
+
+            # 3) CamelCase 변형 (ann_alpha -> AnnAlpha)
+            if name:
+                alt1 = name[0].upper() + name[1:]
+                if hasattr(cfg, alt1):
+                    return getattr(cfg, alt1)
+
+            # 4) 언더스코어 제거 후 대소문자 무시 비교
+            base = name.replace("_", "").lower()
+            for attr in dir(cfg):
+                if attr.startswith("_"):
+                    continue
+                a_low = attr.lower()
+                if a_low == name.lower() or a_low == base:
+                    return getattr(cfg, attr)
+
+        # 5) 어느 쪽에서도 못 찾으면 기본값
         return default
 
     def __init__(self, cfg: Any = None, **kwargs):
@@ -424,25 +445,23 @@ class RetirementEnv:
         rf = _safe_float(self.path_safe[self.t], 0.0)
         return rr, rf
 
-    # ----- annuity init at reset -----
+           # ----- annuity init at reset -----
     def _annuity_init_if_any(self):
         """
-        life_table 있고, ann_alpha>0 이고, ann_on이 'off'가 아니면
-        t=0에서 1회 종신연금 매입 후 y_ann 설정.
+        ann_alpha > 0 이고 ann_on 이 'off' 가 아니면
+        t=0에서 1회 종신연금을 매입하고, 매 스텝당 real 지급 y_ann 을 설정합니다.
 
-        - 매입비중: ann_alpha (0~1), W0의 ann_alpha 비중을 annuity 프리미엄으로 사용
-        - 가격: 종신연금은 **수수료/로딩 없이 공정가(fair price)**로 가격
-        - 지급: 매 스텝마다 고정 real 지급 y_ann (steps_per_year 기준)
-        - ann_index, phi_adval, ann_L 등은 **현 단계에서는 annuity 가격에 사용하지 않음**
+        - life_table 이 있으면 생존확률을 사용
+        - life_table 이 없으면 S_t = 1 (사망위험 무시)로 두고 단순 Yaari 스타일 annuity 구현
         """
 
-        # 기본값 초기화
+        # 기본 상태 리셋
         self.y_ann = 0.0
         self.ann_purchased = False
         self.ann_P = 0.0
         self.ann_a_factor = 0.0
 
-        # 1) annuity 사용 여부 체크 -------------------------------
+        # 1) annuity 사용 여부 체크 -----------------------------------
         alpha = _safe_float(getattr(self, "ann_alpha", 0.0), 0.0)
         if alpha <= 0.0:
             return
@@ -450,33 +469,54 @@ class RetirementEnv:
         mode = str(getattr(self, "ann_on", "auto") or "auto").lower()
         if mode == "off":
             return
+        if mode == "auto":
+            # alpha > 0 이면 자동 on
+            mode = "on"
+            setattr(self, "ann_on", "on")
 
-        # mortality 정보가 없으면 annuity 비활성화
-        if self.life_table is None or len(self.life_table) == 0:
+        # 현재 t=0 투자계정 기준자산
+        W0_now = float(
+            _safe_float(
+                getattr(self, "W", getattr(self, "W0", 0.0)),
+                getattr(self, "W0", 0.0),
+            )
+        )
+        if W0_now <= 0.0:
             return
 
-        lt = self.life_table.copy()
-        if "age" not in lt.columns:
-            return
-
-        lt = lt.sort_values("age").reset_index(drop=True)
-        ages = lt["age"].astype(int).to_numpy()
-
-        # 2) 연간 생존확률 px_year 구축 ---------------------------
-        if "px" in lt.columns:
-            px_year = np.clip(lt["px"].astype(float).to_numpy(), 0.0, 1.0)
-        elif "qx" in lt.columns:
-            qx_year = np.clip(lt["qx"].astype(float).to_numpy(), 0.0, 1.0)
-            px_year = 1.0 - qx_year
-        else:
-            # px/qx 둘 다 없으면 안전하게 annuity 비활성화
-            return
-
+        # 시간축 / 연령 ------------------------------------------------
         S = int(getattr(self, "steps_per_year", 12) or 12)
-        T = int(self.T)
-        age0 = int(self.age0)
+        T = int(getattr(self, "T", S * 30) or (S * 30))
+        age0 = int(getattr(self, "age0", 55))
+        horizon_years = int(math.ceil(T / float(S))) + 1
 
-        # age → px_year 맵 구성 (해당 age 구간에서는 가장 최근 px 사용)
+        # 2) 연간 생존확률 px_year 구축 ------------------------------
+        lt = getattr(self, "life_table", None)
+        px_year = None
+        ages = None
+
+        if isinstance(lt, pd.DataFrame) and not lt.empty and "age" in lt.columns:
+            lt_use = lt.copy()
+            lt_use["age"] = lt_use["age"].astype(int)
+            lt_use = lt_use.sort_values("age").reset_index(drop=True)
+
+            ages = lt_use["age"].to_numpy(dtype=int)
+            if "px" in lt_use.columns:
+                px_year = np.clip(
+                    lt_use["px"].astype(float).to_numpy(), 0.0, 1.0
+                )
+            elif "qx" in lt_use.columns:
+                qx_year = np.clip(
+                    lt_use["qx"].astype(float).to_numpy(), 0.0, 1.0
+                )
+                px_year = 1.0 - qx_year
+
+        if px_year is None or ages is None or px_year.size == 0:
+            # mortality off 또는 생명표 구조 불일치 → px=1.0 가정
+            ages = np.arange(age0, age0 + horizon_years, dtype=int)
+            px_year = np.ones_like(ages, dtype=float)
+
+        # age → px_year 맵 구성 --------------------------------------
         max_age_needed = age0 + math.ceil(T / S) + 1
         age_px_map: Dict[int, float] = {}
         j = 0
@@ -487,20 +527,21 @@ class RetirementEnv:
             last_px = float(px_year[j]) if j < len(px_year) else last_px
             age_px_map[age] = float(np.clip(last_px, 0.0, 1.0))
 
-        # 3) 스텝별 생존확률 S_t (t=0..T), S_0=1 -----------------
+        # 3) 스텝별 생존확률 S_t (t=0..T), S_0=1 ----------------------
         step_surv = np.empty(T + 1, dtype=float)
         step_surv[0] = 1.0
         for t in range(1, T + 1):
-            # t-1 ~ t 구간에 해당하는 연령
             age_t = age0 + (t - 1) // S
             px_yr = float(age_px_map.get(age_t, 1.0))
-            # 연간 px → 스텝별 q_m: 1년 생존확률 px = (1 - q_m)^S 가 되도록
+            # 연간 px → 스텝별 q_m: px = (1 - q_m)^S
             q_m = 1.0 - px_yr ** (1.0 / float(S))
             q_m = float(np.clip(q_m, 0.0, 1.0))
             step_surv[t] = step_surv[t - 1] * (1.0 - q_m)
 
-        # 4) 할인인자 (real rf 사용) ------------------------------
-        r_f_real = float(_safe_float(getattr(self, "r_f_real_annual", 0.02), 0.02))
+        # 4) 할인인자 (real rf 사용) ---------------------------------
+        r_f_real = float(
+            _safe_float(getattr(self, "r_f_real_annual", 0.02), 0.02)
+        )
         if r_f_real <= -0.99:
             r_f_real = 0.0
 
@@ -509,18 +550,20 @@ class RetirementEnv:
             dtype=float,
         )
 
-        # 지급시점별 EPV 가중치: 생존확률 * 할인인자
+        # 지급시점별 EPV 가중치: 생존확률 * 할인인자 ------------------
         surv_pay = step_surv[1:]  # 길이 T
         ann_factor = float(np.sum(surv_pay * disc))
         if (not np.isfinite(ann_factor)) or ann_factor <= 0.0:
             return
 
-        # 5) 공정가 조건으로 y_ann 결정 ---------------------------
-        W0_now = float(_safe_float(self.W, self.W0))
-        P = float(alpha * W0_now)  # 종신연금에 투입할 프리미엄
+        # 5) 공정가 조건으로 y_ann 및 초기 W 설정 --------------------
+        P = float(alpha * W0_now)  # 종신연금 프리미엄
+        if P <= 0.0:
+            return
+
         y_step = float(P / ann_factor)  # 매 스텝당 연금지급액
 
-        # 투자계정은 (1 - alpha) * W0_now로 시작
+        # 투자계정은 (1 - alpha) * W0_now 로 시작
         self.W = max(W0_now - P, 0.0)
 
         self.y_ann = max(y_step, 0.0)
@@ -558,9 +601,44 @@ class RetirementEnv:
         self.cpi_yoy = 0.0
 
         # [ANN] 초기화
+        #  - y_ann 포함해서 상태를 리셋하고,
+        #  - 그 다음에 annuity overlay를 적용해 W0 → (1 - alpha)·W0, y_ann 설정
+        self.y_ann = 0.0
         self.ann_purchased = False
         self.ann_P = 0.0
         self.ann_a_factor = 0.0
+
+# --- ANN DEBUG: before annuity init ---
+        try:
+            tag = getattr(self, "tag", "NA")
+            env_name = type(self).__name__
+            ann_alpha_dbg = getattr(self, "ann_alpha", None)
+            ann_on_dbg = getattr(self, "ann_on", None)
+            life_loaded = getattr(self, "life_table", None) is not None
+
+            print(
+                f"[ANN-DBG-RESET][before] env={env_name} tag={tag} "
+                f"ann_alpha={ann_alpha_dbg} ann_on={ann_on_dbg} "
+                f"life_table_loaded={life_loaded} W_before={self.W}"
+            )
+        except Exception:
+            pass
+
+        # t=0 연금 매입(옵션)
+        self._annuity_init_if_any()
+
+        # --- ANN DEBUG: after annuity init ---
+        try:
+            tag = getattr(self, "tag", "NA")
+            env_name = type(self).__name__
+            print(
+                f"[ANN-DBG-RESET][after ] env={env_name} tag={tag} "
+                f"W_after={self.W} y_ann={getattr(self, 'y_ann', None)} "
+                f"ann_P={getattr(self, 'ann_P', None)} "
+                f"ann_a_factor={getattr(self, 'ann_a_factor', None)}"
+            )
+        except Exception:
+            pass
 
         # (효용-레이어) 이전 효용 초기화
         self._prev_u_for_habit = 0.0

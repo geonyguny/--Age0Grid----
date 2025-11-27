@@ -58,6 +58,11 @@ class IRPEnvAdapter:
         else:
             self._env = RetirementEnv(**kwargs)
 
+        print("[ANN-DBG-IRP] IRPEnvAdapter created underlying env:",
+            type(self._env).__name__,
+            "with kwargs keys=", list(kwargs.keys()))
+
+
         self._last_info: Dict[str, Any] | None = None
 
     # ---------- Helpers ----------

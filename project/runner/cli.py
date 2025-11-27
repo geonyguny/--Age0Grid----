@@ -265,7 +265,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", choices=["on", "off"], default="off")
 
     # ---------------- ANN overlay ----------------
-    p.add_argument("--ann_on", choices=["on", "off"], default="off")
+    p.add_argument("--ann_on", choices=["on", "off"], default=None)
     p.add_argument("--ann_alpha", type=float, default=0.0)
     p.add_argument("--ann_L", type=float, default=0.0)
     p.add_argument("--ann_d", type=int, default=0)

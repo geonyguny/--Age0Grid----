@@ -6,24 +6,65 @@ import numpy as np
 import pandas as pd
 
 
+# =====================================================================
+# Dataclasses
+# =====================================================================
+
+
 @dataclass
 class AnnuityConfig:
-    """Static configuration for an immediate life annuity."""
-    on: bool          # whether annuity feature is enabled
-    alpha: float      # purchase fraction of W0 (θ)
-    L: float          # load (additional expense / margin)
-    d: int            # deferral (in years or steps, MVP: 0 = immediate)
-    index: str        # 'real' | 'nominal'
+    """
+    Static configuration for an immediate life annuity.
+
+    Parameters
+    ----------
+    on : bool
+        Whether the annuity feature is enabled.
+    alpha : float
+        Purchase fraction of initial wealth W0 (θ).
+    L : float
+        Load (additional expense / margin). Interpreted as φ_adval.
+    d : int
+        Deferral in years/steps (MVP: 0 = immediate).
+        Currently not used to shift payments in time but kept for future use.
+    index : str
+        'real' | 'nominal' – indexation convention of the annuity payout.
+    """
+    on: bool
+    alpha: float
+    L: float
+    d: int
+    index: str  # 'real' | 'nominal'
 
 
 @dataclass
 class AnnuityState:
-    """Runtime state of the annuity after init."""
+    """
+    Runtime state of the annuity after initialization.
+
+    Attributes
+    ----------
+    purchased : bool
+        Whether an annuity was actually purchased.
+    P : float
+        Premium paid at t=0.
+    y_ann : float
+        Per-step payout (e.g., monthly).
+    a_factor : float
+        Annuity-immediate factor (per-step).
+    t_star : int
+        Start step (MVP: 0).
+    """
     purchased: bool
-    P: float         # premium paid at t=0
-    y_ann: float     # per-step payout (e.g., monthly)
-    a_factor: float  # annuity-immediate factor (per-step)
-    t_star: int      # start step (MVP: 0)
+    P: float
+    y_ann: float
+    a_factor: float
+    t_star: int
+
+
+# =====================================================================
+# Survival and discounting helpers
+# =====================================================================
 
 
 def _monthly_survival_from_life_table(
@@ -50,6 +91,7 @@ def _monthly_survival_from_life_table(
     -------
     np.ndarray
         Array of survival probabilities at the end of each month.
+        Shape: (n_months,)
     """
     lt = lt.copy()
 
@@ -68,18 +110,22 @@ def _monthly_survival_from_life_table(
     S_m = []
     age_max = min(max_age, int(ages.max()))
 
-    # align index of age0
+    # align index of age0 (if age0 < min(ages), we start from the first age)
     start_idx = int(np.searchsorted(ages, age0))
+    start_idx = max(start_idx, 0)
+    start_idx = min(start_idx, len(ages) - 1)
+
     alive = 1.0
 
     for a_idx in range(start_idx, len(ages)):
         mu_y = float(mu[a_idx])
 
+        # monthly px under UDD: exp(-mu_y / S)
+        # keep S-month loop for flexibility (steps_per_year != 12)
         for _ in range(S):
-            # monthly px under UDD: exp(-mu_y / S)
             p_m = float(np.exp(-mu_y / S))
-            S_m.append(alive * p_m)
             alive *= p_m
+            S_m.append(alive)
 
         if ages[a_idx] >= age_max:
             break
@@ -114,16 +160,31 @@ def compute_ax_real(
     float
         Present value factor a_x with per-step payments.
     """
-    i_m = (1.0 + float(r_f_real_annual)) ** (1.0 / S) - 1.0
+    # guard against pathological or zero rates
+    r = float(r_f_real_annual)
+    if r > -0.9999:
+        i_m = (1.0 + r) ** (1.0 / S) - 1.0
+    else:
+        # extremely negative rate → approximate with very small positive monthly rate
+        i_m = 1e-8
+
     v = 1.0 / (1.0 + i_m)
 
     surv = _monthly_survival_from_life_table(age0_years, life_table, S=S)
+    if surv.size == 0:
+        return 1e-9
+
     # annuity-immediate: sum_{m=1..} v^m * P(alive at end of month m)
     disc = v ** np.arange(1, len(surv) + 1, dtype=float)
     a = float(np.sum(disc * surv))
 
     # numerical guard
     return max(a, 1e-9)
+
+
+# =====================================================================
+# Core initializer
+# =====================================================================
 
 
 def init_annuity(
@@ -148,7 +209,7 @@ def init_annuity(
     life_table : DataFrame or None
         Life table used for survival probabilities.
     r_f_real_annual : float
-        Annual real risk-free rate (for discounting).
+        Annual real risk-free rate (for discounting in real terms).
     S : int
         Steps per year (12 for monthly).
 
@@ -169,9 +230,12 @@ def init_annuity(
 
     # premium and factor
     alpha = float(max(cfg.alpha, 0.0))
-    load = float(max(cfg.L, -0.99))  # guard against 1+L <= 0
+    load = float(max(cfg.L, -0.99))  # guard against 1 + L <= 0
 
     P = (1.0 + load) * alpha * W0
+
+    # 현재 엔진에서는 "real" vs "nominal" 구분을
+    # 전체 시뮬레이션 레벨에서 처리하므로 여기서는 항상 real factor 사용.
     a = compute_ax_real(age0_years, life_table, r_f_real_annual, S=S)
     y = P / a
 
@@ -180,7 +244,36 @@ def init_annuity(
     return W_after, state
 
 
-# === Helper APIs for DECUM env / reporting ==================================
+# =====================================================================
+# Helper APIs for DECUM env / reporting
+# =====================================================================
+
+
+def _resolve_ann_load_from_sim_cfg(sim_cfg: Any) -> float:
+    """
+    Resolve annuity load from simulation config.
+
+    우선순위:
+      1) sim_cfg.ann_load
+      2) sim_cfg.phi_adval
+      3) 기본값 0.0
+    """
+    # 1) explicit ann_load
+    if hasattr(sim_cfg, "ann_load"):
+        try:
+            return float(getattr(sim_cfg, "ann_load"))
+        except Exception:
+            pass
+
+    # 2) CLI에서 넘어온 phi_adval을 로딩으로 해석 (run_opt_design에서 세팅)
+    if hasattr(sim_cfg, "phi_adval"):
+        try:
+            return float(getattr(sim_cfg, "phi_adval"))
+        except Exception:
+            pass
+
+    # 3) default
+    return 0.0
 
 
 def init_from_sim_cfg(
@@ -201,9 +294,10 @@ def init_from_sim_cfg(
         Simulation config object; expected attributes:
         - ann_on (bool)
         - ann_alpha (float)
-        - ann_load (float, optional)
+        - ann_load (float, optional)  ← if missing, phi_adval fallback
+        - phi_adval (float, optional)
         - ann_index (str, optional)
-        - age0 (int, entry age)
+        - age0 (int, entry age; default 55)
     life_table : DataFrame or None
         Life table used for survival probabilities.
     r_f_real_annual : float
@@ -222,7 +316,10 @@ def init_from_sim_cfg(
     """
     ann_on = bool(getattr(sim_cfg, "ann_on", False))
     ann_alpha = float(getattr(sim_cfg, "ann_alpha", 0.0))
-    ann_load = float(getattr(sim_cfg, "ann_load", 0.0))
+
+    # ann_load를 우선 사용, 없으면 phi_adval을 로딩으로 사용
+    ann_load = _resolve_ann_load_from_sim_cfg(sim_cfg)
+
     ann_index = str(getattr(sim_cfg, "ann_index", "real"))
     age0 = int(getattr(sim_cfg, "age0", 55))
 
@@ -262,11 +359,17 @@ def write_annuity_metrics(
     state : AnnuityState
         Realized annuity state after init.
     """
+    # config-level fields
     metrics["ann_on"] = float(cfg.on)  # store as 0/1
     metrics["ann_alpha"] = float(cfg.alpha)
     metrics["ann_load"] = float(cfg.L)
+    metrics["ann_index"] = str(cfg.index)
+    metrics["ann_defer"] = float(cfg.d)
 
-    if state.purchased:
+    # state-level fields
+    metrics["ann_purchased"] = float(bool(getattr(state, "purchased", False)))
+
+    if getattr(state, "purchased", False):
         metrics["P"] = float(state.P)
         metrics["y_ann"] = float(state.y_ann)
         metrics["a_factor"] = float(state.a_factor)

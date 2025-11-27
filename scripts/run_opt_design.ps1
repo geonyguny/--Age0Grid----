@@ -3,7 +3,7 @@
  - RunProfile(light/heavy)에 따라 1D/2D grid 기본값 자동 분기
  - 사용자가 grid 파라미터를 넘기면 RunProfile과 무관하게 그대로 사용
  - 바닥 처리: f_min_real 제거, 고정 비율 바닥(--q_floor)로 일원화(QFloorDefault=0.02)
- - 연금 로딩: --phi_adval (기본 0.05) + --ann_index (real/nominal) 자동 주입
+ - 연금 로딩: --phi_adval (기본 0) + --ann_index (real/nominal) 자동 주입
  - RL 워크로드 명시(Epochs/Steps/NPaths), Smoke 모드 축소
  - FX 헤지 플래그 자동 감지
  - MAIN_ANN: 공정가/현실가(실질/명목) 3세트 실행 + ann_alpha 주입
@@ -47,7 +47,7 @@ param(
   [int]$BootstrapBlock = 24,
 
   # 연금(annuity) 로딩/지수
-  [double]$AnnuityPhi = 0.05,
+  [double]$AnnuityPhi = 0,
   [ValidateSet('real','nominal')]     [string]$AnnuityIndex = 'real',
 
   # 1D/2D 그리드 (기본값은 RunProfile에 따라 아래에서 다시 설정)
