@@ -1,4 +1,4 @@
-﻿# project/eval.py 
+﻿# project/evaluation.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -113,7 +113,7 @@ _METRICS_HEADER: list[str] = [
     # diagnostics for ES
     "es95_source", "es95_note",
     # expected utility reporting
-    "EU", "EU_per_year", "delta_annual",
+    "EU", "EU_std", "EU_per_year", "delta_annual",
     # (NEW) utility/reporting config & loss baseline audit
     "crra_gamma", "u_scale", "report_utility", "F_target_used",
 ]
@@ -323,7 +323,8 @@ def evaluate(
     -------
     metrics : dict
         EW, ES95(통일), EL(손실모드일 때), Ruin, mean_WT, 소비 밴드 등 요약 메트릭
-        + es_mode, es95_source(진단) + (옵션) EU, EU_per_year, delta_annual
+        + es_mode, es95_source(진단)
+        + (옵션) EU, EU_std, EU_per_year, delta_annual
     extras? : dict (optional)
         eval_WT : list[float]  # 경로별 최종자산 (CLI의 재계산/감사에 사용)
         ruin_flags : list[bool]
@@ -362,8 +363,10 @@ def evaluate(
     agg_active_w_sum = 0.0
 
     seeds = getattr(cfg, "seeds", [0]) or [0]
-    # CLI와 호환: n_paths(일반) / rl_n_paths_eval(RL)
-    n_eval = int(getattr(cfg, "n_paths", getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", 1)) or 1))
+    # CLI와 호환: n_paths(일반) / n_paths_eval / rl_n_paths_eval
+    n_eval = int(getattr(cfg, "n_paths",
+                         getattr(cfg, "n_paths_eval",
+                                 getattr(cfg, "rl_n_paths_eval", 1))) or 1)
 
     # --- Utility/EU settings (behavioral spec 읽기) ---
     report_utility = str(getattr(cfg, "report_utility", "off")).lower() == "on"
@@ -509,10 +512,15 @@ def evaluate(
         else:
             m.update({"p10_c_last": 0.0, "p50_c_last": 0.0, "p90_c_last": 0.0, "C_ES95_avg": 0.0})
 
+    # -----------------------------
     # EU summary (+ config echo)
+    # -----------------------------
     try:
         if path_EU:
-            m["EU"] = float(_np.nanmean(_np.asarray(path_EU, dtype=float)))
+            eu_arr = _np.asarray(path_EU, dtype=float)
+            m["EU"] = float(_np.nanmean(eu_arr))           # 기대효용(평균)
+            m["EU_std"] = float(_np.nanstd(eu_arr))        # 효용 표준편차
+
             # 연환산: 총 기간(T months) → years = T/spm
             spm_local = int(getattr(env, "steps_per_year", 12) or 12)
             yrs = float(max(1.0, (T or int(getattr(env, "T", spm_local))) / spm_local))
@@ -520,14 +528,17 @@ def evaluate(
             m["delta_annual"] = getattr(cfg, "delta_annual", None)
         else:
             m["EU"] = None
+            m["EU_std"] = None
             m["EU_per_year"] = None
             m["delta_annual"] = getattr(cfg, "delta_annual", None)
+
         # EU 리포팅 설정/파라미터도 메트릭에 반영
         m["report_utility"] = bool(report_utility)
         m["crra_gamma"] = float(gamma)
         m["u_scale"] = float(u_scale)
     except Exception:
         m["EU"] = None
+        m["EU_std"] = None
         m["EU_per_year"] = None
         m["delta_annual"] = getattr(cfg, "delta_annual", None)
         m["report_utility"] = bool(report_utility)
@@ -681,7 +692,9 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
         "horizon_years": getattr(cfg, "horizon_years", None),
         "steps_per_year": getattr(cfg, "steps_per_year", None),
         "seeds": seeds_str,
-        "n_paths_eval": getattr(cfg, "n_paths_eval", getattr(cfg, "rl_n_paths_eval", getattr(cfg, "n_paths", None))),
+        "n_paths_eval": getattr(cfg, "n_paths_eval",
+                                getattr(cfg, "rl_n_paths_eval",
+                                        getattr(cfg, "n_paths", None))),
         "tag": getattr(cfg, "tag", None),
         # consumption
         "p10_c_last": metrics.get("p10_c_last"),
@@ -700,6 +713,7 @@ def save_metrics_autocsv(metrics: dict, cfg: Any, outputs: Optional[str] = None)
         "es95_note": metrics.get("es95_note"),
         # EU reporting
         "EU": metrics.get("EU"),
+        "EU_std": metrics.get("EU_std"),
         "EU_per_year": metrics.get("EU_per_year"),
         "delta_annual": getattr(cfg, "delta_annual", None),
         # utility/reporting config & loss baseline audit

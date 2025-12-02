@@ -825,6 +825,11 @@ def _save_metrics_files(out_dir: Path, metrics: Dict[str, Any], args: Any) -> No
     if rpct is None and ruin is not None:
         rpct = ruin
 
+    # EU 계열: evaluation.py 의 EU/EU_std/EU_per_year를 우선 사용
+    eu_val = metrics.get("EU", metrics.get("EU_mean"))
+    eu_std = metrics.get("EU_std")
+    eu_py = metrics.get("EU_per_year")
+
     row = {
         "EW": float(ew) if ew is not None else None,
         "ES95": float(es) if es is not None else None,
@@ -858,8 +863,11 @@ def _save_metrics_files(out_dir: Path, metrics: Dict[str, Any], args: Any) -> No
         "log10_WT_mean": _safe_float(metrics.get("log10_WT_mean")),
 
         # ★ 기대효용(할인합) 메트릭
-        "EU_mean": _safe_float(metrics.get("EU_mean")),
-        "EU_std": _safe_float(metrics.get("EU_std")),
+        "EU": _safe_float(eu_val),
+        "EU_std": _safe_float(eu_std),
+        "EU_per_year": _safe_float(eu_py),
+        # (백워드 호환용 alias)
+        "EU_mean": _safe_float(eu_val),
 
         # 설정
         "cstar_mode": metrics.get("cstar_mode"),
@@ -1413,6 +1421,18 @@ def run_rl(args):
     with quiet_ctx:
         t0 = time.perf_counter()
         cfg: SimConfig = make_cfg(args)
+
+        # RL에서도 효용 설정이 로그에 남도록 cfg에 기본값 주입
+        try:
+            if not hasattr(cfg, "crra_gamma"):
+                setattr(cfg, "crra_gamma", float(getattr(args, "crra_gamma", 3.0) or 3.0))
+            if not hasattr(cfg, "u_scale"):
+                setattr(cfg, "u_scale", float(getattr(args, "u_scale", 0.05) or 0.05))
+            if not hasattr(cfg, "report_utility"):
+                setattr(cfg, "report_utility", "on")
+        except Exception:
+            pass
+
         if not hasattr(cfg, "seeds"):
             setattr(cfg, "seeds", list(getattr(args, "seeds", [0])))
         try:
@@ -1559,11 +1579,26 @@ def run_rl(args):
             extras_dict.get("episodes", 0)
         )
 
-        # ★ 기대효용(할인된 효용 합)의 평균/표준편차를 정식 메트릭으로 반영
+        # ★ RL episode return을 기대효용(EU)로 간주하여 정식 메트릭으로 반영
         if debug_eval_mean is not None:
-            metrics_dict.setdefault("EU_mean", float(debug_eval_mean))
+            eu_val = float(debug_eval_mean)
+            metrics_dict.setdefault("EU", eu_val)
+            metrics_dict.setdefault("EU_mean", eu_val)  # 백워드 호환
         if debug_eval_std is not None:
             metrics_dict.setdefault("EU_std", float(debug_eval_std))
+
+        # 연환산 효용(EU_per_year): horizon_years 기준 단순 나누기
+        try:
+            horizon_years = float(
+                getattr(cfg, "horizon_years", getattr(args, "horizon_years", 0.0))
+                or 0.0
+            )
+        except Exception:
+            horizon_years = 0.0
+        if horizon_years > 0.0 and metrics_dict.get("EU") is not None:
+            metrics_dict.setdefault(
+                "EU_per_year", float(metrics_dict["EU"]) / horizon_years
+            )
 
         try:
             _mixed = getattr(cfg, "data_ret_series", None)

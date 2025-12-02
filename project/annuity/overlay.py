@@ -1,4 +1,3 @@
-# project/annuity/overlay.py
 from dataclasses import dataclass
 from typing import Tuple, MutableMapping, Any, Optional
 
@@ -14,21 +13,20 @@ import pandas as pd
 @dataclass
 class AnnuityConfig:
     """
-    Static configuration for an immediate life annuity.
+    종신연금(즉시연금) 설정 값.
 
     Parameters
     ----------
     on : bool
-        Whether the annuity feature is enabled.
+        연금 기능 사용 여부.
     alpha : float
-        Purchase fraction of initial wealth W0 (θ).
+        초기 자산 W0 중 연금에 투입하는 비율(θ).
     L : float
-        Load (additional expense / margin). Interpreted as φ_adval.
+        부가보험료(load, φ_adval에 해당).
     d : int
-        Deferral in years/steps (MVP: 0 = immediate).
-        Currently not used to shift payments in time but kept for future use.
+        연금 개시 지연 기간(연/스텝 단위, MVP에서는 0).
     index : str
-        'real' | 'nominal' – indexation convention of the annuity payout.
+        'real' | 'nominal' – 연금 지급의 인덱싱 방식.
     """
     on: bool
     alpha: float
@@ -40,20 +38,20 @@ class AnnuityConfig:
 @dataclass
 class AnnuityState:
     """
-    Runtime state of the annuity after initialization.
+    초기화 이후 연금 상태.
 
     Attributes
     ----------
     purchased : bool
-        Whether an annuity was actually purchased.
+        실제로 연금을 매입했는지 여부.
     P : float
-        Premium paid at t=0.
+        t=0 시점 납입 보험료.
     y_ann : float
-        Per-step payout (e.g., monthly).
+        스텝(예: 월)당 지급액.
     a_factor : float
-        Annuity-immediate factor (per-step).
+        스텝 단위 종신연금 현가계수 a_x.
     t_star : int
-        Start step (MVP: 0).
+        지급 개시 스텝(MVP: 0).
     """
     purchased: bool
     P: float
@@ -74,28 +72,27 @@ def _monthly_survival_from_life_table(
     max_age: int = 110,
 ) -> np.ndarray:
     """
-    Build monthly survival probabilities from a life table under UDD.
+    생명표로부터 월 단위 생존확률을 생성 (UDD 가정).
 
     Parameters
     ----------
     age0 : int
-        Entry age (years).
+        진입 연령(년).
     lt : DataFrame
-        Life table with columns 'age' and either 'qx' or 'px'.
+        'age'와 'qx' 또는 'px'를 포함한 생명표.
     S : int
-        Number of steps per year (12 for monthly).
+        연간 스텝 수(월 단위 12).
     max_age : int
-        Maximum age to consider in survival projection.
+        생존확률을 계산할 최대 연령.
 
     Returns
     -------
     np.ndarray
-        Array of survival probabilities at the end of each month.
-        Shape: (n_months,)
+        월말 기준 생존확률 배열 (shape: (n_months,)).
     """
     lt = lt.copy()
 
-    # ensure px column
+    # px 열 보장
     if "px" not in lt.columns:
         qx = lt["qx"].to_numpy(dtype=float)
         px = 1.0 - np.clip(qx, 0.0, 1.0)
@@ -104,13 +101,13 @@ def _monthly_survival_from_life_table(
 
     ages = lt["age"].to_numpy(dtype=int)
 
-    # yearly force of mortality under UDD: mu_x = -ln(px)
+    # UDD 하의 연 단위 사망강도: mu_x = -ln(px)
     mu = -np.log(np.clip(px, 1e-12, 1.0))
 
     S_m = []
     age_max = min(max_age, int(ages.max()))
 
-    # align index of age0 (if age0 < min(ages), we start from the first age)
+    # age0에 해당하는 인덱스 정렬
     start_idx = int(np.searchsorted(ages, age0))
     start_idx = max(start_idx, 0)
     start_idx = min(start_idx, len(ages) - 1)
@@ -120,8 +117,7 @@ def _monthly_survival_from_life_table(
     for a_idx in range(start_idx, len(ages)):
         mu_y = float(mu[a_idx])
 
-        # monthly px under UDD: exp(-mu_y / S)
-        # keep S-month loop for flexibility (steps_per_year != 12)
+        # 월간 생존확률 px_month = exp(-mu_y / S)
         for _ in range(S):
             p_m = float(np.exp(-mu_y / S))
             alive *= p_m
@@ -140,32 +136,31 @@ def compute_ax_real(
     S: int = 12,
 ) -> float:
     """
-    Real annuity-immediate factor with per-step payments (e.g. monthly).
+    실질 기준 종신연금(즉시연금) 계수 a_x (스텝당 지급).
 
-    First payment is at step 1.
+    첫 지급은 step=1에서 발생하는 annuity-immediate 형태.
 
     Parameters
     ----------
     age0_years : int
-        Entry age in years.
+        가입 연령.
     life_table : DataFrame
-        Life table with 'age' and 'qx'/'px'.
+        'age'와 'qx' 또는 'px'를 가진 생명표.
     r_f_real_annual : float
-        Annual real risk-free rate.
+        연간 실질 무위험이자율.
     S : int
-        Steps per year (12 for monthly).
+        연간 스텝 수(월 단위 12).
 
     Returns
     -------
     float
-        Present value factor a_x with per-step payments.
+        per-step 지급을 전제로 한 a_x.
     """
-    # guard against pathological or zero rates
     r = float(r_f_real_annual)
     if r > -0.9999:
         i_m = (1.0 + r) ** (1.0 / S) - 1.0
     else:
-        # extremely negative rate → approximate with very small positive monthly rate
+        # 극단적 음(-)금리 방어
         i_m = 1e-8
 
     v = 1.0 / (1.0 + i_m)
@@ -178,7 +173,6 @@ def compute_ax_real(
     disc = v ** np.arange(1, len(surv) + 1, dtype=float)
     a = float(np.sum(disc * surv))
 
-    # numerical guard
     return max(a, 1e-9)
 
 
@@ -196,46 +190,44 @@ def init_annuity(
     S: int = 12,
 ) -> Tuple[float, AnnuityState]:
     """
-    Initialize an immediate life annuity at t=0.
+    t=0에서 종신연금을 1회 매입하는 초기화 로직.
 
     Parameters
     ----------
     W0 : float
-        Initial financial wealth before annuity purchase.
+        연금 매입 전 금융자산.
     cfg : AnnuityConfig
-        Annuity configuration (on/alpha/load/index).
+        연금 설정(on/alpha/load/index 등).
     age0_years : int
-        Entry age at t=0.
+        가입 연령.
     life_table : DataFrame or None
-        Life table used for survival probabilities.
+        생명표. 없을 경우 연금 미적용.
     r_f_real_annual : float
-        Annual real risk-free rate (for discounting in real terms).
+        연간 실질 무위험이자율.
     S : int
-        Steps per year (12 for monthly).
+        연간 스텝 수(월 단위 12).
 
     Returns
     -------
     W0_after : float
-        Wealth after paying annuity premium at t=0.
+        연금 보험료 납입 후 금융자산.
     state : AnnuityState
-        Resulting annuity state (premium, payout, factor).
+        연금 상태(보험료, 지급액, 계수 등).
     """
-    # annuity off or no purchase
+    # 연금 off 또는 alpha=0이면 미적용
     if (not cfg.on) or (cfg.alpha <= 0.0):
         return W0, AnnuityState(False, 0.0, 0.0, 0.0, -1)
 
-    # safety: no life table → do not apply annuity (MVP behavior)
+    # 생명표가 없으면 현재 MVP에서는 annuity 미적용
     if not isinstance(life_table, pd.DataFrame) or life_table.empty:
         return W0, AnnuityState(False, 0.0, 0.0, 0.0, -1)
 
-    # premium and factor
     alpha = float(max(cfg.alpha, 0.0))
-    load = float(max(cfg.L, -0.99))  # guard against 1 + L <= 0
+    load = float(max(cfg.L, -0.99))  # 1+L ≤ 0 방어
 
     P = (1.0 + load) * alpha * W0
 
-    # 현재 엔진에서는 "real" vs "nominal" 구분을
-    # 전체 시뮬레이션 레벨에서 처리하므로 여기서는 항상 real factor 사용.
+    # 현재 엔진에서는 real/nominal 구분은 상위 레벨에서 처리
     a = compute_ax_real(age0_years, life_table, r_f_real_annual, S=S)
     y = P / a
 
@@ -251,28 +243,25 @@ def init_annuity(
 
 def _resolve_ann_load_from_sim_cfg(sim_cfg: Any) -> float:
     """
-    Resolve annuity load from simulation config.
+    시뮬레이션 설정(sim_cfg)에서 연금 load를 추론.
 
     우선순위:
       1) sim_cfg.ann_load
       2) sim_cfg.phi_adval
       3) 기본값 0.0
     """
-    # 1) explicit ann_load
     if hasattr(sim_cfg, "ann_load"):
         try:
             return float(getattr(sim_cfg, "ann_load"))
         except Exception:
             pass
 
-    # 2) CLI에서 넘어온 phi_adval을 로딩으로 해석 (run_opt_design에서 세팅)
     if hasattr(sim_cfg, "phi_adval"):
         try:
             return float(getattr(sim_cfg, "phi_adval"))
         except Exception:
             pass
 
-    # 3) default
     return 0.0
 
 
@@ -284,47 +273,51 @@ def init_from_sim_cfg(
     steps_per_year: int = 12,
 ) -> Tuple[float, AnnuityConfig, AnnuityState]:
     """
-    Convenience initializer that builds AnnuityConfig from a simulation config.
+    시뮬레이션 cfg에서 AnnuityConfig를 구성하고, 초기 연금 매입을 수행.
 
     Parameters
     ----------
     W0 : float
-        Initial wealth before annuity purchase.
+        연금 매입 전 자산.
     sim_cfg : Any
-        Simulation config object; expected attributes:
-        - ann_on (bool)
+        시뮬레이션 설정 객체. 예상 속성:
+        - ann_on (bool 또는 {'on','off','auto'})
         - ann_alpha (float)
-        - ann_load (float, optional)  ← if missing, phi_adval fallback
+        - ann_load (float, optional)
         - phi_adval (float, optional)
         - ann_index (str, optional)
-        - age0 (int, entry age; default 55)
+        - age0 (int, optional)
     life_table : DataFrame or None
-        Life table used for survival probabilities.
+        생명표.
     r_f_real_annual : float
-        Annual real risk-free rate.
+        연간 실질 무위험이자율.
     steps_per_year : int
-        Number of steps per year (e.g. 12 for monthly).
+        연간 스텝 수(월 단위 12).
 
     Returns
     -------
     W_after : float
-        Wealth after annuity premium at t=0.
+        연금 보험료 납입 후 자산.
     cfg : AnnuityConfig
-        Derived annuity configuration.
+        생성된 연금 설정.
     state : AnnuityState
-        Resulting annuity state.
+        연금 상태.
     """
-    ann_on = bool(getattr(sim_cfg, "ann_on", False))
+    raw_on = getattr(sim_cfg, "ann_on", False)
+    if isinstance(raw_on, str):
+        mode = raw_on.lower()
+        on_flag = mode == "on"
+    else:
+        on_flag = bool(raw_on)
+        mode = "on" if on_flag else "off"
+
     ann_alpha = float(getattr(sim_cfg, "ann_alpha", 0.0))
-
-    # ann_load를 우선 사용, 없으면 phi_adval을 로딩으로 사용
     ann_load = _resolve_ann_load_from_sim_cfg(sim_cfg)
-
     ann_index = str(getattr(sim_cfg, "ann_index", "real"))
     age0 = int(getattr(sim_cfg, "age0", 55))
 
     cfg = AnnuityConfig(
-        on=ann_on,
+        on=on_flag,
         alpha=ann_alpha,
         L=ann_load,
         d=0,
@@ -348,33 +341,29 @@ def write_annuity_metrics(
     state: AnnuityState,
 ) -> None:
     """
-    Write annuity-related fields into a metrics mapping (for CSV, logs, etc.).
+    metrics(dict-like)에 연금 관련 지표를 써 넣는 헬퍼.
 
-    Parameters
-    ----------
-    metrics : MutableMapping[str, float]
-        Target metrics dict-like object.
-    cfg : AnnuityConfig
-        Annuity configuration used in the run.
-    state : AnnuityState
-        Realized annuity state after init.
+    - ann_on / ann_alpha / ann_load / ann_index / ann_defer
+    - ann_purchased / P / y_ann / a_factor / ann_a_factor
     """
-    # config-level fields
-    metrics["ann_on"] = float(cfg.on)  # store as 0/1
+    # config-level
+    metrics["ann_on"] = float(bool(cfg.on))       # 0/1
     metrics["ann_alpha"] = float(cfg.alpha)
     metrics["ann_load"] = float(cfg.L)
     metrics["ann_index"] = str(cfg.index)
     metrics["ann_defer"] = float(cfg.d)
 
-    # state-level fields
-    metrics["ann_purchased"] = float(bool(getattr(state, "purchased", False)))
+    # state-level
+    purchased = bool(getattr(state, "purchased", False))
+    metrics["ann_purchased"] = float(purchased)
 
-    if getattr(state, "purchased", False):
+    if purchased:
         metrics["P"] = float(state.P)
         metrics["y_ann"] = float(state.y_ann)
         metrics["a_factor"] = float(state.a_factor)
+        metrics["ann_a_factor"] = float(state.a_factor)
     else:
-        # for non-purchase cases, keep consistent keys with neutral values
         metrics["P"] = 0.0
         metrics["y_ann"] = 0.0
         metrics["a_factor"] = np.nan
+        metrics["ann_a_factor"] = np.nan

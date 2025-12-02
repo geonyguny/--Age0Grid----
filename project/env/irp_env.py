@@ -18,6 +18,7 @@ ENV OVERRIDES (optional)
 - ENV_IRP_SEED:     int, default seed used when reset() is called with seed=None
 """
 from __future__ import annotations
+
 import os
 from typing import Any, Dict, Optional
 
@@ -31,6 +32,22 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 
+# -----------------------
+# CRRA 효용 헬퍼 함수
+# -----------------------
+def _crra_u(c: float, gamma: float) -> float:
+    """
+    단순 CRRA 효용 u(c) = (c^(1-gamma) - 1) / (1-gamma), gamma != 1
+    - gamma = 1 에 근접하면 log(c)로 처리
+    - c <= 0 인 경우 수치안정을 위해 매우 작은 양수로 클리핑
+    """
+    c_eff = float(max(c, 1e-12))
+    g = float(gamma)
+    if abs(g - 1.0) < 1e-9:
+        return float(np.log(c_eff))
+    return float((c_eff ** (1.0 - g) - 1.0) / (1.0 - g))
+
+
 class IRPEnvAdapter:
     def __init__(
         self,
@@ -39,29 +56,36 @@ class IRPEnvAdapter:
         q_floor: Optional[float] = None,
         base_kwargs: Optional[Dict[str, Any]] = None,
         q_cap: Optional[float] = None,
-        cfg: Any = None,  # ★ 추가: RetirementEnv에 그대로 전달
+        cfg: Any = None,  # RetirementEnv 구성에 사용되는 cfg
     ):
         self.f_target = float(f_target)
         self.q_cap = float(q_cap) if q_cap is not None else None
         self._cfg = cfg
 
         kwargs = dict(base_kwargs or {})
+
+        # CRRA 효용 관련 파라미터 (run._build_env_factory_from_args 에서 채워줌)
+        self.crra_gamma: float = float(kwargs.get("crra_gamma", 3.0) or 3.0)
+        self.u_scale: float = float(kwargs.get("u_scale", 0.05) or 0.05)
+
         # best-effort: common flags if supported by underlying env
         if w_max is not None:
             kwargs.setdefault("w_max", float(w_max))
         if q_floor is not None:
             kwargs.setdefault("q_floor", float(q_floor))
 
-        # ★ 핵심: cfg 주입 경로 보장
+        # cfg 주입 경로 보장
         if self._cfg is not None:
             self._env = RetirementEnv(self._cfg, **kwargs)
         else:
             self._env = RetirementEnv(**kwargs)
 
-        print("[ANN-DBG-IRP] IRPEnvAdapter created underlying env:",
+        print(
+            "[ANN-DBG-IRP] IRPEnvAdapter created underlying env:",
             type(self._env).__name__,
-            "with kwargs keys=", list(kwargs.keys()))
-
+            "with kwargs keys=",
+            list(kwargs.keys()),
+        )
 
         self._last_info: Dict[str, Any] | None = None
 
@@ -148,8 +172,12 @@ class IRPEnvAdapter:
         trunc = False  # default if not provided
         if isinstance(res, dict):
             ob = res.get("obs") or res.get("observation")
-            rew = float(res.get("reward", 0.0))
-            term = bool(res.get("done", False) or res.get("terminated", False) or res.get("terminal", False))
+            _rew_raw = float(res.get("reward", 0.0))
+            term = bool(
+                res.get("done", False)
+                or res.get("terminated", False)
+                or res.get("terminal", False)
+            )
             trunc = bool(res.get("truncated", False))
             info = dict(res.get("info", {}))
             done = term or trunc
@@ -157,29 +185,28 @@ class IRPEnvAdapter:
             try:
                 n = len(res)  # may raise if not sized
             except Exception:
-                raise TypeError(f"Underlying env.step returned unsupported type: {type(res)!r}")
+                raise TypeError(
+                    f"Underlying env.step returned unsupported type: {type(res)!r}"
+                )
 
             if n == 5:
-                ob, rew, term, trunc, info = res
-                rew = float(rew)
+                ob, _rew_raw, term, trunc, info = res
                 done = bool(term) or bool(trunc)
                 info = dict(info or {})
             elif n == 4:
-                ob, rew, done, info = res
-                rew = float(rew)
+                ob, _rew_raw, done, info = res
                 done = bool(done)
                 trunc = False
                 info = dict(info or {})
             elif n == 3:
-                ob, rew, done = res
-                rew = float(rew)
+                ob, _rew_raw, done = res
                 done = bool(done)
                 trunc = False
                 info = {}
             else:
                 raise TypeError("Underlying env.step must return 3, 4, or 5 elements")
 
-        # 4) terminal info enrichment
+        # 4) terminal info enrichment (W_T, L_term 등)
         if done:
             # Prefer info.W_T, else try env.W
             W_T = info.get("W_T")
@@ -215,7 +242,33 @@ class IRPEnvAdapter:
                     except Exception:
                         pass
 
+        # 5) ★★★ RL 보상 재정의: 소비에 대한 CRRA 효용으로 계산 ★★★
+        #    - underlying env 가 제공하는 reward는 무시하고, info의 소비금액 기반으로 reward 산출
+        c_t = None
+        if isinstance(info, dict):
+            c_t = info.get("consumption") or info.get("c_t") or info.get("C")
+        try:
+            c_val = float(c_t) if c_t is not None else 0.0
+        except Exception:
+            c_val = 0.0
+
+        # CRRA 효용 계산 + 스케일
+        u_t = _crra_u(c_val, self.crra_gamma)
+        rew = float(self.u_scale * u_t)
+
+        # (선택적) 파산 경로에 소규모 페널티 부여
+        if done:
+            W_T_val = info.get("W_T") or info.get("terminal_wealth") or 0.0
+            try:
+                W_T_val = float(W_T_val)
+            except Exception:
+                W_T_val = 0.0
+            if W_T_val <= 0.0:
+                # 지나치게 큰 페널티는 RL 안정성을 해칠 수 있으므로 아주 작은 값 수준으로 유지
+                rew += -1.0
+
         self._last_info = dict(info or {})
+        # RLTrainer 쪽은 (obs, reward, done, info) 4-튜플을 허용하므로 기존 형태 유지
         return self._as_obs(ob), float(rew), bool(done), info
 
     # Optional accessor

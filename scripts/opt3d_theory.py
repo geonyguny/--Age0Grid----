@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -11,6 +12,9 @@ from typing import Any, Dict, List
 from project.runner.run import run_once, run_rl
 
 
+# --------------------------
+# 유틸 함수
+# --------------------------
 def _parse_float_grid(text: str) -> List[float]:
     if not text:
         return []
@@ -35,8 +39,6 @@ def _resolve_market_csv(args: argparse.Namespace) -> str:
     - dev  -> kr_us_gold_bootstrap_mini_extended.csv
     - full -> kr_us_gold_bootstrap_full.csv
     """
-    from pathlib import Path
-
     if getattr(args, "market_csv", None):
         return str(args.market_csv)
 
@@ -117,11 +119,14 @@ def _build_base_args(args: argparse.Namespace, outputs_root: Path) -> SimpleName
     return SimpleNamespace(**base)
 
 
+# --------------------------
+# 메트릭 추출 (1 row)
+# --------------------------
 def _extract_metrics_row(
     out: Dict[str, Any],
     ann_alpha: float,
     w_max: float,
-    q_cap: float,
+    q_cap_annual: float,
     tag: str,
 ) -> Dict[str, Any]:
     """
@@ -129,13 +134,16 @@ def _extract_metrics_row(
     (후속 요약/스코어링에서 그대로 사용)
     """
     m = out.get("metrics", {}) or {}
+    meta = out.get("meta", {}) or {}
     row: Dict[str, Any] = {}
 
     # 설계 축
     row["tag"] = tag
     row["ann_alpha"] = float(ann_alpha)
     row["w_max"] = float(w_max)
-    row["rl_q_cap"] = float(q_cap)
+    # 설계 입력(연간 상한)과 실제 사용된 월간 상한을 모두 기록
+    row["q_cap_annual"] = float(q_cap_annual)
+    row["rl_q_cap"] = m.get("rl_q_cap")
 
     # 기본 메트릭
     row["EW"] = m.get("EW")
@@ -156,6 +164,25 @@ def _extract_metrics_row(
     row["WT_p95"] = m.get("WT_p95")
     row["log10_WT_mean"] = m.get("log10_WT_mean")
 
+    # guardrail용 q,w 행동 분포 요약 (RL meta 기반; 있으면 사용)
+    row["q_min"] = meta.get("q_min")
+    row["q_p5"] = meta.get("q_p5")
+    row["q_p25"] = meta.get("q_p25")
+    row["q_p50"] = meta.get("q_p50")
+    row["q_p75"] = meta.get("q_p75")
+    row["q_p95"] = meta.get("q_p95")
+    row["q_max"] = meta.get("q_max")
+    row["q_mean"] = meta.get("q_mean")
+
+    row["w_min"] = meta.get("w_min")
+    row["w_p5"] = meta.get("w_p5")
+    row["w_p25"] = meta.get("w_p25")
+    row["w_p50"] = meta.get("w_p50")
+    row["w_p75"] = meta.get("w_p75")
+    row["w_p95"] = meta.get("w_p95")
+    row["w_max_eff"] = meta.get("w_max_eff")
+    row["w_mean"] = meta.get("w_mean")
+
     # annuity/환경 메타
     row["ann_on"] = m.get("ann_on")
     row["y_ann"] = m.get("y_ann")
@@ -165,9 +192,31 @@ def _extract_metrics_row(
     row["cstar_mode"] = m.get("cstar_mode")
     row["cstar_m"] = m.get("cstar_m")
 
-    # 기대효용(할인된 효용 합) 관련 메트릭 (run_rl + run.py 수정분)
-    row["EU_mean"] = m.get("EU_mean")
-    row["EU_std"] = m.get("EU_std")
+    # 기대효용(할인된 효용 합) 관련 메트릭
+    eu_mean = m.get("EU_mean")
+    eu_std = m.get("EU_std")
+
+    # EU_mean / EU_std sanity check:
+    #   - None 이거나 비유한/과도한(|x|>1e6) 값이면
+    #     RL 평가 메타(eval_return_mean/std) 기반으로 보정
+    try:
+        if eu_mean is not None:
+            _eu_val = float(eu_mean)
+            if (not math.isfinite(_eu_val)) or abs(_eu_val) > 1e6:
+                eu_mean = meta.get("eval_return_mean", None)
+    except Exception:
+        eu_mean = meta.get("eval_return_mean", None)
+
+    try:
+        if eu_std is not None:
+            _eu_std_val = float(eu_std)
+            if (not math.isfinite(_eu_std_val)) or abs(_eu_std_val) > 1e6:
+                eu_std = meta.get("eval_return_std", None)
+    except Exception:
+        eu_std = meta.get("eval_return_std", None)
+
+    row["EU_mean"] = eu_mean
+    row["EU_std"] = eu_std
 
     # 기타 환경 설정
     row["method"] = out.get("method")
@@ -177,6 +226,15 @@ def _extract_metrics_row(
     row["es_mode"] = out.get("es_mode")
     row["n_paths"] = out.get("n_paths")
 
+    # horizon_years: out["args"]가 dict인 경우 고려
+    args_obj = out.get("args", {})
+    horizon_years = None
+    if isinstance(args_obj, dict):
+        horizon_years = args_obj.get("horizon_years", None)
+    else:
+        horizon_years = getattr(args_obj, "horizon_years", None)
+    row["horizon_years"] = horizon_years
+
     timing = out.get("timing", {}) or {}
     row["time_total_s"] = timing.get("total_s")
     row["time_total_hms"] = timing.get("total_hms")
@@ -184,6 +242,9 @@ def _extract_metrics_row(
     return row
 
 
+# --------------------------
+# 요약 저장
+# --------------------------
 def _write_summary(
     rows: List[Dict[str, Any]],
     out_dir: Path,
@@ -202,7 +263,12 @@ def _write_summary(
     csv_path = out_dir / f"{filename_prefix}_summary.csv"
     json_path = out_dir / f"{filename_prefix}_summary.json"
 
-    fieldnames = list(rows[0].keys())
+    # 모든 row의 key union으로 헤더 구성 (안전)
+    field_set = set()
+    for r in rows:
+        field_set.update(r.keys())
+    fieldnames = list(field_set)
+
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -230,20 +296,16 @@ def _as_float(x: Any, default: float = 0.0) -> float:
 
 def _score_row(row: Dict[str, Any]) -> float:
     """
-    간단한 스코어 함수:
-      - 기본: EU_mean(없으면 EW)을 최대화
-      - 패널티: RuinPct, la_sf_mean 을 차감
-    필요하면 가중치는 나중에 조정할 수 있도록 단순한 구조로 유지.
+    간단한 스코어 함수(임시):
+      - 기본: EW 최대화
+      - 패널티: RuinPct, la_sf_mean 차감
+    EU는 현재 수치 스케일이 불안정하므로 사용하지 않는다.
     """
-    eu = row.get("EU_mean")
     ew = row.get("EW")
     ruin = row.get("RuinPct")
     la_sf = row.get("la_sf_mean")
 
-    base = _as_float(eu, None) if eu is not None else None
-    if base is None:
-        base = _as_float(ew, 0.0)
-
+    base = _as_float(ew, 0.0)
     ruin_f = _as_float(ruin, 0.0)
     la_sf_f = _as_float(la_sf, 0.0)
 
@@ -284,8 +346,12 @@ def _write_scored_summary(
     json_path = out_dir / f"{filename_prefix}_summary_scored.json"
     best_path = out_dir / f"{filename_prefix}_best.json"
 
-    # CSV
-    fieldnames = list(scored_rows_sorted[0].keys())
+    # CSV: 모든 row의 key union 사용
+    field_set = set()
+    for r in scored_rows_sorted:
+        field_set.update(r.keys())
+    fieldnames = list(field_set)
+
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -335,7 +401,7 @@ def main() -> None:
         "--qcap-grid",
         type=str,
         required=True,
-        help="예: 0.03,0.05,0.07 (연간 소비율 상한 수준)",
+        help="예: 0.03,0.05,0.07 (연간 소비율 상한, 내부에서 월간=연간/12로 변환)",
     )
 
     # 공통 시뮬레이션 설정
@@ -392,22 +458,25 @@ def main() -> None:
 
     for ann_alpha in ann_grid:
         for w_max in wmax_grid:
-            for q_cap in qcap_grid:
+            for q_cap_annual in qcap_grid:
+                # q_cap_annual(연간)을 내부 RL용 월간으로 변환
+                q_cap_monthly = float(q_cap_annual) / 12.0
+
                 tag = (
                     f"{args.tag_prefix}"
-                    f"_ann{ann_alpha:.2f}_w{w_max:.2f}_qcap{q_cap:.3f}"
+                    f"_ann{ann_alpha:.2f}_w{w_max:.2f}_qcap{q_cap_annual:.3f}"
                 )
                 print(
                     f"[RUN] ann_alpha={ann_alpha:.3f}, "
-                    f"w_max={w_max:.3f}, rl_q_cap={q_cap:.3f} "
-                    f"tag={tag}"
+                    f"w_max={w_max:.3f}, q_cap_annual={q_cap_annual:.3f} "
+                    f"(q_cap_monthly={q_cap_monthly:.5f}) tag={tag}"
                 )
 
                 # 개별 run용 args 복사 후 축 값만 세팅
                 run_args_dict = base_args.__dict__.copy()
                 run_args_dict["ann_alpha"] = float(ann_alpha)
                 run_args_dict["w_max"] = float(w_max)
-                run_args_dict["rl_q_cap"] = float(q_cap)
+                run_args_dict["rl_q_cap"] = float(q_cap_monthly)
                 run_args_dict["tag"] = tag
 
                 run_args = SimpleNamespace(**run_args_dict)
@@ -421,7 +490,7 @@ def main() -> None:
                     out,
                     ann_alpha=ann_alpha,
                     w_max=w_max,
-                    q_cap=q_cap,
+                    q_cap_annual=q_cap_annual,
                     tag=tag,
                 )
                 rows.append(row)
