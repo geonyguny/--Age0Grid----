@@ -299,7 +299,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--habit_phi", type=float, default=0.0, help="습관/스무딩 계수")
     p.add_argument("--bias_loss_aversion", type=float, default=0.0,
                    help="추가적 손실가중(필요 시)")
-    p.add_argument("--bias_prob_gamma", type=float, default=0.0,
+    p.add_argument("--bias_prob_gamma", type=float, default=1.0,
                    help="Prelec 가중 γ (0이면 사용 안함; 예: 0.70)")
     p.add_argument("--bias_myopia", type=float, default=0.0,
                    help="현재편향 강도(예: 0.92, 0.90, 0.85)")

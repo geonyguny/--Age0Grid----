@@ -44,6 +44,24 @@ def _interp1d_grid(x_grid: _np.ndarray, y_on_grid: _np.ndarray, xq: _np.ndarray)
     return (1.0 - w) * yg[idx] + w * yg[idx + 1]
 
 
+def _gauss_hermite_shocks(mu: float, sigma: float, n: int = 32) -> Tuple[_np.ndarray, _np.ndarray]:
+    """
+    N(mu, sigma^2)에 대한 기댓값을 몬테카를로 없이 정확히 근사하는
+    Gauss-Hermite 구적 노드(shocks)와 가중치(weights)를 반환한다.
+
+    사용법: E[f(X)] ≈ np.dot(weights, f(shocks))   (weights의 합은 1)
+
+    노드 수 n은 20~40 정도면 부드러운 함수에 대해 몬테카를로 수천~수만 개
+    표본보다 훨씬 정확하다(샘플링 노이즈 자체가 없음). n이 너무 크면(수백 이상)
+    오히려 Hermite 다항식 계수의 수치적 불안정성이 생길 수 있어 상한을 둔다.
+    """
+    n_eff = int(max(2, min(int(n), 64)))
+    z, wgt = _np.polynomial.hermite_e.hermegauss(n_eff)  # weight function e^{-z^2/2}
+    shocks = mu + max(0.0, float(sigma)) * z
+    weights = wgt / _np.sqrt(2.0 * _np.pi)  # 합이 1이 되도록 정규화
+    return shocks, weights
+
+
 # ---------- HJB ----------
 class HJBSolver:
     """
@@ -58,6 +76,12 @@ class HJBSolver:
 
     Hedge: cfg.hedge / hedge_mode / hedge_sigma_k / hedge_cost를 간단 규칙으로 반영
     Fee: 월 수수료 φ_m = m['phi_m'] (t 시점의 W_t 기준)
+
+    기댓값 계산(Nshock):
+      cfg.hjb_expectation == "mc" 이면 기존 몬테카를로 방식(회귀테스트/비교용).
+      그 외(기본값)에는 Gauss-Hermite 구적법을 사용해 샘플링 노이즈 없이
+      기댓값을 계산한다. 노드 수는 hjb_Nshock 값을 그대로 재사용하되
+      내부적으로 64개로 캡한다(구적법은 노드가 많다고 더 정확해지지 않음).
     """
 
     def __init__(self, cfg: SimConfig):
@@ -140,7 +164,8 @@ class HJBSolver:
         return self.lam * (eta + inv * _np.maximum(self.F - W - float(eta), 0.0))
 
     # --- value backup for (W, q, w) ---
-    def _backup_val(self, V_next: _np.ndarray, W: float, q: float, w: float, shocks: _np.ndarray) -> float:
+    def _backup_val(self, V_next: _np.ndarray, W: float, q: float, w: float, shocks: _np.ndarray,
+                     weights: Optional[_np.ndarray] = None) -> float:
         # 1) consume
         c = q * W
         W_net = max(W - c, 0.0)
@@ -149,9 +174,15 @@ class HJBSolver:
         gross = 1.0 + (w * shocks) + ((1.0 - w) * self.rf)
         W_next = _np.clip(W_net * gross - self.phi_m * W, 0.0, float(self.W_grid[-1]))
 
-        # 3) continuation value (linear interp, MC average)
+        # 3) continuation value
+        #    - weights가 있으면(Gauss-Hermite 구적) 가중평균으로 노이즈 없는 정확한 기댓값 계산
+        #    - 없으면(기존 몬테카를로 방식) 단순평균으로 폴백
         Vn = _interp1d_grid(self.W_grid, V_next, W_next)
-        return float(_crra_u([c], self.gamma)[0] + self.beta * float(Vn.mean()))
+        if weights is not None:
+            Vn_mean = float(_np.dot(Vn, weights))
+        else:
+            Vn_mean = float(Vn.mean())
+        return float(_crra_u([c], self.gamma)[0] + self.beta * Vn_mean)
 
     def solve(self, seed: Optional[int] = None, rng: Optional[_np.random.Generator] = None) -> Dict[str, Any]:
         """
@@ -160,7 +191,15 @@ class HJBSolver:
         dict: { "Pi_w": (T×|W|), "Pi_q": (T×|W|), "eta": float, "W_grid": np.ndarray }
         """
         rng_local = rng if rng is not None else _make_rng(seed)
-        shocks = rng_local.normal(loc=self.mu, scale=max(0.0, self.sigma), size=max(1, self.Nshock))
+
+        # 기댓값 계산 방식 선택: 기본은 Gauss-Hermite 구적(노이즈 없음),
+        # cfg.hjb_expectation == "mc" 이면 기존 몬테카를로 방식(비교/회귀테스트용).
+        use_mc = str(getattr(self.cfg, "hjb_expectation", "quad")).lower() == "mc"
+        if use_mc:
+            shocks = rng_local.normal(loc=self.mu, scale=max(0.0, self.sigma), size=max(1, self.Nshock))
+            weights = None
+        else:
+            shocks, weights = _gauss_hermite_shocks(self.mu, self.sigma, n=self.Nshock)
 
         # η 후보 (λ<=0이면 0만)
         eta_values = tuple(getattr(self.cfg, "hjb_eta_grid", (0.0,))) if (self.lam > 0.0) else (0.0,)
@@ -197,7 +236,7 @@ class HJBSolver:
                     for w in self.w_actions:
                         w = min(max(float(w), 0.0), w_max)
                         for q in q_grid:
-                            val = self._backup_val(V[t + 1, :], float(W), float(q), float(w), shocks)
+                            val = self._backup_val(V[t + 1, :], float(W), float(q), float(w), shocks, weights)
                             # tie-break: 값 동률이면 더 보수적 w(작은 w) 선택
                             if (val > best_val + self.tie_eps) or (abs(val - best_val) <= self.tie_eps and w < bw):
                                 best_val = float(val)
