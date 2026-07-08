@@ -180,6 +180,8 @@ def make_cfg(args) -> SimConfig:
         f_min_real=_get(args, "f_min_real", getattr(cfg, "f_min_real", None)),
         F_target=_get(args, "F_target", getattr(cfg, "F_target", None)),
         hjb_W_grid=_get(args, "hjb_W_grid", getattr(cfg, "hjb_W_grid", None)),
+        hjb_W_max=_get(args, "hjb_W_max", getattr(cfg, "hjb_W_max", None)),
+        hjb_W_min=_get(args, "hjb_W_min", getattr(cfg, "hjb_W_min", None)),
         hjb_Nshock=_get(args, "hjb_Nshock", getattr(cfg, "hjb_Nshock", None)),
         # 헤지/시장
         hedge=_get(args, "hedge", getattr(cfg, "hedge", "off")),

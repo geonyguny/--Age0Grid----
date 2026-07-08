@@ -181,6 +181,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # ---------------- HJB ----------------
     p.add_argument("--hjb_W_grid", type=int, help="HJB 자산 격자 크기")
+    p.add_argument("--hjb_W_max", type=float, help="HJB 자산 격자 상한(W/W0 기준, 기본 5.0)")
+    p.add_argument("--hjb_W_min", type=float, help="HJB 자산 격자 하한(기본 0.0)")
     p.add_argument("--hjb_Nshock", type=int, help="HJB 쇼크(근사) 개수")
     p.add_argument("--hjb_eta_n", type=int, help="HJB 적분 노드 개수")
     p.add_argument("--hjb_w_grid", help="HJB 위험비중 격자(쉼표구분)")
@@ -299,7 +301,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--habit_phi", type=float, default=0.0, help="습관/스무딩 계수")
     p.add_argument("--bias_loss_aversion", type=float, default=0.0,
                    help="추가적 손실가중(필요 시)")
-    p.add_argument("--bias_prob_gamma", type=float, default=1.0,
+    p.add_argument("--bias_prob_gamma", type=float, default=0.0,
                    help="Prelec 가중 γ (0이면 사용 안함; 예: 0.70)")
     p.add_argument("--bias_myopia", type=float, default=0.0,
                    help="현재편향 강도(예: 0.92, 0.90, 0.85)")
