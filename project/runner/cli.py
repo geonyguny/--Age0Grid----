@@ -183,6 +183,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hjb_W_grid", type=int, help="HJB 자산 격자 크기")
     p.add_argument("--hjb_W_max", type=float, help="HJB 자산 격자 상한(W/W0 기준, 기본 5.0)")
     p.add_argument("--hjb_W_min", type=float, help="HJB 자산 격자 하한(기본 0.0)")
+    p.add_argument("--hjb_W_focus", type=float, help="저자산 구간 격자 집중 상한(기본 2.0, 이 값 이하에 격자점 대부분을 배치). 0 이하 또는 hjb_W_max 이상이면 균일격자로 폴백")
+    p.add_argument("--hjb_W_focus_frac", type=float, help="hjb_W_focus 이하 구간에 배치할 격자점 비율(기본 0.75)")
     p.add_argument("--hjb_Nshock", type=int, help="HJB 쇼크(근사) 개수")
     p.add_argument("--hjb_eta_n", type=int, help="HJB 적분 노드 개수")
     p.add_argument("--hjb_w_grid", help="HJB 위험비중 격자(쉼표구분)")
@@ -238,8 +240,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--value_coef", type=float, default=0.5)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--max_grad_norm", type=float, default=0.5)
-    p.add_argument("--rl_q_cap", type=float, default=0.0,
-                   help="정책의 분기별 최댓값(소비/인출 상한 등)")
+    p.add_argument("--rl_q_cap", type=float, default=0.02,
+                   help="정책의 분기별 소비율 상한(월간 기준, 예: 0.02=월 2%). "
+                        "HJB의 q_actions 최댓값(4%룰 월환산 q4≈0.0034)보다 넉넉하게 잡아 "
+                        "행동편향 등 더 공격적인 소비 정책도 탐색 가능하게 함. "
+                        "0 이하로 주면 상한 없음(주의: irp_env.py의 액터 출력이 그대로 "
+                        "소비율로 쓰이므로 무제한 설정 시 학습 초반 파산 위험이 큼).")
     p.add_argument("--teacher_eps0", type=float, default=0.0)
     p.add_argument("--teacher_decay", type=float, default=1.0)
     p.add_argument("--lw_scale", type=float, default=0.0)
@@ -301,7 +307,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--habit_phi", type=float, default=0.0, help="습관/스무딩 계수")
     p.add_argument("--bias_loss_aversion", type=float, default=0.0,
                    help="추가적 손실가중(필요 시)")
-    p.add_argument("--bias_prob_gamma", type=float, default=0.0,
+    p.add_argument("--bias_prob_gamma", type=float, default=1.0,
                    help="Prelec 가중 γ (0이면 사용 안함; 예: 0.70)")
     p.add_argument("--bias_myopia", type=float, default=0.0,
                    help="현재편향 강도(예: 0.92, 0.90, 0.85)")

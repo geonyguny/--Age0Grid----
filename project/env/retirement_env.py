@@ -298,13 +298,25 @@ class RetirementEnv:
         self.bootstrap_block = int(max(1, self._get(cfg, kwargs, "bootstrap_block", 24)))
         self.use_real_rf = str(self._get(cfg, kwargs, "use_real_rf", "on") or "on").lower()
 
-        # --- IID 파라미터(테스트/디버그용) ---
-        self.mu_risky = _safe_float(self._get(cfg, kwargs, "mu_risky", 0.06 / 12), 0.06 / 12)
+        # --- IID 파라미터 ---
+        # [FIX 2026-07] 기존 코드는 "mu_risky"/"sigma_risky"라는, cfg에 존재하지도 않는
+        # 속성명을 찾다가 실패하면 무조건 하드코딩된 기본값(mu=6%/12, sigma=18%/sqrt(12))으로
+        # 폴백했다. 그 결과 cfg.mu_annual/cfg.sigma_annual(자산별 프리셋: KR 20%, US 16%,
+        # Gold 15% 등)이 iid 모드의 실제 시장 시뮬레이션에 전혀 반영되지 않는 버그가 있었다.
+        # (--asset 플래그를 바꿔도 iid 모드 결과가 달라지지 않았던 근본 원인.)
+        # 아래처럼 cfg.mu_annual/sigma_annual로부터 월간 mu_risky/sigma_risky 기본값을
+        # 먼저 계산한 뒤, 그래도 명시적으로 mu_risky/sigma_risky가 주어지면(override) 그것을
+        # 우선하도록 수정한다.
+        mu_ann_default = float(self._get(cfg, kwargs, "mu_annual", 0.06) or 0.06)
+        sigma_ann_default = float(self._get(cfg, kwargs, "sigma_annual", 0.20) or 0.20)
+        _default_mu_risky = (1.0 + mu_ann_default) ** (1.0 / self.steps_per_year) - 1.0
+        _default_sigma_risky = sigma_ann_default / np.sqrt(self.steps_per_year)
+        self.mu_risky = _safe_float(self._get(cfg, kwargs, "mu_risky", _default_mu_risky), _default_mu_risky)
         self.sigma_risky = max(
             0.0,
             _safe_float(
-                self._get(cfg, kwargs, "sigma_risky", 0.18 / np.sqrt(12)),
-                0.18 / np.sqrt(12),
+                self._get(cfg, kwargs, "sigma_risky", _default_sigma_risky),
+                _default_sigma_risky,
             ),
         )
         self.r_safe_fix = _safe_float(self._get(cfg, kwargs, "r_safe", 0.02 / 12), 0.02 / 12)

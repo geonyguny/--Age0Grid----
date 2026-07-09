@@ -89,10 +89,27 @@ class HJBSolver:
         self.m = cfg.monthly()
 
         # --- grids ---
+        # NOTE (2026-07): 균일 격자(np.linspace)를 그대로 쓰면 실제 인출경로가
+        # 거의 항상 머무는 저자산 구간(W~0~2)의 해상도가 너무 낮아져서, HJB가
+        # W_max=10 등 넓은 범위를 균일하게 나눌 때 저자산 구간에서 위험자산
+        # 비중을 0으로 잘못 수렴시키는 이산화 아티팩트가 발생함을 확인했다
+        # (rule 기반 고정정책 w=0.30보다 EU가 낮게 나오는 역설의 근본 원인).
+        # 해결: 저자산 구간(W_focus 이하)에 격자점 대부분을 몰아주고, 그 위쪽은
+        # 성기게(안전망 목적) 배치하는 2단 비균일 격자로 변경.
         W_min = float(getattr(cfg, "hjb_W_min", 0.0) or 0.0)
         W_max = float(getattr(cfg, "hjb_W_max", 2.0) or 2.0)
         W_n   = int(getattr(cfg, "hjb_W_grid", 33) or 33)
-        self.W_grid = _np.linspace(W_min, W_max, max(2, W_n))
+        W_focus = float(getattr(cfg, "hjb_W_focus", min(2.0, W_max)) or min(2.0, W_max))
+        focus_frac = float(getattr(cfg, "hjb_W_focus_frac", 0.75) or 0.75)
+
+        if W_focus is not None and 0.0 < W_focus < W_max and W_n >= 4:
+            n_focus = max(2, int(round(max(2, W_n) * focus_frac)))
+            n_tail = max(2, max(2, W_n) - n_focus + 1)  # +1: 접합점 중복 제거용
+            dense = _np.linspace(W_min, W_focus, n_focus)
+            sparse = _np.linspace(W_focus, W_max, n_tail)[1:]  # 접합점(W_focus) 중복 제거
+            self.W_grid = _np.concatenate([dense, sparse])
+        else:
+            self.W_grid = _np.linspace(W_min, W_max, max(2, W_n))
         self.T = int(getattr(cfg, "horizon_years", 35)) * int(getattr(cfg, "steps_per_year", 12))
 
         # --- w actions (dedup + filter + clamp to w_max) ---

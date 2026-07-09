@@ -67,6 +67,13 @@ class SimConfig:
     hjb_W_min: float = 0.0
     hjb_W_max: float = 5.0
     hjb_W_grid: int = 121                         # 논문 기본 해상도(201도 가능)
+    # 2026-07 추가: 저자산 구간 격자 집중 옵션(이산화 아티팩트 방지).
+    # W_focus 이하에 격자점의 focus_frac 비율을 몰아주고, 그 위쪽(W_focus~W_max)은
+    # 성기게 배치한다. 실제 인출 경로가 거의 벗어나지 않는 범위(대략 초기자산의
+    # 1.5~2.5배)로 W_focus를 잡으면, 기존 W_max=5~10 균일격자에서 발생했던
+    # "저자산 구간에서 위험자산비중이 0으로 잘못 수렴"하는 문제가 사라진다.
+    hjb_W_focus: Optional[float] = 2.0
+    hjb_W_focus_frac: float = 0.75
     # w-grid: 자동 생성(0~w_max, 균등분할). 직접 지정 시 리스트/튜플 모두 허용.
     hjb_w_grid: Optional[FloatGrid] = None
     hjb_w_grid_n: int = 8                         # 0~w_max를 n등분 (기본 8점)

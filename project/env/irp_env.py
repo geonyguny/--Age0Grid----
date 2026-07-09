@@ -157,7 +157,14 @@ class IRPEnvAdapter:
         w = float(action.get("w", 0.0))
 
         # ★ 소비 상한 캡(월간). 예: 0.01 → 월 1%
-        if self.q_cap is not None:
+        # [FIX 2026-07] 기존 코드는 `self.q_cap is not None`만 검사했는데,
+        # --rl_q_cap의 CLI 기본값이 0.0("제한 없음"을 의도)이라 self.q_cap이
+        # 0.0(≠None)으로 설정되면 `q = min(q, 0.0)`이 되어 소비율이 매 스텝
+        # 무조건 0으로 강제되고 있었다. 이로 인해 RL 정책이 무엇을 출력하든
+        # 소비가 항상 0으로 깎여 (a) 보상이 클립 하한(-100)에 영구히 고정되고
+        # (b) 학습이 epoch 수와 무관하게 전혀 진행되지 않는 문제가 있었다.
+        # 0 이하 값은 "제한 없음"으로 해석하도록 수정.
+        if self.q_cap is not None and self.q_cap > 0.0:
             q = min(q, self.q_cap)
 
         # 2) call underlying env robustly
@@ -255,6 +262,17 @@ class IRPEnvAdapter:
         # CRRA 효용 계산 + 스케일
         u_t = _crra_u(c_val, self.crra_gamma)
         rew = float(self.u_scale * u_t)
+
+        # [FIX 2026-07] 위에서 재계산한 reward는 RetirementEnv.step()이 원래
+        # 적용하던 ±100 클립을 그대로 우회하고 있었다. _crra_u는 소비가 0에
+        # 가까워지면(c_eff 하한 1e-12) u(c)가 -1e23 스케일까지 발산하는데,
+        # 그 값이 아무 제약 없이 그대로 RL 학습 보상으로 들어가고 있었다.
+        # 실제로 초기/미학습 정책이 q≈0을 출력할 때마다 reward가 약 -2.5e22
+        # 수준으로 폭주하여 critic loss가 처음부터 inf가 되고, 이후 몇 백
+        # epoch을 더 돌려도 학습이 전혀 진행되지 않는 현상(60/200 epoch 결과
+        # 완전 동일)의 직접적인 원인이었다. RetirementEnv.step()과 동일한
+        # 스케일(±100)로 클립하여 학습 안정성을 회복한다.
+        rew = float(np.clip(rew, -100.0, 100.0))
 
         # (선택적) 파산 경로에 소규모 페널티 부여
         if done:
