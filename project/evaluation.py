@@ -308,6 +308,7 @@ def evaluate(
     es_mode: str = "wealth",
     rng=None,                  # (호환성 유지용, 미사용)
     return_paths: bool = False,
+    args: Any = None,          # [FIX 2026-07] 행동편향 래퍼를 실제 시뮬레이션 env에 정확히 적용하기 위해 추가
 ) -> Union[Dict[str, float], Tuple[Dict[str, float], Dict[str, Any]]]:
     """
     Parameters
@@ -332,6 +333,21 @@ def evaluate(
     """
     env = RetirementEnv(cfg)
     T = int(getattr(env, "T", 0))
+
+    # [FIX 2026-07] 행동편향 래퍼(손실회피/변동성쇼크/후회회피 등 recent_ret·recent_vol
+    # 상태에 의존하는 편향들)는 반드시 "실제로 시뮬레이션에 쓰이는" 이 env 인스턴스를
+    # 참조해야 한다. 예전에는 actors.py의 build_actor()가 별도의 (한 번도 reset되지
+    # 않는) 임시 env로 래퍼를 만들어 전달했기 때문에, 상태 의존적 편향들이 항상
+    # recent_ret=0.0/recent_vol=0.0(기본값)만 보게 되어 사실상 작동하지 않는
+    # 구조적 결함이 있었다. (확률왜곡/근시/모호성회피처럼 상태와 무관한 편향들은
+    # 우연히 정상 작동했다.) args가 주어지면 여기서 다시 한번 이 실제 env로
+    # 래퍼를 씌운다. actors.py 쪽 래핑은 제거했으므로 이중적용 걱정은 없다.
+    if args is not None:
+        try:
+            from .policy.behavioral_bias import make_bias_wrapper  # type: ignore
+            actor = make_bias_wrapper(args, env)(actor)
+        except Exception:
+            pass
 
     # (debug) verify injected paths snapshot (quiet=off 때만)
     if str(getattr(cfg, "quiet", "on")).lower() != "on":

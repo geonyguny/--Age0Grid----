@@ -60,6 +60,8 @@ class IRPEnvAdapter:
     ):
         self.f_target = float(f_target)
         self.q_cap = float(q_cap) if q_cap is not None else None
+        # [FIX 2026-07] w도 q와 동일한 문제(클립 vs 스케일)가 있어 w_max를 저장해 둔다.
+        self.w_max = float(w_max) if w_max is not None else 1.0
         self._cfg = cfg
 
         kwargs = dict(base_kwargs or {})
@@ -153,19 +155,28 @@ class IRPEnvAdapter:
 
     def step(self, action: Dict[str, float]):
         # 1) parse action
-        q = float(action.get("q", 0.0))
-        w = float(action.get("w", 0.0))
+        q_raw = float(action.get("q", 0.0))
+        w_raw = float(action.get("w", 0.0))
 
-        # ★ 소비 상한 캡(월간). 예: 0.01 → 월 1%
-        # [FIX 2026-07] 기존 코드는 `self.q_cap is not None`만 검사했는데,
-        # --rl_q_cap의 CLI 기본값이 0.0("제한 없음"을 의도)이라 self.q_cap이
-        # 0.0(≠None)으로 설정되면 `q = min(q, 0.0)`이 되어 소비율이 매 스텝
-        # 무조건 0으로 강제되고 있었다. 이로 인해 RL 정책이 무엇을 출력하든
-        # 소비가 항상 0으로 깎여 (a) 보상이 클립 하한(-100)에 영구히 고정되고
-        # (b) 학습이 epoch 수와 무관하게 전혀 진행되지 않는 문제가 있었다.
-        # 0 이하 값은 "제한 없음"으로 해석하도록 수정.
+        # ★ 소비율 스케일링(월간). 예: q_cap=0.02 → 월 최대 2%
+        # [FIX 2026-07, 2차] 액터(BetaActor)는 Beta(a,b) 분포를 통해 [0,1] 구간에서
+        # 원값(q_raw)을 샘플링하는데, 기존 코드는 이 원값을 실제 소비율로 간주하고
+        # `q = min(q_raw, q_cap)`으로 "클립"만 하고 있었다. q_cap(예: 0.02)이 Beta의
+        # 지지집합 [0,1]에 비해 매우 작으므로, q_raw는 거의 항상 q_cap보다 크고,
+        # 그 결과 실제 소비율은 네트워크가 무엇을 출력하든 사실상 항상 정확히
+        # q_cap 그 자체로 고정되어 있었다(예: 월 2%=연 21.9%, 매우 공격적이고 고정된
+        # 인출률). 이는 초기화를 아무리 잘 잡아도 학습이 실질적으로 아무 효과를
+        # 내지 못했던 근본 원인이었다. "클립"이 아니라 "스케일"로 바꿔, Beta의
+        # [0,1] 전체 지지집합이 [0, q_cap] 구간 전체에 의미 있게 대응하도록 한다.
         if self.q_cap is not None and self.q_cap > 0.0:
-            q = min(q, self.q_cap)
+            q = float(np.clip(q_raw, 0.0, 1.0)) * self.q_cap
+        else:
+            q = q_raw
+
+        # ★ 위험자산비중 스케일링. w_max=0.7이면 Beta의 [0,1] 전체가 [0,0.7]에 대응.
+        # (q_cap=0.02처럼 극단적으로 작진 않아 증상은 덜 치명적이었지만, 원리상
+        # 동일한 클립-대-스케일 버그였다.)
+        w = float(np.clip(w_raw, 0.0, 1.0)) * self.w_max
 
         # 2) call underlying env robustly
         res = self._call_step_underlying(q, w)

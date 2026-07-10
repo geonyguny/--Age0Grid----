@@ -20,11 +20,17 @@ class BehavioralSpec:
     - lambda_loss: 손실 가중(λ>=0); u<ref 구간에서 패널티 강화
     - beta       : 현재편향(0<β<=1); t>=1 보상에 β 곱해 과소평가
     - habit_phi  : 습관효용(φ>=0); u_t ← u_t - φ*u_{t-1}
+    - regret_rho : 후회민감도(ρ>=0); 논문 식(38) — 소비(c)가 기준소비(c*, 예: 4%룰
+                   인출액)에 미달할 때 추가 불편(disutility) = -ρ*max(c*-c, 0) 부과.
+                   [2026-07] 최초 구현(시장수익률 기반 위험자산 추격매수)은 논문 본문의
+                   Bell(1982)/Loomes-Sugden(1982) 후회이론(소비 미달 기준)과 맞지 않아
+                   소비 관점으로 재구현함.
     """
     on: bool = False
     lambda_loss: float = 0.0   # >=0
     beta: float = 1.0          # (0,1]
     habit_phi: float = 0.0     # >=0
+    regret_rho: float = 0.0    # >=0
 
 def parse_behavioral_from_args(args) -> BehavioralSpec:
     on = str(getattr(args, "bh_on", "off") or "off").lower() == "on"
@@ -33,7 +39,8 @@ def parse_behavioral_from_args(args) -> BehavioralSpec:
     if not (0.0 < beta <= 1.0):
         beta = 1.0
     habit_phi = max(0.0, _f(getattr(args, "bh_habit_phi", getattr(args, "habit_phi", 0.0)), 0.0))
-    return BehavioralSpec(on=on, lambda_loss=lam, beta=beta, habit_phi=habit_phi)
+    regret_rho = max(0.0, _f(getattr(args, "bh_regret_rho", 0.0), 0.0))
+    return BehavioralSpec(on=on, lambda_loss=lam, beta=beta, habit_phi=habit_phi, regret_rho=regret_rho)
 
 def distort_utility(u: float, *, ref: float = 0.0, spec: BehavioralSpec) -> float:
     """
@@ -53,6 +60,17 @@ def habit_utility(u: float, prev_u: float, *, spec: BehavioralSpec) -> float:
     if not spec.on or spec.habit_phi <= 1e-16:
         return float(u)
     return float(u) - float(spec.habit_phi) * float(prev_u)
+
+def regret_utility(u: float, c: float, c_ref: float, *, spec: BehavioralSpec) -> float:
+    """
+    논문 식(38): u_t ← u_t - ρ * max(c* - c, 0)
+    소비(c)가 기준소비(c_ref, 예: 4%룰 인출액)에 미달할 때 추가 불편을 부과한다.
+    (Bell 1982, Loomes and Sugden 1982 후회이론)
+    """
+    if not spec.on or spec.regret_rho <= 1e-16:
+        return float(u)
+    shortfall = max(float(c_ref) - float(c), 0.0)
+    return float(u) - float(spec.regret_rho) * shortfall
 
 def describe(spec: BehavioralSpec) -> Dict[str, float | int | str | bool]:
     d = asdict(spec)

@@ -692,10 +692,10 @@ def _standard_evaluate(
 
     try:
         ret = evaluate(
-            cfg, actor_like, es_mode=str(es_mode).lower(), return_paths=True
+            cfg, actor_like, es_mode=str(es_mode).lower(), return_paths=True, args=args
         )
     except TypeError:
-        ret = evaluate(cfg, actor_like, es_mode=str(es_mode).lower())
+        ret = evaluate(cfg, actor_like, es_mode=str(es_mode).lower(), args=args)
     metrics, extras = {}, {}
     if isinstance(ret, dict):
         metrics = ret

@@ -186,6 +186,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hjb_W_focus", type=float, help="저자산 구간 격자 집중 상한(기본 2.0, 이 값 이하에 격자점 대부분을 배치). 0 이하 또는 hjb_W_max 이상이면 균일격자로 폴백")
     p.add_argument("--hjb_W_focus_frac", type=float, help="hjb_W_focus 이하 구간에 배치할 격자점 비율(기본 0.75)")
     p.add_argument("--hjb_Nshock", type=int, help="HJB 쇼크(근사) 개수")
+    p.add_argument("--hjb_q_max_mult", type=float,
+                   help="HJB 소비율 격자 상한 배율(기본 1.0=4%룰 월환산 q4 그대로). "
+                        "예: 4.0이면 q4의 4배(연 16%)까지 격자를 넓혀서 진짜 무제약 "
+                        "최적 소비율이 4%보다 높은지 검증할 수 있음.")
+    p.add_argument("--pension_rho", type=float,
+                   help="국민연금 실질 소득대체율 ρ (0=미반영). 확정 정책실험 구간: "
+                        "0.20/0.30/0.40 (한정림·이항석 2013 추정치 약 21~23%, "
+                        "한국일보 2025.4 보도 기준 체감 실질 대체율 약 30%). "
+                        "※명목 소득대체율(2026년부터 43%, 40년 만근 가정)과는 다른 개념이므로 혼동 주의.")
+    p.add_argument("--pension_income_mult", type=float,
+                   help="은퇴 전 연소득/W0 배율(X). 기본 3.692 = 2025 가계금융복지조사 "
+                        "가구 평균 금융자산(1억 3,690만원, 부동산 제외) / 국민연금 A값 "
+                        "연환산(309만원×12=3,708만원). 은퇴직전 소득 기준값으로 가계 "
+                        "전체 평균소득이 아닌 국민연금 A값(제도상 대표소득)을 채택.")
+    p.add_argument("--pension_claim_age", type=float,
+                   help="국민연금 수급개시 연령(65세로 고정)")
     p.add_argument("--hjb_eta_n", type=int, help="HJB 적분 노드 개수")
     p.add_argument("--hjb_w_grid", help="HJB 위험비중 격자(쉼표구분)")
     p.add_argument("--w_min_dev", type=float, help="dev: w < w_min_dev 액션 제거")
@@ -313,6 +329,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="현재편향 강도(예: 0.92, 0.90, 0.85)")
     p.add_argument("--bias_w_floor", type=float, default=0.0, help="소비 바닥")
     p.add_argument("--bias_w_cap_shock", type=float, default=0.0, help="소비 캡 쇼크")
+    p.add_argument("--bh_regret_rho", type=float, default=0.0,
+                   help="후회회피 ρ (0이면 사용 안함; 예: 0.3~0.7). 논문 식(38)/Bell(1982), "
+                        "Loomes and Sugden(1982) 후회이론에 따라, 소비(c)가 기준소비 "
+                        "c*(4%룰 인출액)에 미달할 때 효용에 -ρ*max(c*-c,0) 페널티를 부과한다. "
+                        "--bh_on on 과 함께 사용해야 적용됨(손실회피/습관형성과 동일한 효용-레이어).")
 
     # ---------------- stdout / logging ----------------
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",
@@ -372,7 +393,7 @@ def _validate_args(args) -> None:
             hp = float(args.habit_phi)
             if not (0.0 <= hp <= 1.0): _warn(f"--habit_phi 권장범위(0~1) 벗어남: {hp}")
         except Exception: _warn("--habit_phi 파싱 실패")
-    for name in ["bias_loss_aversion","bias_myopia","bias_w_cap_shock"]:
+    for name in ["bias_loss_aversion","bias_myopia","bias_w_cap_shock","bh_regret_rho"]:
         v = getattr(args,name,0.0)
         try:
             if float(v) < 0.0: _warn(f"--{name} 음수 비권장: {v}")
@@ -413,6 +434,13 @@ def _inject_meta(out: Dict[str,Any], args) -> None:
             "myopia": getattr(args,"bias_myopia",0.0),
             "w_floor": getattr(args,"bias_w_floor",0.0),
             "w_cap_shock": getattr(args,"bias_w_cap_shock",0.0),
+            "ambiguity": getattr(args,"theta_ambiguity",None),
+        })
+        meta.setdefault("behavioral_spec", {
+            "bh_on": getattr(args,"bh_on","off"),
+            "la_k": getattr(args,"la_k",0.0),
+            "habit_phi": getattr(args,"habit_phi",0.0),
+            "regret_rho": getattr(args,"bh_regret_rho",0.0),
         })
         meta.setdefault("verbose", getattr(args,"verbose","off"))
     except Exception:

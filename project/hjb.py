@@ -125,9 +125,14 @@ class HJBSolver:
         self.w_actions = _np.array(sorted(set(wa)), dtype=float)
 
         # --- q actions (5-pt grid around 4% rule, with q_floor clamp later) ---
+        # [2026-07] 기존엔 격자 상한이 q4(4%룰 월환산)로 하드코딩되어 있어서,
+        # 진짜 무제약 최적 소비율이 4%보다 높은지 검증할 방법이 없었다.
+        # hjb_q_max_mult(기본 1.0=기존과 동일)로 상한을 조절할 수 있게 확장.
         spm = int(getattr(cfg, "steps_per_year", 12) or 12)
         q4 = 1.0 - (1.0 - 0.04) ** (1.0 / max(1, spm))
-        self.q_actions = _np.array([0.0, 0.25 * q4, 0.5 * q4, 0.75 * q4, q4], dtype=float)
+        q_max_mult = float(getattr(cfg, "hjb_q_max_mult", 1.0) or 1.0)
+        q_max = q4 * max(0.0, q_max_mult)
+        self.q_actions = _np.array([0.0, 0.25 * q_max, 0.5 * q_max, 0.75 * q_max, q_max], dtype=float)
 
         # --- preferences (utility scale & gamma for tie-breaking consistency) ---
         self.gamma = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
@@ -164,6 +169,57 @@ class HJBSolver:
         self.lam   = float(getattr(cfg, "lambda_term", 0.0) or 0.0)
         self.F     = float(getattr(cfg, "F_target", 1.0) or 1.0)
 
+        # --- 유증동기(bequest) terminal utility ---
+        # [2026-07 신규구현] 기존엔 project/env.py(사용 안 하는 죽은 코드)에만
+        # bequest_kappa/bequest_gamma가 연결되어 있었고, HJB의 가치함수 계산에는
+        # 전혀 반영되지 않았다(즉 유증동기=0으로 강제된 것과 동일). 여기서는
+        # 종단시점 자산 W_T에 대해 CRRA 형태의 유증효용
+        #     bequest_kappa * (W_T^(1-bequest_gamma) - 1) / (1-bequest_gamma)
+        # 을 기존 CVaR 페널티에 추가로 더해, 소비 효용과 별개로 "남기는 자산" 자체에서도
+        # 효용을 얻도록 한다. bequest_kappa=0(기본값)이면 완전히 기존과 동일하게 동작한다.
+        self.bequest_kappa = float(getattr(cfg, "bequest_kappa", 0.0) or 0.0)
+        self.bequest_gamma = float(getattr(cfg, "bequest_gamma", 1.0) or 1.0)
+
+        # --- 국민연금(소득대체율 ρ) 외생소득 ---
+        # [2026-07 신규구현, 2026-07 개정] 소득대체율 ρ는 정의상 "은퇴 전 소득 대비
+        # 연금액 비율"인데, 본 모델은 자산(W)만 정규화된 상태변수로 쓰므로, ρ를
+        # 반영하려면 "은퇴 전 연소득이 초기자산(W0) 대비 몇 배였는지"를 나타내는
+        # 환산배율이 하나 더 필요하다.
+        # [개정] 은퇴직전 소득 기준값은 가계 평균소득이 아니라 "국민연금 A값"
+        # (전체 가입자 평균소득월액, 2025년 309만원/월)으로 확정 — A값은 국민연금
+        # 급여 산정에 실제 쓰이는 제도상 대표소득이라 ρ 정의와 더 정합적이다.
+        # X ≈ 3.69 = 2025년 가계금융복지조사 가구 평균 금융자산(1.37억, 부동산 제외)
+        #            / A값 연환산(3,708만원).
+        # ρ 정책실험 확정구간: {0.20, 0.30, 0.40} (실질 소득대체율 기준, 한정림·이항석
+        # 2013 / 한국일보 2025.4 근거). pension_income_mult(=X)가 클수록 "은퇴 전
+        # 소득 대비 자산이 넉넉했다"는 뜻이 되어 국민연금이 상대적으로 덜 중요해진다.
+        # 국민연금이 상대적으로 덜 중요해진다.
+        self.pension_rho = float(getattr(cfg, "pension_rho", 0.0) or 0.0)
+        self.pension_income_mult = float(getattr(cfg, "pension_income_mult", 3.692) or 3.692)
+        self.pension_claim_age = float(getattr(cfg, "pension_claim_age", 65.0) or 65.0)
+        self.age0 = float(getattr(cfg, "age0", 55) or 55)
+
+        # 월간 국민연금 소득(W0=1.0 정규화 단위). 수급개시 이전 구간은 0.
+        Y_month = 0.0
+        if self.pension_rho > 0.0 and self.pension_income_mult > 0.0:
+            Y_month = self.pension_rho / (self.pension_income_mult * 12.0)
+        claim_month_idx = max(0, int(round((self.pension_claim_age - self.age0) * spm)))
+        self.Y_sched = _np.zeros(self.T, dtype=float)
+        if claim_month_idx < self.T:
+            self.Y_sched[claim_month_idx:] = Y_month
+
+        # --- 종신연금(1회성 매입) 외생소득 ---
+        # [2026-07 신규] θ(연금전환비율)는 t=0에서 1회 선택되는 결정으로 취급한다.
+        # 이미 runner.annuity_wiring.setup_annuity_overlay()가 HJBSolver 생성 전에
+        # 실행되어 cfg.y_ann(월 지급액, 사망률 기반 a_factor로 환산됨)과 cfg.W0(연금
+        # 매입 후 잔여자산)을 계산해 두므로, 별도 메커니즘을 새로 만들지 않고 이 값을
+        # 그대로 재사용한다(기존에 검증된 계산 경로를 이중화하지 않기 위함).
+        # θ 자체의 최적화(여러 후보값 비교)는 --ann_alpha를 바꿔가며 CLI를 반복
+        # 실행하고 EU를 비교하는 외부 그리드서치로 수행한다.
+        ann_y_month = float(getattr(cfg, "y_ann", 0.0) or 0.0)
+        if ann_y_month > 0.0:
+            self.Y_sched = self.Y_sched + ann_y_month
+
         # --- fee (monthly) ---
         self.phi_m = float(self.m.get("phi_m", 0.0) or 0.0)
 
@@ -180,12 +236,22 @@ class HJBSolver:
         inv = 1.0 / max(1e-12, (1.0 - self.alpha))
         return self.lam * (eta + inv * _np.maximum(self.F - W - float(eta), 0.0))
 
+    # --- Terminal bequest utility (CRRA on terminal wealth) ---
+    def _bequest_U(self, W: _np.ndarray) -> _np.ndarray:
+        if self.bequest_kappa <= 0.0:
+            return _np.zeros_like(W, dtype=float)
+        return self.bequest_kappa * _crra_u(W, self.bequest_gamma)
+
     # --- value backup for (W, q, w) ---
     def _backup_val(self, V_next: _np.ndarray, W: float, q: float, w: float, shocks: _np.ndarray,
-                     weights: Optional[_np.ndarray] = None) -> float:
+                     weights: Optional[_np.ndarray] = None, Y_t: float = 0.0) -> float:
         # 1) consume
-        c = q * W
-        W_net = max(W - c, 0.0)
+        #    [2026-07] 국민연금 등 외생소득 Y_t가 있으면 "총소비 = 개인인출(q*W) + Y_t"로
+        #    CRRA 효용을 계산하되, 포트폴리오에서 실제로 빠져나가는 금액은 q*W뿐이다
+        #    (연금소득은 외부에서 들어와 그대로 소비되고 자산에는 반영되지 않는다고 가정).
+        q_w = q * W
+        c = q_w + Y_t
+        W_net = max(W - q_w, 0.0)
 
         # 2) returns
         gross = 1.0 + (w * shocks) + ((1.0 - w) * self.rf)
@@ -236,7 +302,7 @@ class HJBSolver:
             PiQ = _np.zeros((self.T,     self.W_grid.size), dtype=float)
 
             # terminal
-            V[self.T, :] = - self._cvar_T(self.W_grid, float(eta))
+            V[self.T, :] = self._bequest_U(self.W_grid) - self._cvar_T(self.W_grid, float(eta))
 
             # backward
             for t in reversed(range(self.T)):
@@ -253,7 +319,7 @@ class HJBSolver:
                     for w in self.w_actions:
                         w = min(max(float(w), 0.0), w_max)
                         for q in q_grid:
-                            val = self._backup_val(V[t + 1, :], float(W), float(q), float(w), shocks, weights)
+                            val = self._backup_val(V[t + 1, :], float(W), float(q), float(w), shocks, weights, Y_t=float(self.Y_sched[t]))
                             # tie-break: 값 동률이면 더 보수적 w(작은 w) 선택
                             if (val > best_val + self.tie_eps) or (abs(val - best_val) <= self.tie_eps and w < bw):
                                 best_val = float(val)
@@ -280,3 +346,20 @@ class HJBSolver:
             best_PiQ = _np.full((self.T, self.W_grid.size), const_q, dtype=float)
 
         return {"Pi_w": best_PiW, "Pi_q": best_PiQ, "eta": best_eta, "W_grid": self.W_grid}
+
+# =====================================================================
+# [2026-07 참고] 종신연금 전환비율(theta, ann_alpha)의 1회성 결정 최적화 방법
+# =====================================================================
+# theta 자체를 HJB가 매 시점 반복 선택하는 진짜 3번째 통제변수로 만들면
+# 상태공간이 (W, 누적연금소득) 2차원으로 늘어나 계산량이 크게 증가한다.
+# 본 연구는 "1회성 결정" 스코프로 한정하여 (Milevsky 2007의 부분적/점진적
+# 연금화 논의와도 부합), theta는 t=0에서 한 번만 선택되는 것으로 취급한다.
+#
+# 구현: runner.annuity_wiring.setup_annuity_overlay()가 HJBSolver 생성 전에
+# cfg.y_ann(월 지급액)과 cfg.W0(연금 매입 후 잔여자산)을 계산해 두면,
+# HJBSolver.__init__은 이를 그대로 읽어 Y_sched에 반영한다(위 참조).
+#
+# theta 자체의 최적화는 여러 --ann_alpha 후보값(예: 0, 0.1, ..., 0.6)으로
+# CLI를 반복 실행하고, 각 실행의 EU(evaluate() 결과)를 비교하는 외부
+# 그리드서치로 수행한다. 이는 bequest_kappa/pension_rho 민감도 분석과
+# 동일한 패턴이며, 이미 검증된 evaluate() 파이프라인을 그대로 재사용한다.

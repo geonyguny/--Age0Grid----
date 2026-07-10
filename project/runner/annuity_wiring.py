@@ -198,19 +198,26 @@ def setup_annuity_overlay(
     life_df = get_life_table_from_env(probe)  # 있을수록 정확
     W0 = _f(getattr(probe, "W0", getattr(cfg, "W0", 1.0)), 1.0)
 
-    # 5) (실질/명목) 연율 추정 → y_ann
+    # 5) (실질/명목) 연율 추정 → annuity_factor 계산용 할인율(r_ann_rate)
+    #    [FIX 2026-07] 이 지역변수는 "연금 계수 계산용 할인율"일 뿐 실제 지급액이
+    #    아닌데, 기존 코드는 변수명이 똑같이 "y_ann"이라 아래 7)에서 실수로
+    #    cfg.y_ann에 이 할인율(예: 연 2%대)을 그대로 대입하고 있었다. 그 결과
+    #    HJB/평가 파이프라인이 실제 지급액(P, 보통 연 1~2%대 수준으로 훨씬 작음)
+    #    대신 훨씬 큰 가짜 소득을 "월 연금지급액"으로 착각하는 버그가 있었다.
+    #    (HJB가 실제보다 훨씬 큰 연금소득을 믿고 개인자산을 과도하게 인출하도록
+    #    유도해, θ>0 케이스에서 EU가 오히려 급격히 악화되는 현상의 원인이었음.)
     r_m = _avg_monthly_rf(cfg, probe)
     if index_mode == "nominal":
         # CPI 연동 시 명목화
         r_m = r_m + _avg_monthly_cpi(cfg)
-    y_ann = (1.0 + r_m) ** spm - 1.0
+    r_ann_rate = (1.0 + r_m) ** spm - 1.0
 
     # 6) a_factor & 지급액 계산
     if _ANN_STREAM:
         spec = AnnuitySpec(
             steps_per_year=spm,
             index_mode=("real" if index_mode == "real" else "nominal"),
-            r_f_annual=float(y_ann),
+            r_f_annual=float(r_ann_rate),
             first_payment_immediate=first_immediate,
         )
         a_fac, _ = annuity_factor(
@@ -230,7 +237,7 @@ def setup_annuity_overlay(
             age0=age0,
             horizon_years=horizon_years,
             spm=spm,
-            r_annual=float(y_ann),
+            r_annual=float(r_ann_rate),
             life_table=life_df,
             immediate=first_immediate,
         )
@@ -240,16 +247,18 @@ def setup_annuity_overlay(
     W0_after = float(max(0.0, W0 * (1.0 - ann_alpha)))
 
     # 7) cfg 주입
+    # [FIX 2026-07] cfg.y_ann은 "실제 스텝당 연금 지급액"이어야 하므로 P를 대입한다
+    # (기존엔 위의 r_ann_rate가 잘못 들어가고 있었음).
     setattr(cfg, "ann_on", "on")
     setattr(cfg, "W0", W0_after)
-    setattr(cfg, "y_ann", _f(y_ann, 0.0))
+    setattr(cfg, "y_ann", _f(P, 0.0))
     setattr(cfg, "ann_P", _f(P, 0.0))
     setattr(cfg, "ann_a_factor", _f(a_fac, 0.0))
     setattr(cfg, "ann_index", "real" if index_mode == "real" else "nominal")
 
     # 러너가 메타를 기록할 수 있도록 도우미 dict 반환
     return {
-        "y_ann": float(y_ann),
+        "y_ann": float(P),
         "P": float(P),
         "a_factor": float(a_fac),
         "W0_after": float(W0_after),

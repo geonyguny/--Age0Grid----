@@ -109,6 +109,24 @@ class BetaActor(nn.Module):
         self.backbone = MLP(obs_dim, hidden, out_dim=4)  # [a_q, b_q, a_w, b_w]
         self.softplus = nn.Softplus()
 
+        # [FIX 2026-07] 초기화 문제: PyTorch 기본 초기화로는 마지막 레이어의 원시
+        # 출력이 0 근방이라, softplus(x)+1 이후 a_q≈b_q≈1.69가 되어 초기 정책이
+        # Beta(1.69,1.69)(평균 0.5, q_cap 대비 절반)에서 시작한다. 그런데 q는
+        # 월간 소비율로서 실제 적정 범위(월 0.3~1.5%, 즉 q_cap의 15~75% 수준)와
+        # 스케일 자체가 크게 어긋나 있어, 학습이 이 격차를 극복하는 데 오래 걸리거나
+        # (critic이 부실한 상태와 겹쳐) 수렴에 실패하는 원인 중 하나로 보인다.
+        # 마지막 레이어의 weight를 0으로, bias를 아래 계산된 값으로 초기화해
+        # "학습 시작 시점의 정책"이 이미 합리적인 근방(q 평균≈q_cap의 15%,
+        # w 평균≈0.35, 본 연구에서 확인된 근사 최적 위험자산비중과 유사)에서
+        # 출발하도록 한다. 입력에 대한 의존성(가중치)은 그대로 학습되며,
+        # 이는 "합리적 사전(prior)에서 시작"하는 표준적인 정책경사 초기화 기법이다.
+        last = self.backbone.net[-1]
+        if isinstance(last, nn.Linear):
+            with torch.no_grad():
+                last.weight.zero_()
+                # inverse-softplus(target-1) 로 역산한 bias 값
+                last.bias.copy_(torch.tensor([-0.4328, 7.4994, 0.6952, 2.8434]))
+
     def forward(self, x: torch.Tensor) -> Tuple[Beta, Beta, torch.Tensor]:
         raw = self.backbone(x)
         a_q, b_q, a_w, b_w = torch.chunk(raw, 4, dim=-1)
@@ -122,9 +140,19 @@ class BetaActor(nn.Module):
 
 
 class ValueCritic(nn.Module):
-    def __init__(self, obs_dim: int, hidden: List[int]):
+    def __init__(self, obs_dim: int, hidden: List[int], init_value: float = -1800.0):
         super().__init__()
         self.v = MLP(obs_dim, hidden, out_dim=1)
+        # [FIX 2026-07] 크리틱 초기 출력이 0 근방인데, 실제 관측된 리턴(ret) 스케일은
+        # 대략 -1500~-2000 수준이었다(로그 rew_mean/ret_mean 참조). 이 격차를 그래디언트
+        # 하강만으로 좁히려면 학습 초반 상당 기간이 소요되고, loss_v가 학습 내내
+        # 거의 줄지 않는 것처럼 보이는 현상의 원인 중 하나였다. 마지막 레이어를
+        # 0으로, bias를 경험적 스케일 근방으로 초기화해 이 문제를 완화한다.
+        last = self.v.net[-1]
+        if isinstance(last, nn.Linear):
+            with torch.no_grad():
+                last.weight.zero_()
+                last.bias.fill_(float(init_value))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.v(x).squeeze(-1)

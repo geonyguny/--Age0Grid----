@@ -83,6 +83,26 @@ class SimConfig:
 
     # MC samples for expectation inside HJB
     hjb_Nshock: int = 1024
+    hjb_q_max_mult: float = 1.0   # 소비율 격자 상한 배율(1.0=기존 4%룰 상한과 동일, 하위호환)
+
+    # --- 국민연금(소득대체율 ρ) 외생소득 [2026-07 신규, 2026-07 개정] ---
+    # pension_rho: 실질 소득대체율 ρ (0이면 국민연금 미반영).
+    #   확정 정책실험 구간: {0.20, 0.30, 0.40} (실질 기준, 명목 소득대체율 43%와는 다른 개념)
+    #   근거: 한정림·이항석(2013, 한국데이터분석학회지) 국민연금 실질 소득대체율 추정치
+    #   (약 21~23%), 한국일보(2025.4) 보도 기준 현재 체감 실질 대체율(약 30%).
+    # pension_income_mult: 은퇴 전 연소득 / W0 배율(X).
+    #   [개정] 은퇴직전 소득 기준값을 가계 평균소득이 아니라 "국민연금 A값"
+    #   (전체 가입자 평균소득월액, 2025년 309만원/월=3,708만원/년)으로 확정.
+    #   X = 2025년 가계금융복지조사 가구 평균 금융자산(1억 3,690만원, 부동산 제외)
+    #       / A값 연환산(3,708만원) ≈ 3.69
+    #   (A값은 국민연금 급여 산정에 실제 쓰이는 "제도상 대표소득"이라, 가계 전체
+    #   평균소득보다 ρ의 정의와 정합적임)
+    # pension_claim_age: 국민연금 수급개시 연령(65세로 고정)
+    # 주의: 본 모형은 전 과정 세전(before-tax) 금액 기준이며, 연금소득세 등 세금
+    #   효과는 고려하지 않는다(논문 서론/3장에 명시 필요, 향후연구 과제).
+    pension_rho: float = 0.0
+    pension_income_mult: float = 3.692
+    pension_claim_age: float = 65.0
 
     # --- Eval / bookkeeping ---
     # seeds는 리스트/튜플 모두 허용 → 내부적으로 튜플로 고정
@@ -219,7 +239,11 @@ class SimConfig:
 
 
 ASSET_PRESETS = {
-    "KR":   dict(mu_annual=0.06,  sigma_annual=0.20),
-    "US":   dict(mu_annual=0.065, sigma_annual=0.16),
-    "Gold": dict(mu_annual=0.03,  sigma_annual=0.15),
+    # [2026-07] 논문 <표 1> 값으로 정합화 (출처: KOSPI/S&P500/LBMA, 2000-2024 실질수익률 기준)
+    # 본 논문의 기본분석은 한국주식(KR) 단일 위험자산 + 안전자산(3년 국채) 2자산 구조를
+    # 채택하며, US/Gold는 부록의 대안적 위험자산 가정 하 강건성 체크 용도로만 사용한다.
+    "KR":   dict(mu_annual=0.055, sigma_annual=0.22),  # KOSPI, 2000-2024
+    "US":   dict(mu_annual=0.065, sigma_annual=0.18),  # S&P500, 2000-2024
+    "Gold": dict(mu_annual=0.02,  sigma_annual=0.15),  # LBMA, 2000-2024
 }
+# 안전자산: 3년 만기 국채수익률 ≈ 연 2.0% (rf_annual 기본값과 일치, config 상단 참조)

@@ -52,7 +52,7 @@ import pandas as pd
 try:
     from ..policy.behavioral import (  # type: ignore
         BehavioralSpec,                # type: ignore
-        distort_utility, habit_utility # type: ignore
+        distort_utility, habit_utility, regret_utility  # type: ignore
     )
 except Exception:  # pragma: no cover
     BehavioralSpec = None  # type: ignore
@@ -61,6 +61,9 @@ except Exception:  # pragma: no cover
         return float(u)
 
     def habit_utility(u: float, prev_u: float, *, spec=None) -> float:  # type: ignore
+        return float(u)
+
+    def regret_utility(u: float, c: float, c_ref: float, *, spec=None) -> float:  # type: ignore
         return float(u)
 
 
@@ -287,10 +290,31 @@ class RetirementEnv:
         self.ann_purchased = False
         self.ann_P = 0.0
         self.ann_a_factor = 0.0
+        # [FIX 2026-07] 상위(annuity_wiring.setup_annuity_overlay)에서 이미 매입이
+        # 끝난 경우를 식별하기 위해 원본 cfg 값을 별도로 보관해 둔다(이중매입 방지용).
+        self._cfg_y_ann_precomputed = _safe_float(self._get(cfg, kwargs, "y_ann", 0.0), 0.0)
+        self._cfg_ann_P_precomputed = _safe_float(self._get(cfg, kwargs, "ann_P", 0.0), 0.0)
+        self._cfg_ann_a_factor_precomputed = _safe_float(self._get(cfg, kwargs, "ann_a_factor", 0.0), 0.0)
 
         # --- meta ---
         self.age0 = int(self._get(cfg, kwargs, "age0", 55))
         self.age_years = float(self.age0)
+
+        # --- 국민연금(소득대체율 ρ) 외생소득 [2026-07 신규] ---
+        # hjb.py의 Y_sched와 동일한 계산식을 순방향 시뮬레이션(evaluate)에도 반영해야,
+        # HJB가 "연금을 받을 걸 알고" 덜 인출한 정책을 평가할 때도 그 연금소득이 실제로
+        # 소비/효용에 반영되어 정합성이 유지된다. y_ann(민간 즉시연금)과 동일한 방식으로
+        # "포트폴리오에서 차감되지 않는 외부소득"으로 취급한다.
+        self._pension_rho = float(self._get(cfg, kwargs, "pension_rho", 0.0) or 0.0)
+        self._pension_income_mult = float(self._get(cfg, kwargs, "pension_income_mult", 3.692) or 3.692)
+        self._pension_claim_age = float(self._get(cfg, kwargs, "pension_claim_age", 65.0) or 65.0)
+        _pension_Y_month = 0.0
+        if self._pension_rho > 0.0 and self._pension_income_mult > 0.0:
+            _pension_Y_month = self._pension_rho / (self._pension_income_mult * 12.0)
+        self._pension_Y_month = _pension_Y_month
+        self._pension_claim_month_idx = max(
+            0, int(round((self._pension_claim_age - self.age0) * self.steps_per_year))
+        )
 
         # --- market sources ---
         self.market_mode = str(self._get(cfg, kwargs, "market_mode", "bootstrap") or "bootstrap").lower()
@@ -533,6 +557,15 @@ class RetirementEnv:
 
         - annuity overlay(init_from_sim_cfg)를 사용하여
           W, y_ann, ann_P, ann_a_factor를 설정.
+
+        [FIX 2026-07] 기존엔 runner.annuity_wiring.setup_annuity_overlay()가
+        (HJB 액터 생성 전에) cfg.W0를 이미 (1-ann_alpha)만큼 줄여놓았는데도,
+        여기서 다시 같은 ann_alpha로 한 번 더 매입을 수행하여 자산이 이중으로
+        (예: 0.3+0.3 아니라 곱연산으로 0.7×0.7=0.49처럼) 줄어드는 버그가 있었다.
+        그 결과 HJB가 가정한 잔여자산·연금소득과 실제 순방향 시뮬레이션의 값이
+        서로 달라, θ(ann_alpha)>0 케이스의 평가지표가 왜곡되고 있었다.
+        이제 cfg 쪽에서 이미 매입이 끝난 상태(ann_on='on' & y_ann>0)인지 먼저
+        확인하고, 그렇다면 재매입하지 않고 그 값을 그대로 채택한다.
         """
         # 기본 상태 초기화
         self.y_ann = 0.0
@@ -548,6 +581,17 @@ class RetirementEnv:
         if alpha <= 0.0:
             return
         if mode == "off":
+            return
+
+        # --- [FIX] 이미 상위(setup_annuity_overlay)에서 매입이 끝난 경우 재매입 방지 ---
+        upstream_y_ann = _safe_float(getattr(self, "_cfg_y_ann_precomputed", 0.0), 0.0)
+        if mode == "on" and upstream_y_ann > 0.0:
+            self.y_ann = upstream_y_ann
+            self.ann_purchased = True
+            self.ann_P = _safe_float(getattr(self, "_cfg_ann_P_precomputed", upstream_y_ann), upstream_y_ann)
+            self.ann_a_factor = _safe_float(getattr(self, "_cfg_ann_a_factor_precomputed", 0.0), 0.0)
+            # self.W(=self.W0)는 이미 setup_annuity_overlay에서 매입 후 잔여자산으로
+            # 설정되어 있으므로 추가로 차감하지 않는다.
             return
 
         # auto → alpha>0 이면 on
@@ -809,8 +853,9 @@ class RetirementEnv:
 
         # 2) consumption -------------------------------------------------
         y_ann = _safe_float(getattr(self, "y_ann", 0.0), 0.0)
-        c = _safe_float(y_ann + q * W_start, 0.0)
-        # annuity 지급은 계정 밖에서 이뤄지므로, 계정 차감은 q*W_start만 적용
+        pension_y = self._pension_Y_month if self.t >= self._pension_claim_month_idx else 0.0
+        c = _safe_float(y_ann + pension_y + q * W_start, 0.0)
+        # annuity/국민연금 지급은 계정 밖에서 이뤄지므로, 계정 차감은 q*W_start만 적용
         W_after_c = max(W_start - q * W_start, 0.0)
 
         # 3) returns (+hedge) --------------------------------------------
@@ -847,7 +892,12 @@ class RetirementEnv:
                 u1 = distort_utility(base_u, ref=0.0, spec=spec)
                 u2 = habit_utility(u1, self._prev_u_for_habit, spec=spec)
                 self._prev_u_for_habit = float(u1)
-                u_eff = float(u2)
+                # 후회(regret, 논문 식38): 기준소비 c*를 "4%룰 인출액(q4*W_start)"으로 설정.
+                # 실제 소비(c)가 이보다 낮을 때만 페널티가 발생한다.
+                q4_ref = 1.0 - (1.0 - 0.04) ** (1.0 / max(1, self.steps_per_year))
+                c_ref = q4_ref * W_start
+                u3 = regret_utility(u2, c, c_ref, spec=spec)
+                u_eff = float(u3)
             except Exception:
                 u_eff = base_u
 
@@ -885,6 +935,7 @@ class RetirementEnv:
         info: Dict[str, Any] = {
             "consumption": float(c),
             "y_ann": float(y_ann),
+            "pension_y": float(pension_y),
             "ann_on": (self.ann_on == "on"),
             "ann_purchased": bool(self.ann_purchased),
             "ann_P": float(self.ann_P),

@@ -334,13 +334,13 @@ def build_actor(cfg: SimConfig, args) -> Callable[[Any], Tuple[float, float]]:
 
     base_actor = builders[method]()  # Callable[[obs], (q,w)]
 
-    # 3) 행동편향 래퍼 체결 (bias_on=off면 내부에서 바로 원액터 반환하여 무해)
-    try:
-        wrapper = make_bias_wrapper(args, env)  # env 신호(recent_ret/vol) 전달
-        actor = wrapper(base_actor)
-    except Exception as e:
-        # 래퍼 쪽 문제로 전체 런이 깨지지 않도록 폴백
-        print(f"[WARN] behavioral bias wrapper failed: {e!r}. Fallback to base_actor.")
-        actor = base_actor
+    # [FIX 2026-07] 행동편향 래퍼는 더 이상 여기서 씌우지 않는다.
+    # 예전엔 여기서 만든 임시 env(한 번도 reset되지 않음)를 래퍼에 전달했는데,
+    # 실제 시뮬레이션(evaluate())은 완전히 별도의 env 인스턴스를 만들어 사용하므로
+    # recent_ret/recent_vol에 의존하는 편향(손실회피/변동성쇼크/후회회피)이
+    # 항상 기본값(0.0)만 보고 사실상 무력화되는 구조적 버그가 있었다.
+    # 이제는 evaluation.evaluate()가 실제 env 생성 직후 그 env로 래퍼를 씌운다
+    # (evaluate(..., args=args) 호출 경로 참고).
+    actor = base_actor
 
     return actor

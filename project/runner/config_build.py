@@ -185,6 +185,10 @@ def make_cfg(args) -> SimConfig:
         hjb_W_focus=_get(args, "hjb_W_focus", getattr(cfg, "hjb_W_focus", None)),
         hjb_W_focus_frac=_get(args, "hjb_W_focus_frac", getattr(cfg, "hjb_W_focus_frac", None)),
         hjb_Nshock=_get(args, "hjb_Nshock", getattr(cfg, "hjb_Nshock", None)),
+        hjb_q_max_mult=_get(args, "hjb_q_max_mult", getattr(cfg, "hjb_q_max_mult", None)),
+        pension_rho=_get(args, "pension_rho", getattr(cfg, "pension_rho", None)),
+        pension_income_mult=_get(args, "pension_income_mult", getattr(cfg, "pension_income_mult", None)),
+        pension_claim_age=_get(args, "pension_claim_age", getattr(cfg, "pension_claim_age", None)),
         # 헤지/시장
         hedge=_get(args, "hedge", getattr(cfg, "hedge", "off")),
         hedge_on=(str(_get(args, "hedge", "off")).lower() == "on"),
