@@ -103,6 +103,7 @@ class SimConfig:
     pension_rho: float = 0.0
     pension_income_mult: float = 3.692
     pension_claim_age: float = 65.0
+    regret_c_ref_rate: Optional[float] = None  # 후회회피 기준소비율(연). None=기본 4%룰
 
     # --- Eval / bookkeeping ---
     # seeds는 리스트/튜플 모두 허용 → 내부적으로 튜플로 고정

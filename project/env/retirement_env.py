@@ -371,6 +371,7 @@ class RetirementEnv:
 
         # --- 행동편향 사양(효용 레이어) ---
         self._bh_spec = getattr(cfg, "behavioral_spec", None)
+        self.regret_c_ref_rate = self._get(cfg, kwargs, "regret_c_ref_rate", None)
         self._prev_u_for_habit = 0.0
 
         # --- seeding / RNG ---
@@ -892,10 +893,17 @@ class RetirementEnv:
                 u1 = distort_utility(base_u, ref=0.0, spec=spec)
                 u2 = habit_utility(u1, self._prev_u_for_habit, spec=spec)
                 self._prev_u_for_habit = float(u1)
-                # 후회(regret, 논문 식38): 기준소비 c*를 "4%룰 인출액(q4*W_start)"으로 설정.
-                # 실제 소비(c)가 이보다 낮을 때만 페널티가 발생한다.
-                q4_ref = 1.0 - (1.0 - 0.04) ** (1.0 / max(1, self.steps_per_year))
-                c_ref = q4_ref * W_start
+                # 후회(regret, 논문 식38): 기준소비 c*를 설정. 기본은 "4%룰 인출액"
+                # (하위호환)이지만, cfg.regret_c_ref_rate(연 기준)로 다른 기준소비율을
+                # 지정할 수 있다. [2026-07 확장] 4%룰은 본 모델에서 55~70세 구간에서만
+                # 근사적으로 최적이고, 그 이후엔 실제 최적 소비율이 훨씬 높다는 것을
+                # 이미 확인했다(격자확장 실험). 4%룰을 기준으로 삼으면 이미 4%룰보다
+                # 공격적으로 소비하는 정책에서는 후회가 거의 발동하지 않으므로,
+                # 더 현실적인(혹은 실험적으로 더 높은) 기준소비율을 시도할 수 있게 한다.
+                _rcr = getattr(self, "regret_c_ref_rate", None)
+                c_ref_rate_annual = _safe_float(_rcr, 0.04) if _rcr is not None else 0.04
+                q_ref = 1.0 - (1.0 - c_ref_rate_annual) ** (1.0 / max(1, self.steps_per_year))
+                c_ref = q_ref * W_start
                 u3 = regret_utility(u2, c, c_ref, spec=spec)
                 u_eff = float(u3)
             except Exception:

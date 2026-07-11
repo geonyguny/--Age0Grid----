@@ -66,11 +66,23 @@ def regret_utility(u: float, c: float, c_ref: float, *, spec: BehavioralSpec) ->
     논문 식(38): u_t ← u_t - ρ * max(c* - c, 0)
     소비(c)가 기준소비(c_ref, 예: 4%룰 인출액)에 미달할 때 추가 불편을 부과한다.
     (Bell 1982, Loomes and Sugden 1982 후회이론)
+
+    [FIX 2026-07] 원래 식(38) 그대로 "소비 단위"의 절대적 미달분에 선형 페널티를
+    매기면, CRRA 효용(절대소비가 작을수록 거듭제곱으로 발산)의 자연스러운 스케일
+    (본 모델 파라미터 하에서 -1e4~-1e6 단위)에 비해 미달분(소비 단위, 보통
+    0.001~0.02 수준)이 지나치게 작아 사실상 어떤 ρ를 줘도 효과가 전혀 나타나지
+    않는 문제가 있었다. "소비 단위 절대량"이 아니라 "기준소비 대비 상대적
+    미달비율"로 바꾸고, 이를 현재 시점 효용 u의 크기에 비례시켜 두 항의 스케일이
+    자연스럽게 맞도록 한다(ρ가 "효용의 몇 %를 후회 페널티로 깎을지"를 직접
+    통제하게 되어 해석도 더 명확해짐).
     """
     if not spec.on or spec.regret_rho <= 1e-16:
         return float(u)
-    shortfall = max(float(c_ref) - float(c), 0.0)
-    return float(u) - float(spec.regret_rho) * shortfall
+    c_ref = float(c_ref)
+    if c_ref <= 1e-12:
+        return float(u)
+    shortfall_frac = max(c_ref - float(c), 0.0) / c_ref  # 0~1 사이 상대적 미달비율
+    return float(u) - float(spec.regret_rho) * shortfall_frac * abs(float(u))
 
 def describe(spec: BehavioralSpec) -> Dict[str, float | int | str | bool]:
     d = asdict(spec)

@@ -341,6 +341,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "Loomes and Sugden(1982) 후회이론에 따라, 소비(c)가 기준소비 "
                         "c*(4%룰 인출액)에 미달할 때 효용에 -ρ*max(c*-c,0) 페널티를 부과한다. "
                         "--bh_on on 과 함께 사용해야 적용됨(손실회피/습관형성과 동일한 효용-레이어).")
+    p.add_argument("--regret_c_ref_rate", type=float,
+                   help="후회회피 기준소비율(연, 기본 0.04=4%룰). 본 모델에서 진짜 최적 "
+                        "소비율은 연령에 따라 4%보다 훨씬 높을 수 있어(격자확장 실험 참조), "
+                        "4%룰 기준으로는 이미 공격적인 정책에서 후회가 거의 발동하지 않을 "
+                        "수 있다. 더 높은 값(예: 0.08~0.15)으로 실험 가능.")
 
     # ---------------- stdout / logging ----------------
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",
