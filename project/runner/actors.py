@@ -4,7 +4,6 @@ from typing import Any, Tuple, Callable
 import numpy as _np
 
 from ..config import SimConfig
-# ⚠️ runner 경로의 Env로 통일
 from ..env.retirement_env import RetirementEnv  # type: ignore
 from ..hjb import HJBSolver
 from .helpers import arrhash, monthly_from_cfg, get_life_table_from_env
@@ -15,56 +14,75 @@ from ..policy.kgr_rule import (
     KGRLiteConfig, kgr_lite_init, kgr_lite_update_yearly, kgr_lite_policy_step,
 )
 
+# 행동편향(action-layer) 래퍼: 있으면 사용, 없으면 no-op
+try:
+    from ..policy.behavioral_bias import make_bias_wrapper  # type: ignore
+except Exception:
+    def make_bias_wrapper(_args, _env):  # type: ignore
+        def _noop(actor: Callable[[Any], Tuple[float, float]]) -> Callable[[Any], Tuple[float, float]]:
+            return actor
+        return _noop
+
+
 # --------------------------
 # Adapters & Safety
 # --------------------------
 def _as_nd_state(raw: Any, *, T_hint: int | None = None, W_hint: float | None = None) -> _np.ndarray:
-    """
-    정책 입력 상태를 항상 ndarray([t_norm, W]) 로 정규화.
-    - dict: {"t": step_idx, "W": wealth} 가정
-    - ndarray: 그대로 사용(길이<2면 보강)
-    - 기타: [0.0, W_hint] 폴백
-    """
+    """정책 입력을 항상 ndarray([t_norm, W])로 정규화."""
     if isinstance(raw, dict):
         T = int(T_hint or 1)
         t_idx = float(raw.get("t", 0.0))
         t_norm = t_idx / float(max(1, T - 1))
         W_now = float(raw.get("W", W_hint if W_hint is not None else 0.0))
         return _np.asarray([t_norm, W_now], dtype=float)
-
     if isinstance(raw, _np.ndarray):
         arr = _np.asarray(raw, dtype=float).ravel()
         if arr.size >= 2:
             return arr[:2]
         W_now = float(W_hint if W_hint is not None else 0.0)
         return _np.asarray([float(arr[0]) if arr.size else 0.0, W_now], dtype=float)
-
     return _np.asarray([0.0, float(W_hint if W_hint is not None else 0.0)], dtype=float)
 
 
 def _clip_action(q: float, w: float, cfg: SimConfig) -> Tuple[float, float]:
-    q_floor = float(getattr(cfg, "q_floor", 0.0) or 0.0)
+    """최종 액션을 q_floor(월), w_max에 맞춰 클립."""
+    q_floor_m = float(getattr(cfg, "q_floor", 0.0) or 0.0)
     w_max = float(getattr(cfg, "w_max", 1.0) or 1.0)
-    q = float(_np.clip(q, q_floor, 1.0))
+    q = float(_np.clip(q, q_floor_m, 1.0))
     w = float(_np.clip(w, 0.0, w_max))
     return q, w
 
 
+def _w_default(cfg: SimConfig) -> float:
+    """w_fixed가 주어지면 그 값을, 아니면 w_max를 사용하되 경계 안전."""
+    try:
+        w_max = float(getattr(cfg, "w_max", 1.0) or 1.0)
+    except Exception:
+        w_max = 1.0
+    w_fix = getattr(cfg, "w_fixed", None)
+    if w_fix is None:
+        return float(_np.clip(w_max, 0.0, 1.0))
+    try:
+        return float(_np.clip(float(w_fix), 0.0, w_max))
+    except Exception:
+        return float(_np.clip(w_max, 0.0, 1.0))
+
+
 # ---------- RULE ----------
-def rule_actor_4pct(cfg: SimConfig, env: RetirementEnv) -> Callable[[Any], Tuple[float, float]]:
+def rule_actor_4pct(cfg: SimConfig, _env: RetirementEnv) -> Callable[[Any], Tuple[float, float]]:
+    spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+    q_m = 1.0 - (1.0 - 0.04) ** (1.0 / spm)
+    w_def = _w_default(cfg)
     def actor(_obs):
-        q_m = 1.0 - (1.0 - 0.04) ** (1.0 / int(getattr(cfg, "steps_per_year", 12) or 12))
-        w = float(getattr(cfg, "w_fixed", None) if getattr(cfg, "w_fixed", None) is not None else getattr(cfg, "w_max", 1.0))
-        return _clip_action(q_m, w, cfg)
+        return _clip_action(q_m, w_def, cfg)
     return actor
 
 
-def rule_actor_cpb(cfg: SimConfig, env: RetirementEnv) -> Callable[[Any], Tuple[float, float]]:
+def rule_actor_cpb(cfg: SimConfig, _env: RetirementEnv) -> Callable[[Any], Tuple[float, float]]:
+    _g_m, p_m = monthly_from_cfg(cfg)
+    w_def = _w_default(cfg)
     def actor(_obs):
-        _g_m, p_m = monthly_from_cfg(cfg)
-        q_m = float(p_m)
-        w = float(getattr(cfg, "w_fixed", None) if getattr(cfg, "w_fixed", None) is not None else getattr(cfg, "w_max", 1.0))
-        return _clip_action(q_m, w, cfg)
+        return _clip_action(float(p_m), w_def, cfg)
     return actor
 
 
@@ -83,6 +101,8 @@ def rule_actor_vpw(cfg: SimConfig, env: RetirementEnv) -> Callable[[Any], Tuple[
         spm = int(getattr(_cfg, "steps_per_year", 12) or 12)
         return (1.0 + g_ann) ** (1.0 / spm) - 1.0
 
+    w_def = _w_default(cfg)
+
     def actor(_obs):
         t = int(getattr(env, "t", 0))
         T = int(getattr(env, "T", 1) or 1)
@@ -93,25 +113,24 @@ def rule_actor_vpw(cfg: SimConfig, env: RetirementEnv) -> Callable[[Any], Tuple[
         else:
             a = (1.0 - (1.0 + g_m) ** (-Nm)) / g_m
             q_m = 1.0 / max(a, 1e-12)
-        w = float(getattr(cfg, "w_fixed", None) if getattr(cfg, "w_fixed", None) is not None else getattr(cfg, "w_max", 1.0))
-        return _clip_action(q_m, w, cfg)
+        return _clip_action(q_m, w_def, cfg)
     return actor
 
 
 def rule_actor_kgr(cfg: SimConfig, env: RetirementEnv, *, quiet: bool) -> Callable[[Any], Tuple[float, float]]:
     steps_per_year = int(getattr(cfg, "steps_per_year", 12) or 12)
-    q_floor = float(getattr(cfg, "q_floor", 0.02) or 0.02)
+    q_floor_ann = float(getattr(cfg, "q_floor_annual", 0.02) or 0.02)  # cfg.q_floor는 월, kgr는 연 기준 파라미터 사용
     fee_annual = float(getattr(cfg, "phi_adval", getattr(cfg, "fee_annual", 0.004)) or 0.004)
-    w_fixed = float(getattr(cfg, "w_fixed", None) if getattr(cfg, "w_fixed", None) is not None else getattr(cfg, "w_max", 1.0))
+    w_fixed = _w_default(cfg)
 
     life_table_df = get_life_table_from_env(env)
     r_f_real_annual = float(getattr(env, "r_f_real_annual", 0.02) or 0.02)
     W0 = float(getattr(env, "W0", 1.0))
-    age0 = float(getattr(cfg, "age0", 65) or 65)
+    age0 = float(getattr(cfg, "age0", 55) or 55)
 
     kgr_cfg = KGRLiteConfig(
         FR_high=1.30, FR_low=0.85, delta_up=0.07, delta_dn=-0.07,
-        kappa_safety=0.002, w_fixed=w_fixed, q_floor=q_floor,
+        kappa_safety=0.002, w_fixed=w_fixed, q_floor=q_floor_ann,
         phi_adval_annual=fee_annual, steps_per_year=steps_per_year,
     )
     kgr_state = None
@@ -168,25 +187,9 @@ def rule_actor_kgr(cfg: SimConfig, env: RetirementEnv, *, quiet: bool) -> Callab
         with mute_kgr_year_logs_if(no_life_table=(o.get("life_table", None) is None) if (not quiet) else False):
             out = kgr_lite_policy_step(o, kgr_state, kgr_cfg)
 
-        q_annual = float(out.get("q_t", kgr_cfg.q_floor))
+        q_annual = float(out.get("q_t", q_floor_ann))
         q_m = 1.0 - (1.0 - q_annual) ** (1.0 / steps_per_year)
-        q_floor_cfg = float(getattr(kgr_cfg, "q_floor", 0.02) or 0.02)
-        if bool(getattr(kgr_cfg, "q_floor_is_annual", True)):
-            q_floor_m = 1.0 - (1.0 - q_floor_cfg) ** (1.0 / steps_per_year)
-        else:
-            q_floor_m = q_floor_cfg
-        q_m = float(_np.clip(q_m, q_floor_m, 1.0))
-
-        try:
-            w_fixed_local = float(getattr(kgr_cfg, "w_fixed", 0.6))
-        except (TypeError, ValueError):
-            w_fixed_local = 0.6
-        try:
-            w_max = float(getattr(cfg, "w_max", 1.0))
-        except (TypeError, ValueError):
-            w_max = 1.0
-        w = max(0.0, min(w_fixed_local, w_max))
-        return _clip_action(q_m, w, cfg)
+        return _clip_action(q_m, float(getattr(kgr_cfg, "w_fixed", w_fixed)), cfg)
     return actor
 
 
@@ -204,111 +207,140 @@ def build_rule_actor(cfg: SimConfig, args, env: RetirementEnv):
 
 # ---------- HJB ----------
 def build_hjb_actor(cfg: SimConfig, args, env: RetirementEnv):
-    """
-    HJB 정책을 상태 어댑터와 함께 감싸, 입력이 dict/ndarray 무엇이든 안전 처리.
-    t 인덱스는 env.t 대신 obs[0]=t_norm 으로 계산.
-    + 정책 테이블 NaN/Inf 정화 및 범위 클리핑(방호 강화).
-    """
-    sol = HJBSolver(cfg).solve(seed=cfg.seeds[0])
+    """HJB 정책을 테이블 보간 actor로 래핑."""
+    # HJBSolver.solve() 보호 호출
+    try:
+        sol = HJBSolver(cfg).solve(seed=(cfg.seeds[0] if getattr(cfg, "seeds", None) else None))
+    except Exception as e:
+        # 완전 실패 시 상수 정책 폴백
+        if str(getattr(args, "quiet", "on")).lower() != "on":
+            print(f"[hjb] solver failed: {type(e).__name__} → using constant fallback")
+        spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+        const_q = 1.0 - (1.0 - 0.04) ** (1.0 / spm)
+        const_w = _w_default(cfg)
+        def actor_const(_obs):
+            return _clip_action(const_q, const_w, cfg)
+        return actor_const
+
     Pi_w = sol.get("Pi_w", None)
     Pi_q = sol.get("Pi_q", None)
-    print("policy_hash_q=", arrhash(Pi_q))
-    print("policy_hash_w=", arrhash(Pi_w))
 
-    # W 그리드 확보
+    # 해시 로그(quiet=off일 때만)
+    if str(getattr(args, "quiet", "on")).lower() != "on":
+        try:
+            print("policy_hash_q=", arrhash(Pi_q))
+            print("policy_hash_w=", arrhash(Pi_w))
+        except Exception:
+            pass
+
+    # W grid 확보
     if "W_grid" in sol and sol["W_grid"] is not None:
-        Wg = _np.asarray(sol["W_grid"], dtype=float)
+        Wg = _np.asarray(sol["W_grid"], dtype=float).ravel()
     else:
         Wg = _np.linspace(float(getattr(cfg, "hjb_W_min", 0.0)),
                           float(getattr(cfg, "hjb_W_max", 1.5)),
-                          int(getattr(cfg, "hjb_W_grid", 65) or 65))
+                          int(getattr(cfg, "hjb_W_grid", 55) or 55))
 
-    # 정책이 비어있으면 상수 정책으로 폴백
-    if Pi_w is None or getattr(Pi_w, "size", 0) == 0 or Pi_q is None or getattr(Pi_q, "size", 0) == 0:
-        const_w = float(min(max(float(getattr(cfg, "hjb_w_grid", [0.0, 0.6])[-1]), 0.0),
-                            float(getattr(cfg, "w_max", 1.0))))
-        q4 = 1.0 - (1.0 - 0.04) ** (1.0 / int(getattr(cfg, "steps_per_year", 12) or 12))
-        const_q = float(q4)
-
+    # 비정상/빈 테이블 → 상수 정책 폴백
+    def _fallback_actor():
+        spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+        const_q = 1.0 - (1.0 - 0.04) ** (1.0 / spm)
+        const_w = _w_default(cfg)
         def actor(_obs):
             return _clip_action(const_q, const_w, cfg)
         return actor
 
-    # ---- 정책 테이블 사전 정화 (NaN/Inf → 안전값 + 범위 클립) ----
+    if (Pi_w is None) or (getattr(Pi_w, "size", 0) == 0) or (Pi_q is None) or (getattr(Pi_q, "size", 0) == 0):
+        return _fallback_actor()
+
+    # 정책 테이블 정화(+경계 값 채움)
     def _clean_pi(arr, lo, hi, fill):
         a = _np.asarray(arr, dtype=float)
         a = _np.nan_to_num(a, nan=fill, posinf=hi, neginf=lo)
         return _np.clip(a, lo, hi)
 
     q_floor_m = float(getattr(cfg, "q_floor", 0.0) or 0.0)
-    # 기본치: 월 4%룰, w 기본 0.6 (경계 내)
-    q_fill = max(q_floor_m, 0.04 / int(getattr(cfg, "steps_per_year", 12) or 12))
+    spm = int(getattr(cfg, "steps_per_year", 12) or 12)
+    q_fill = max(q_floor_m, 0.04 / spm)
     w_fill = min(0.6, float(getattr(cfg, "w_max", 1.0)))
 
-    Pi_w = _clean_pi(Pi_w, 0.0, float(getattr(cfg, "w_max", 1.0)), w_fill)
+    w_max = float(getattr(cfg, "w_max", 1.0) or 1.0)
+    Pi_w = _clean_pi(Pi_w, 0.0, w_max, w_fill)
     Pi_q = _clean_pi(Pi_q, q_floor_m, 1.0, q_fill)
 
-    # grid 정합성 (최소 2노드)
-    Wg = _np.asarray(Wg, dtype=float).ravel()
+    # grid 정합성
     if Wg.size < 2 or not _np.isfinite(Wg).all():
-        Wg = _np.linspace(float(getattr(cfg, "hjb_W_min", 0.0)),
-                          float(getattr(cfg, "hjb_W_max", 1.5)), 2)
+        return _fallback_actor()
 
     T_pol = int(Pi_w.shape[0])
 
+    # 단일 칼럼/행이면 보간 의미 없음 → 상수 정책
+    if Pi_w.ndim != 2 or Pi_q.ndim != 2 or Pi_w.shape[1] < 2 or Pi_q.shape[1] < 2:
+        return _fallback_actor()
+
+    def _interp_row(row: _np.ndarray, xg: _np.ndarray, x: float, lo: float, hi: float, fill: float) -> float:
+        """단일 시점 행(row)에서 W에 대해 선형 보간."""
+        try:
+            if not _np.isfinite(x):
+                return fill
+            return float(_np.clip(_np.interp(x, xg, row, left=row[0], right=row[-1]), lo, hi))
+        except Exception:
+            return float(_np.clip(fill, lo, hi))
+
     def actor(obs):
-        # 상태를 [t_norm, W]로 정규화
         s = _as_nd_state(obs, T_hint=T_pol, W_hint=float(getattr(env, "W", 1.0)))
         t_norm = float(_np.clip(s[0], 0.0, 1.0))
         W_now = float(s[1])
 
-        # 시점 인덱스: t_norm ∈ [0,1] → [0, T_pol-1]
         t_idx = int(_np.clip(round(t_norm * (T_pol - 1)), 0, T_pol - 1))
+        # 선형 보간(각 시점 행에서 W축 보간)
+        q = _interp_row(Pi_q[t_idx, :], Wg, W_now, q_floor_m, 1.0, q_fill)
+        w = _interp_row(Pi_w[t_idx, :], Wg, W_now, 0.0, w_max, w_fill)
 
-        # W 인덱스: 왼쪽 구간 선택 (searchsorted - 1), 경계 안전
-        i = int(_np.clip(_np.searchsorted(Wg, W_now) - 1, 0, max(Wg.size - 2, 0)))
-
-        q = float(Pi_q[t_idx, i])
-        w = float(Pi_w[t_idx, i])
-
-        # 최종 방호 (비정상값 기본치 대체 후 클립)
-        if not _np.isfinite(q):
-            q = q_fill
-        if not _np.isfinite(w):
-            w = w_fill
         return _clip_action(q, w, cfg)
 
     return actor
 
 
 # ---------- RL ----------
-def build_rl_actor(cfg: SimConfig, args):
+def build_rl_actor(cfg: SimConfig, _args):
+    # 이 경로는 run_rl()에서 trainer를 통해 사용하는 편이 권장됨.
     try:
-        from ..rl import A2CTrainer  # noqa
-        pol = A2CTrainer(cfg).train(seed=cfg.seeds[0])
-
-        def actor(obs):
-            s = _as_nd_state(obs, T_hint=int(getattr(cfg, "horizon_steps", 0) or 0), W_hint=None)
-            out = pol.act(s)
-            if isinstance(out, dict):
-                q, w = float(out.get("q", 0.0)), float(out.get("w", 0.0))
-            else:
-                q, w = float(out[0]), float(out[1])
-            return _clip_action(q, w, cfg)
-
-        return actor
-    except Exception:
-        raise SystemExit("RL route requires --method rl in main() (trainer moved to project.trainer.rl_a2c).")
+        from ..trainer.rl_a2c import PolicyNet, make_actor_from_policy  # noqa: F401
+        raise SystemExit("RL은 runner.run_rl 경로를 사용하세요 (method=rl).")
+    except Exception as e:
+        raise SystemExit(f"RL route not available here: {e}")
 
 
 # ---------- entry ----------
-def build_actor(cfg: SimConfig, args):
-    # 공유 probe env (일부 규칙형 정책이 참조)
+def build_actor(cfg: SimConfig, args) -> Callable[[Any], Tuple[float, float]]:
+    """
+    주어진 cfg/args로 정책 actor(q,w)->(q,w)를 생성.
+    - method in {"rule","hjb","rl"}
+    - 행동편향 래퍼는 항상 체결하되 bias_on=off면 no-op (성능/안전성 영향 없음)
+    """
+    # 1) 공용 환경 (rule/hjb가 참조), RL은 기존대로 env 미전달
     env = RetirementEnv(cfg)
-    if args.method == "rule":
-        return build_rule_actor(cfg, args, env)
-    if args.method == "hjb":
-        return build_hjb_actor(cfg, args, env)
-    if args.method == "rl":
-        return build_rl_actor(cfg, args)
-    raise SystemExit("Unknown method")
+
+    # 2) 메서드 정규화 + 디스패치
+    method = str(getattr(args, "method", "")).lower()
+    builders: dict[str, Callable[[], Callable[[Any], Tuple[float, float]]]] = {
+        "rule": lambda: build_rule_actor(cfg, args, env),
+        "hjb":  lambda: build_hjb_actor(cfg, args, env),
+        "rl":   lambda: build_rl_actor(cfg, args),
+    }
+    if method not in builders:
+        raise SystemExit(f"Unknown method: {method}")
+
+    base_actor = builders[method]()  # Callable[[obs], (q,w)]
+
+    # [FIX 2026-07] 행동편향 래퍼는 더 이상 여기서 씌우지 않는다.
+    # 예전엔 여기서 만든 임시 env(한 번도 reset되지 않음)를 래퍼에 전달했는데,
+    # 실제 시뮬레이션(evaluate())은 완전히 별도의 env 인스턴스를 만들어 사용하므로
+    # recent_ret/recent_vol에 의존하는 편향(손실회피/변동성쇼크/후회회피)이
+    # 항상 기본값(0.0)만 보고 사실상 무력화되는 구조적 버그가 있었다.
+    # 이제는 evaluation.evaluate()가 실제 env 생성 직후 그 env로 래퍼를 씌운다
+    # (evaluate(..., args=args) 호출 경로 참고).
+    actor = base_actor
+
+    return actor
