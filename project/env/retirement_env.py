@@ -52,18 +52,21 @@ import pandas as pd
 try:
     from ..policy.behavioral import (  # type: ignore
         BehavioralSpec,                # type: ignore
-        distort_utility, habit_utility, regret_utility  # type: ignore
+        distort_utility, habit_utility, regret_utility, ambiguity_utility  # type: ignore
     )
 except Exception:  # pragma: no cover
     BehavioralSpec = None  # type: ignore
 
-    def distort_utility(u: float, *, ref: float = 0.0, spec=None) -> float:  # type: ignore
+    def distort_utility(u: float, *, u_ref: float = 0.0, spec=None) -> float:  # type: ignore
         return float(u)
 
-    def habit_utility(u: float, prev_u: float, *, spec=None) -> float:  # type: ignore
+    def habit_utility(u: float, c_t: float, c_prev: float, *, spec=None) -> float:  # type: ignore
         return float(u)
 
     def regret_utility(u: float, c: float, c_ref: float, *, spec=None) -> float:  # type: ignore
+        return float(u)
+
+    def ambiguity_utility(u: float, w: float, shock_dev: float, sigma: float, *, spec=None) -> float:  # type: ignore
         return float(u)
 
 
@@ -372,7 +375,7 @@ class RetirementEnv:
         # --- 행동편향 사양(효용 레이어) ---
         self._bh_spec = getattr(cfg, "behavioral_spec", None)
         self.regret_c_ref_rate = self._get(cfg, kwargs, "regret_c_ref_rate", None)
-        self._prev_u_for_habit = 0.0
+        self._prev_c = 0.0
 
         # --- seeding / RNG ---
         seeds = self._get(cfg, kwargs, "seeds", [0]) or [0]
@@ -706,7 +709,7 @@ class RetirementEnv:
             pass
 
         # 행동편향용 내부 상태
-        self._prev_u_for_habit = 0.0
+        self._prev_c = 0.0
 
         # HJB용 할인 관련 상태
         self._disc_factor = 1.0
@@ -884,28 +887,42 @@ class RetirementEnv:
         fee = _safe_float(fee_m_eff * W_after_c, 0.0)
         self.W = max(_safe_float(W_before_fee - fee, 0.0), 0.0)
 
-        # ----- 효용 계산 + 행동편향 훅 ---------------------------------
-        base_u = _crra_u(c, _safe_float(getattr(self, "crra_gamma", 3.0), 3.0))
+        # ----- 효용 계산 + 행동편향 훅 (논문 식44/45 순서: 손실회피→습관형성→후회→모호성회피) ---
+        gamma_c = _safe_float(getattr(self, "crra_gamma", 3.0), 3.0)
+        base_u = _crra_u(c, gamma_c)
         u_eff = base_u
         spec = getattr(self, "_bh_spec", None)
         if spec is not None and getattr(spec, "on", False):
             try:
-                u1 = distort_utility(base_u, ref=0.0, spec=spec)
-                u2 = habit_utility(u1, self._prev_u_for_habit, spec=spec)
-                self._prev_u_for_habit = float(u1)
-                # 후회(regret, 논문 식38): 기준소비 c*를 설정. 기본은 "4%룰 인출액"
-                # (하위호환)이지만, cfg.regret_c_ref_rate(연 기준)로 다른 기준소비율을
-                # 지정할 수 있다. [2026-07 확장] 4%룰은 본 모델에서 55~70세 구간에서만
-                # 근사적으로 최적이고, 그 이후엔 실제 최적 소비율이 훨씬 높다는 것을
-                # 이미 확인했다(격자확장 실험). 4%룰을 기준으로 삼으면 이미 4%룰보다
-                # 공격적으로 소비하는 정책에서는 후회가 거의 발동하지 않으므로,
-                # 더 현실적인(혹은 실험적으로 더 높은) 기준소비율을 시도할 수 있게 한다.
+                # 기준소비(c_ref) 계산: regret_c_ref_rate가 있으면 그 연율 기준,
+                # 없으면 직전기 실제소비(c_{t-1})를 손실회피·습관형성 공통 기준으로 사용.
+                prev_c = _safe_float(getattr(self, "_prev_c", None), c)
                 _rcr = getattr(self, "regret_c_ref_rate", None)
-                c_ref_rate_annual = _safe_float(_rcr, 0.04) if _rcr is not None else 0.04
-                q_ref = 1.0 - (1.0 - c_ref_rate_annual) ** (1.0 / max(1, self.steps_per_year))
-                c_ref = q_ref * W_start
+                if _rcr is not None:
+                    c_ref_rate_annual = _safe_float(_rcr, 0.04)
+                    q_ref = 1.0 - (1.0 - c_ref_rate_annual) ** (1.0 / max(1, self.steps_per_year))
+                    c_ref = q_ref * W_start
+                else:
+                    c_ref = prev_c
+
+                # 1) 손실회피 (식45): u - κ·[u(c_ref)-u(c)]⁺
+                u_ref = float(_crra_u(c_ref, gamma_c))
+                u1 = distort_utility(base_u, u_ref=u_ref, spec=spec)
+
+                # 2) 습관형성 (식33, 상대변화율 스케일): u - φ·(Δc/c_{t-1})²·|u|
+                u2 = habit_utility(u1, c, prev_c, spec=spec)
+
+                # 3) 후회 (식38, 상대미달률 스케일): u - ρ·(미달비율)·|u|
                 u3 = regret_utility(u2, c, c_ref, spec=spec)
-                u_eff = float(u3)
+
+                # 4) 모호성회피 (식36/44): u - ρamb·(w·z)²·|u|  (z=표준화 충격)
+                mu_r = _safe_float(getattr(self, "mu_risky", 0.0), 0.0)
+                sigma_r = _safe_float(getattr(self, "sigma_risky", 0.0), 0.0)
+                shock_dev = _safe_float(r_risky_raw, 0.0) - mu_r
+                u4 = ambiguity_utility(u3, w, shock_dev, sigma_r, spec=spec)
+
+                self._prev_c = float(c)
+                u_eff = float(u4)
             except Exception:
                 u_eff = base_u
 
@@ -1008,14 +1025,24 @@ class RetirementEnv:
             penalty -= lam_s * L_term
 
         beta = _safe_float(getattr(self, "beta", 1.0), 1.0)
-        disc_factor = float(getattr(self, "_disc_factor", 1.0))
+
+        # [FIX 2026-07] 논문 식(37)/(44): 현재편향(present bias)은 Laibson(1997)의
+        # 준쌍곡선(quasi-hyperbolic) 할인 U = u(c0) + β·Σ_{t≥1} δ^t u(ct) 구조를
+        # 따른다 — β는 "1기 이후 전체"에 걸쳐 딱 한 번만 곱해지는 상수이지,
+        # 매 시점마다 반복적으로 복리 적용되는 항이 아니다. 기존 코드는
+        # disc_factor를 매 스텝 beta로 계속 복리 곱셈(disc_factor *= beta)하고
+        # 있었는데, 이는 수학적으로 "표준 지수할인율을 낮춘 것"과 동일해서
+        # 진짜 현재편향(초반 소비 급증 후 그 이후 소비가 계속 낮게 유지되는
+        # 게 아니라 전반적으로 미래를 더 깎아보는 것) 구조를 만들지 못한다.
+        # t=0(에피소드 시작)에는 1.0, t≥1부터는 beta로 "일정하게" 고정한다.
+        if beta != 1.0:
+            disc_factor = 1.0 if self.t <= 1 else beta
+        else:
+            disc_factor = 1.0
 
         reward = base_reward + penalty
-        if beta != 1.0:
-            reward = reward * disc_factor
-            self._disc_factor = disc_factor * beta
-        else:
-            self._disc_factor = disc_factor
+        reward = reward * disc_factor
+        self._disc_factor = disc_factor
 
         # 수치 폭주 방지용 클리핑
         reward = float(np.clip(reward, -100.0, 100.0))

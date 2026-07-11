@@ -19,11 +19,10 @@ class BiasConfig:
     - myopia:        0~1; 클수록 소비 q 상향(현재소비 편향)
     - w_floor:       위험자산 최소 비중 하한(0~1)
     - w_cap_shock:   최근 변동성(recent_vol) 기반 추가 축소 강도(0~1)
-    - ambiguity:     θ∈[0,1]; 모형(수익률 분포) 불확실성에 대한 나이트unc적 회피.
-                     시장상황과 무관하게 항상 w를 구조적으로 축소(최대 40%).
-                     (참고: --theta_ambiguity 플래그 값을 그대로 사용)
-    - (후회/regret은 논문 식(38)에 맞춰 효용-레이어(BehavioralSpec.regret_rho,
-       --bh_regret_rho)로 이전 구현됨. 이 액션-레이어 클래스에는 두지 않는다.)
+    - (모호성회피는 논문 식(36)/(44)에 맞춰 효용-레이어(BehavioralSpec.ambiguity_rho,
+       --theta_ambiguity)로 이전 구현됨. 후회(regret) 역시 효용-레이어
+       (BehavioralSpec.regret_rho, --bh_regret_rho)로 이전됨. 이 액션-레이어
+       클래스에는 두지 않는다.)
     """
     on: bool = False
     loss_aversion: float = 0.0
@@ -31,7 +30,6 @@ class BiasConfig:
     myopia: float = 0.0
     w_floor: float = 0.0
     w_cap_shock: float = 0.0
-    ambiguity: float = 0.0
 
     def __post_init__(self):
         # 안전 범위로 정규화
@@ -40,7 +38,6 @@ class BiasConfig:
         self.myopia = _clip01f(self.myopia)
         self.w_floor = _clip01f(self.w_floor)
         self.w_cap_shock = _clip01f(self.w_cap_shock)
-        self.ambiguity = _clip01f(self.ambiguity)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -101,13 +98,6 @@ def apply_bias(q: float, w: float, state: Dict[str, float], cfg: BiasConfig) -> 
     if cfg.prob_gamma < 1.0:
         k = 1.0 - cfg.prob_gamma  # 0~1
         w_b *= (1.0 - 0.25 * k)   # 최대 25% 축소
-
-    # 2.5) 모호성회피 θ: 수익률 분포(모수) 자체의 불확실성에 대한 나이트류 회피.
-    #      최근 시장상황과 무관하게 항상 구조적으로 위험자산 비중을 축소한다
-    #      (loss_aversion/w_cap_shock처럼 "최근 나쁜 신호"에 반응하는 게 아니라,
-    #      "모형 자체를 못 믿어서" 상시 보수화한다는 점이 다른 편향들과의 차이).
-    if cfg.ambiguity > 0.0:
-        w_b *= max(0.0, 1.0 - 0.4 * cfg.ambiguity)  # 최대 40% 축소
 
     # 3) 근시 myopia: 소비성향 q 상향
     if cfg.myopia > 0.0:
@@ -191,9 +181,6 @@ def make_bias_wrapper(
             myopia=_safe_float(getattr(args, "bias_myopia", 0.0), 0.0),
             w_floor=_safe_float(getattr(args, "bias_w_floor", 0.0), 0.0),
             w_cap_shock=_safe_float(getattr(args, "bias_w_cap_shock", 0.0), 0.0),
-            # [신규] 모호성회피: 기존에 로그 기록용으로만 쓰이던 --theta_ambiguity 값을
-            # 실제로 정책에 반영. None이면 0(효과 없음)으로 폴백.
-            ambiguity=_safe_float(getattr(args, "theta_ambiguity", 0.0) or 0.0, 0.0),
         )
     except Exception:
         cfg = BiasConfig(on=False)
@@ -225,8 +212,7 @@ def make_bias_wrapper(
                     t = -1
                 if not _logged_once["header"]:
                     print(f"[BIAS] on=True λ={cfg.loss_aversion} γ={cfg.prob_gamma} myopia={cfg.myopia} "
-                          f"w_floor={cfg.w_floor} w_cap_shock={cfg.w_cap_shock} "
-                          f"ambiguity={cfg.ambiguity}")
+                          f"w_floor={cfg.w_floor} w_cap_shock={cfg.w_cap_shock}")
                     _logged_once["header"] = True
                 if 0 <= t < 2:
                     print(f"[BIAS-APPLY] t={t} q:{_safe_float(q):.4f}->{q_b:.4f} "
