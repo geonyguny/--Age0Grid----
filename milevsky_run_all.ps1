@@ -2,13 +2,13 @@
 # 사용법: chcp 65001 먼저 실행 후, 이 파일을 G:\01_simul 에 두고 .\milevsky_run_all.ps1 실행
 
 $biasPatterns = @{
-    "base"          = "rl5b_base_s0_*", "rl5_base_s0_*"
+    "base"          = "rl5b_base_s0_*", "rl5_base_s0_*", "rl_rl_bias_base_*"
     "lossaversion"  = "rl5b_lossaversion_s0_*", "rl5_lossaversion_s0_*", "rl_rl_bias_lossaversion_*"
-    "habit"         = "rl5b_habit_s0_*", "rl5_habit_s0_*"
-    "presentbias"   = "rl5b_presentbias_s0_*"
-    "ambiguity"     = "rl5b_ambiguity_s0_*"
-    "regret"        = "rl5b_regret_s0_*", "rl5_regret_s0_*"
-    "probdistort"   = "rl5b_probdistort_s0_*", "rl5_probdistort_s0_*"
+    "habit"         = "rl5b_habit_s0_*", "rl5_habit_s0_*", "rl_rl_bias_habit_*"
+    "presentbias"   = "rl5b_presentbias_s0_*", "rl_rl_bias_presentbias_*"
+    "ambiguity"     = "rl5b_ambiguity_s0_*", "rl_rl_bias_ambiguity_*"
+    "regret"        = "rl5b_regret_s0_*", "rl5_regret_s0_*", "rl_rl_bias_regret_fixed_*", "rl_rl_bias_regret_*"
+    "probdistort"   = "rl5b_probdistort_s0_*", "rl5_probdistort_s0_*", "rl_rl_bias_probdistort_*"
 }
 
 foreach ($key in $biasPatterns.Keys) {
