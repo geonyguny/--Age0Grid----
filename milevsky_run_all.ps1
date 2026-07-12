@@ -3,12 +3,12 @@
 
 $biasPatterns = @{
     "base"          = "rl5b_base_s0_*", "rl5_base_s0_*", "rl_rl_bias_base_*"
-    "lossaversion"  = "rl5b_lossaversion_s0_*", "rl5_lossaversion_s0_*", "rl_rl_bias_lossaversion_*"
-    "habit"         = "rl5b_habit_s0_*", "rl5_habit_s0_*", "rl_rl_bias_habit_*"
+    "lossaversion"  = "rl5b_lossaversion_s0_final*", "rl5b_lossaversion_s0_*", "rl5_lossaversion_s0_*"
+    "habit"         = "rl5b_habit_s0_final*", "rl5b_habit_s0_*", "rl5_habit_s0_*"
     "presentbias"   = "rl5b_presentbias_s0_*", "rl_rl_bias_presentbias_*"
     "ambiguity"     = "rl5b_ambiguity_s0_*", "rl_rl_bias_ambiguity_*"
-    "regret"        = "rl5b_regret_s0_*", "rl5_regret_s0_*", "rl_rl_bias_regret_fixed_*", "rl_rl_bias_regret_*"
-    "probdistort"   = "rl5b_probdistort_s0_*", "rl5_probdistort_s0_*", "rl_rl_bias_probdistort_*"
+    "regret"        = "rl5b_regret_s0_final*", "rl5b_regret_s0_*", "rl5_regret_s0_*"
+    "probdistort"   = "rl5b_probdistort_s0_final*", "rl5b_probdistort_s0_*", "rl5_probdistort_s0_*"
 }
 
 foreach ($key in $biasPatterns.Keys) {

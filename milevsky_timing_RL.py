@@ -32,7 +32,7 @@ from project.runner.helpers import get_life_table_from_env
 from project.trainer.rl_trainer import BetaActor
 
 
-def load_actor(ckpt_path: str, obs_dim: int = 2, hidden=(128, 128)) -> BetaActor:
+def load_actor(ckpt_path: str, obs_dim: int = 3, hidden=(128, 128)) -> BetaActor:
     state = torch.load(ckpt_path, map_location="cpu")
     actor = BetaActor(obs_dim, list(hidden))
     actor.load_state_dict(state["actor"])
@@ -109,10 +109,21 @@ def simulate_with_midpoint_annuity_batch(actor, base_cfg, q_cap, w_max, age_ann,
         disc *= delta_m
 
     WT = np.array([env.W for env in envs])
+    # [FIX 2026-07] 평균(mean) EU가 극소수의 파국적 경로(소비가 거의 0에 가까워
+    # CRRA 효용이 천문학적으로 나빠지는 경로)에 크게 좌우되어, theta=1.0(완전
+    # 연금화=시장위험 완전 차단)이 인위적으로 항상 이기는 현상이 나타났다.
+    # 중위값(median)과 절사평균(상하 10% 제외)을 추가로 계산해 극단치 영향을
+    # 줄인 지표로 theta*를 다시 판단할 수 있게 한다.
+    u_sorted = np.sort(u_sum)
+    trim = max(1, int(len(u_sorted) * 0.1))
+    trimmed = u_sorted[trim:-trim] if len(u_sorted) > 2 * trim else u_sorted
     return {
         "theta": theta, "age_ann": age_ann,
         "EU_mean": float(np.mean(u_sum)),
+        "EU_median": float(np.median(u_sum)),
+        "EU_trimmed_mean": float(np.mean(trimmed)),
         "EW_mean": float(np.mean(WT)),
+        "EW_median": float(np.median(WT)),
         "n_paths": n_paths,
     }
 
@@ -158,25 +169,29 @@ def main():
     all_results = []
     for age_ann in ages:
         row = {"age_ann": age_ann, "results": []}
-        best_theta, best_eu = None, -1e300
+        best_theta, best_eu_median = None, -1e300
         for theta in theta_candidates:
             r = simulate_with_midpoint_annuity_batch(
                 actor, base_cfg, q_cap, w_max, age_ann, theta,
                 life_df, r_f, n_paths=n_paths,
             )
             row["results"].append(r)
-            print(f"  age={age_ann} theta={theta}: EU_mean={r['EU_mean']:.2f}  EW_mean={r['EW_mean']:.4f}")
-            if r["EU_mean"] > best_eu:
-                best_eu, best_theta = r["EU_mean"], theta
+            print(f"  age={age_ann} theta={theta}: "
+                  f"EU_mean={r['EU_mean']:.2f}  EU_median={r['EU_median']:.2f}  "
+                  f"EU_trimmed={r['EU_trimmed_mean']:.2f}  EW_median={r['EW_median']:.4f}")
+            # [FIX 2026-07] 극단치에 취약한 mean 대신 median을 theta* 판단 기준으로 사용
+            if r["EU_median"] > best_eu_median:
+                best_eu_median, best_theta = r["EU_median"], theta
         row["theta_star"] = best_theta
+        row["theta_star_criterion"] = "EU_median"
         all_results.append(row)
-        print(f"-> age={age_ann}: theta* = {best_theta}\n")
+        print(f"-> age={age_ann}: theta* (median 기준) = {best_theta}\n")
 
     with open("milevsky_timing_RL_results.json", "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     print("결과 저장: milevsky_timing_RL_results.json")
 
-    print("\n=== 요약 (RL/행동편향) ===")
+    print("\n=== 요약 (RL/행동편향, theta*는 EU_median 기준) ===")
     for row in all_results:
         print(f"  {row['age_ann']}세: theta* = {row['theta_star']}")
 

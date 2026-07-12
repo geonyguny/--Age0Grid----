@@ -727,11 +727,26 @@ class RetirementEnv:
 
     def _obs(self) -> np.ndarray:
         """
-        관측값: [t_norm, W_t] (float32 ndarray)
+        관측값: [t_norm, W_t, income_total] (float32 ndarray)
+
+        [FIX 2026-07] 기존엔 [t_norm, W_t] 2차원이라, 정책이 종신연금/국민연금
+        소득(y_ann, pension_y)의 존재 자체를 전혀 인지하지 못했다. 그 결과
+        시뮬레이션 도중 연금이 매입되어 자산(W)이 줄고 대신 고정소득이 생겨도,
+        정책은 "그냥 자산이 줄었다"고만 인식해 학습 시 한 번도 겪어보지 못한
+        상황(분포 밖)에서 부적절하게 반응하는 문제가 있었다(Milevsky 연금화
+        시점 분석에서 이 문제로 인해 모든 조건에서 θ*=1.0이 나오는 인공적
+        결과가 관측됨). income_total(연금+국민연금 합산 월소득)을 3번째
+        관측차원으로 추가하여, 정책이 소득 유무에 따라 행동을 조정할 수
+        있게 한다.
         """
         t_norm = (self.t / max(1, self.T - 1)) if self.T > 1 else 0.0
+        y_ann = _safe_float(getattr(self, "y_ann", 0.0), 0.0)
+        pension_month = _safe_float(getattr(self, "_pension_Y_month", 0.0), 0.0)
+        claim_idx = int(getattr(self, "_pension_claim_month_idx", 0) or 0)
+        pension_y = pension_month if self.t >= claim_idx else 0.0
+        income_total = y_ann + pension_y
         return np.asarray(
-            [_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0)],
+            [_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0), _safe_float(income_total, 0.0)],
             dtype=np.float32,
         )
 

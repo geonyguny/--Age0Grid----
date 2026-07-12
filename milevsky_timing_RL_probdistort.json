@@ -1,0 +1,739 @@
+[
+  {
+    "age_ann": 55,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 55,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 55,
+        "EU_mean": -4326540.434386214,
+        "EU_median": -4293490.635242997,
+        "EU_trimmed_mean": -4300879.840992114,
+        "EW_mean": 0.3894684928410513,
+        "EW_median": 0.3671974645556191,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 55,
+        "EU_mean": -4215964.884165339,
+        "EU_median": -4213319.072572865,
+        "EU_trimmed_mean": -4206665.621352443,
+        "EW_mean": 0.296150148342747,
+        "EW_median": 0.27932655961344266,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 55,
+        "EU_mean": -4108633.2124717943,
+        "EU_median": -4118603.9368229955,
+        "EU_trimmed_mean": -4107802.0684481324,
+        "EW_mean": 0.20064206043642305,
+        "EW_median": 0.18928346756468872,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 55,
+        "EU_mean": -3994162.870675953,
+        "EU_median": -4002339.535980218,
+        "EU_trimmed_mean": -3995864.6193769136,
+        "EW_mean": 0.10220283359866758,
+        "EW_median": 0.09641605598360162,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 55,
+        "EU_mean": -35379.68915142815,
+        "EU_median": -35379.68915142815,
+        "EU_trimmed_mean": -35379.68915142816,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 56,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 56,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 56,
+        "EU_mean": -4317881.959109109,
+        "EU_median": -4310306.133602556,
+        "EU_trimmed_mean": -4290766.693209472,
+        "EW_mean": 0.38932266948235184,
+        "EW_median": 0.3669279477262669,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 56,
+        "EU_mean": -4197117.152434592,
+        "EU_median": -4177334.3345043994,
+        "EU_trimmed_mean": -4183465.6534813205,
+        "EW_mean": 0.295902419238837,
+        "EW_median": 0.2788689620178953,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 56,
+        "EU_mean": -4079288.489727775,
+        "EU_median": -4052219.3620735114,
+        "EU_trimmed_mean": -4070114.119379476,
+        "EW_mean": 0.2003619768064686,
+        "EW_median": 0.18876605950141834,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 56,
+        "EU_mean": -3955607.607648195,
+        "EU_median": -3937481.7786724595,
+        "EU_trimmed_mean": -3946464.381038937,
+        "EW_mean": 0.10199231735018958,
+        "EW_median": 0.0960268241743338,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 56,
+        "EU_mean": -426702.8990565439,
+        "EU_median": -420736.8458677975,
+        "EU_trimmed_mean": -425028.70593604754,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 57,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 57,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 57,
+        "EU_mean": -4326473.075200787,
+        "EU_median": -4317771.2452757135,
+        "EU_trimmed_mean": -4297179.35471561,
+        "EW_mean": 0.38916329739325084,
+        "EW_median": 0.36678150915851665,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 57,
+        "EU_mean": -4211006.981627155,
+        "EU_median": -4258628.498004543,
+        "EU_trimmed_mean": -4194406.987117098,
+        "EW_mean": 0.2956319012330774,
+        "EW_median": 0.27862319188682116,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 57,
+        "EU_mean": -4096777.8242064198,
+        "EU_median": -4135298.5268103047,
+        "EU_trimmed_mean": -4084789.152363606,
+        "EW_mean": 0.2000563895350156,
+        "EW_median": 0.1884914060323114,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 57,
+        "EU_mean": -3976608.2883262937,
+        "EU_median": -3975836.480473818,
+        "EU_trimmed_mean": -3966951.406300767,
+        "EW_mean": 0.10176282137428604,
+        "EW_median": 0.09582260400935438,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 57,
+        "EU_mean": -817241.208181144,
+        "EU_median": -815031.2108937073,
+        "EU_trimmed_mean": -814317.7097170011,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 58,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 58,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 58,
+        "EU_mean": -4326135.035519182,
+        "EU_median": -4296891.0190674355,
+        "EU_trimmed_mean": -4287705.347671555,
+        "EW_mean": 0.3890268916879368,
+        "EW_median": 0.36662405847136215,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 58,
+        "EU_mean": -4208755.201131666,
+        "EU_median": -4164051.1838664627,
+        "EU_trimmed_mean": -4174911.3064785902,
+        "EW_mean": 0.29540117670642035,
+        "EW_median": 0.2783591322273703,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 58,
+        "EU_mean": -4092762.626559825,
+        "EU_median": -4085902.47134447,
+        "EU_trimmed_mean": -4061053.384626982,
+        "EW_mean": 0.1997967230450246,
+        "EW_median": 0.18819657598037698,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 58,
+        "EU_mean": -3972545.0915283887,
+        "EU_median": -3932449.016782496,
+        "EU_trimmed_mean": -3940128.940322878,
+        "EW_mean": 0.10156856912975233,
+        "EW_median": 0.09560361381073874,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 58,
+        "EU_mean": -1206385.0969304692,
+        "EU_median": -1203810.0856244005,
+        "EU_trimmed_mean": -1200760.7425171048,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 59,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 59,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 59,
+        "EU_mean": -4322811.553147613,
+        "EU_median": -4277109.574790455,
+        "EU_trimmed_mean": -4280367.512050083,
+        "EW_mean": 0.38888616606616266,
+        "EW_median": 0.36653746754652555,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 59,
+        "EU_mean": -4202140.566067286,
+        "EU_median": -4200353.269880554,
+        "EU_trimmed_mean": -4163759.0610951292,
+        "EW_mean": 0.29516270419734086,
+        "EW_median": 0.27821457004963307,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 59,
+        "EU_mean": -4084156.749430898,
+        "EU_median": -4063021.076688001,
+        "EU_trimmed_mean": -4047867.0351736983,
+        "EW_mean": 0.19952788200363372,
+        "EW_median": 0.18803599980413782,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 59,
+        "EU_mean": -3964481.0642572735,
+        "EU_median": -3960944.498465291,
+        "EU_trimmed_mean": -3930295.56602502,
+        "EW_mean": 0.10136714739946813,
+        "EW_median": 0.09548506486938328,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 59,
+        "EU_mean": -1593798.5489553383,
+        "EU_median": -1582759.240753245,
+        "EU_trimmed_mean": -1583557.3592566743,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 60,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 60,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 60,
+        "EU_mean": -4328042.5278988,
+        "EU_median": -4283487.956888977,
+        "EU_trimmed_mean": -4283622.933554109,
+        "EW_mean": 0.38874775942854617,
+        "EW_median": 0.3663752236378939,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 60,
+        "EU_mean": -4211811.315919118,
+        "EU_median": -4172767.8742374773,
+        "EU_trimmed_mean": -4174878.637597291,
+        "EW_mean": 0.29492819645455176,
+        "EW_median": 0.2779437235118577,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 60,
+        "EU_mean": -4098706.5240180264,
+        "EU_median": -4082368.2327313246,
+        "EU_trimmed_mean": -4068201.910461017,
+        "EW_mean": 0.19926360742323748,
+        "EW_median": 0.18773501049629504,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 60,
+        "EU_mean": -3985479.8809142048,
+        "EU_median": -3985135.9668995175,
+        "EU_trimmed_mean": -3957902.7370859426,
+        "EW_mean": 0.10116925858662999,
+        "EW_median": 0.0952625459796338,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 60,
+        "EU_mean": -1975823.012587544,
+        "EU_median": -1978393.741410503,
+        "EU_trimmed_mean": -1962146.5940749203,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 61,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 61,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 61,
+        "EU_mean": -4334009.962436149,
+        "EU_median": -4290047.435558599,
+        "EU_trimmed_mean": -4288280.047310458,
+        "EW_mean": 0.3886054389563987,
+        "EW_median": 0.36625732701305724,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 61,
+        "EU_mean": -4224218.180560945,
+        "EU_median": -4173057.288966682,
+        "EU_trimmed_mean": -4184576.911905263,
+        "EW_mean": 0.29468706909031994,
+        "EW_median": 0.27774414333008046,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 61,
+        "EU_mean": -4118815.2575548436,
+        "EU_median": -4090664.567751972,
+        "EU_trimmed_mean": -4084136.764286077,
+        "EW_mean": 0.1989919163710127,
+        "EW_median": 0.18751050729179955,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 61,
+        "EU_mean": -4015264.1528424495,
+        "EU_median": -4020187.3013364766,
+        "EU_trimmed_mean": -3984231.6925139776,
+        "EW_mean": 0.10096586841452736,
+        "EW_median": 0.09509490650380659,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 61,
+        "EU_mean": -2353863.747501866,
+        "EU_median": -2367540.144717401,
+        "EU_trimmed_mean": -2338131.3044558987,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 62,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 62,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 62,
+        "EU_mean": -4346098.353250081,
+        "EU_median": -4295683.657662103,
+        "EU_trimmed_mean": -4296444.582320379,
+        "EW_mean": 0.3884666064476742,
+        "EW_median": 0.3661389838738359,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 62,
+        "EU_mean": -4247928.378420875,
+        "EU_median": -4192080.781677409,
+        "EU_trimmed_mean": -4201368.561995776,
+        "EW_mean": 0.29445275383559166,
+        "EW_median": 0.27754564464720655,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 62,
+        "EU_mean": -4154586.21067148,
+        "EU_median": -4121901.528005808,
+        "EU_trimmed_mean": -4110978.0078958203,
+        "EW_mean": 0.19872896425398584,
+        "EW_median": 0.18728919044985504,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 62,
+        "EU_mean": -4064275.7015338717,
+        "EU_median": -4009200.262710358,
+        "EU_trimmed_mean": -4023725.8805190753,
+        "EW_mean": 0.10076984666509888,
+        "EW_median": 0.09493098704451901,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 62,
+        "EU_mean": -2727508.552454129,
+        "EU_median": -2730316.3441960085,
+        "EU_trimmed_mean": -2706578.197870196,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 63,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 63,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 63,
+        "EU_mean": -4366508.20389175,
+        "EU_median": -4307681.899787441,
+        "EU_trimmed_mean": -4314744.947990639,
+        "EW_mean": 0.3883201566410372,
+        "EW_median": 0.36608888515702287,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 63,
+        "EU_mean": -4287472.191711361,
+        "EU_median": -4251240.996838184,
+        "EU_trimmed_mean": -4236438.036270135,
+        "EW_mean": 0.2942059152076017,
+        "EW_median": 0.27746340483583926,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 63,
+        "EU_mean": -4212775.364735162,
+        "EU_median": -4173503.482324729,
+        "EU_trimmed_mean": -4162580.5355612948,
+        "EW_mean": 0.19845232502332674,
+        "EW_median": 0.18719945974934804,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 63,
+        "EU_mean": -4141214.5775083597,
+        "EU_median": -4091885.3553422773,
+        "EU_trimmed_mean": -4091999.7967104274,
+        "EW_mean": 0.10056388158818459,
+        "EW_median": 0.0948659658457911,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 63,
+        "EU_mean": -3104763.9511037515,
+        "EU_median": -3074425.635295489,
+        "EU_trimmed_mean": -3074433.5325889033,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 64,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 64,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 64,
+        "EU_mean": -4388020.484634995,
+        "EU_median": -4308442.107900452,
+        "EU_trimmed_mean": -4336208.732198636,
+        "EW_mean": 0.3881894613795817,
+        "EW_median": 0.3658622576745457,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 64,
+        "EU_mean": -4329699.615848656,
+        "EU_median": -4260091.990135198,
+        "EU_trimmed_mean": -4278723.084457191,
+        "EW_mean": 0.2939863817061441,
+        "EW_median": 0.277082896907344,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 64,
+        "EU_mean": -4275439.583703547,
+        "EU_median": -4214194.452164437,
+        "EU_trimmed_mean": -4225279.803415514,
+        "EW_mean": 0.19820718241455465,
+        "EW_median": 0.1867746755148987,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 64,
+        "EU_mean": -4224394.07934252,
+        "EU_median": -4158675.2691682456,
+        "EU_trimmed_mean": -4174860.8970488426,
+        "EW_mean": 0.10038207245497956,
+        "EW_median": 0.09455091420891808,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 64,
+        "EU_mean": -3481426.9749778556,
+        "EU_median": -3438301.5162047194,
+        "EU_trimmed_mean": -3439252.675089901,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  },
+  {
+    "age_ann": 65,
+    "results": [
+      {
+        "theta": 0.0,
+        "age_ann": 65,
+        "EU_mean": -4451538.747537247,
+        "EU_median": -4365911.530221492,
+        "EU_trimmed_mean": -4398925.322154922,
+        "EW_mean": 0.4812314397509315,
+        "EW_median": 0.45346431956966776,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.2,
+        "age_ann": 65,
+        "EU_mean": -4415012.901536462,
+        "EU_median": -4328957.695449855,
+        "EU_trimmed_mean": -4361685.515222301,
+        "EW_mean": 0.3880375050154465,
+        "EW_median": 0.36574761540866796,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.4,
+        "age_ann": 65,
+        "EU_mean": -4381977.576552726,
+        "EU_median": -4300601.224853624,
+        "EU_trimmed_mean": -4328280.987052596,
+        "EW_mean": 0.293730019167394,
+        "EW_median": 0.2768920911202757,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.6,
+        "age_ann": 65,
+        "EU_mean": -4351782.063693128,
+        "EU_median": -4274965.313653614,
+        "EU_trimmed_mean": -4297827.06445237,
+        "EW_mean": 0.19791966647307258,
+        "EW_median": 0.18656357246249422,
+        "n_paths": 150
+      },
+      {
+        "theta": 0.8,
+        "age_ann": 65,
+        "EU_mean": -4323898.59844464,
+        "EU_median": -4251027.506343613,
+        "EU_trimmed_mean": -4269724.861477936,
+        "EW_mean": 0.100167902673376,
+        "EW_median": 0.09439575934112424,
+        "n_paths": 150
+      },
+      {
+        "theta": 1.0,
+        "age_ann": 65,
+        "EU_mean": -3838425.8984630853,
+        "EU_median": -3769095.2967742123,
+        "EU_trimmed_mean": -3784501.985861347,
+        "EW_mean": 0.0,
+        "EW_median": 0.0,
+        "n_paths": 150
+      }
+    ],
+    "theta_star": 1.0,
+    "theta_star_criterion": "EU_median"
+  }
+]
