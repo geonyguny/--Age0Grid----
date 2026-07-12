@@ -346,6 +346,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "소비율은 연령에 따라 4%보다 훨씬 높을 수 있어(격자확장 실험 참조), "
                         "4%룰 기준으로는 이미 공격적인 정책에서 후회가 거의 발동하지 않을 "
                         "수 있다. 더 높은 값(예: 0.08~0.15)으로 실험 가능.")
+    p.add_argument("--prob_weight_alpha", type=float,
+                   help="확률왜곡 Prelec α (기본 1.0=왜곡없음). 논문 식(34)/(35). "
+                        "0<α<1일수록 꼬리확률을 과대평가(HJB 구적 가중치에 직접 적용).")
+    p.add_argument("--prob_weight_eta", type=float,
+                   help="확률왜곡 Prelec η (기본 1.0=왜곡없음, 0<η≤1). 논문 식(34)/(35).")
 
     # ---------------- stdout / logging ----------------
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",

@@ -104,6 +104,9 @@ class SimConfig:
     pension_income_mult: float = 3.692
     pension_claim_age: float = 65.0
     regret_c_ref_rate: Optional[float] = None  # 후회회피 기준소비율(연). None=기본 4%룰
+    # 확률왜곡(Prelec 1998, 식34/35): φ(p)=exp[-η(-ln p)^α]. 둘 다 1.0이면 왜곡 없음(기존과 동일)
+    prob_weight_alpha: float = 1.0
+    prob_weight_eta: float = 1.0
 
     # --- Eval / bookkeeping ---
     # seeds는 리스트/튜플 모두 허용 → 내부적으로 튜플로 고정

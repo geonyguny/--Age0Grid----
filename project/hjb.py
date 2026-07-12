@@ -44,6 +44,43 @@ def _interp1d_grid(x_grid: _np.ndarray, y_on_grid: _np.ndarray, xq: _np.ndarray)
     return (1.0 - w) * yg[idx] + w * yg[idx + 1]
 
 
+def _prelec_reweight(
+    shocks: _np.ndarray, weights: _np.ndarray, alpha: float, eta: float
+) -> _np.ndarray:
+    """
+    논문 식(34)/(35): Prelec(1998) 확률가중함수 φ(p)=exp[-η(-ln p)^α]를
+    Gauss-Hermite 구적 노드의 (원본) 확률가중치에 직접 적용하여, 왜곡된
+    확률측도 하의 "결정가중치(decision weight)"로 치환한다.
+
+    절차: 충격(shock) 크기 순으로 정렬 → 누적확률(CDF) 계산 → φ(CDF)로 변환
+    → 연속차분으로 각 노드의 새 결정가중치 산출(합이 1이 되도록 재정규화).
+    α가 작을수록(0<α<1) 극단값(꼬리) 근처의 확률질량이 과대평가되어, 좌우
+    양쪽 꼬리 모두에 더 큰 가중치가 실린다(선행연구에서 흔히 강조되는 "손실
+    꼬리 과대평가"만이 아니라 Prelec 함수의 원래 정의가 갖는 특성 그대로 구현).
+    α=η=1이면 φ(p)=p로 항등변환(왜곡 없음, 기존과 완전히 동일).
+    """
+    if weights is None:
+        return weights
+    if abs(alpha - 1.0) < 1e-9 and abs(eta - 1.0) < 1e-9:
+        return weights
+    order = _np.argsort(shocks)
+    w_sorted = weights[order]
+    cdf = _np.cumsum(w_sorted)
+    cdf = _np.clip(cdf, 1e-12, 1.0)
+    phi = _np.exp(-float(eta) * (-_np.log(cdf)) ** float(alpha))
+    phi = _np.clip(phi, 0.0, 1.0)
+    dphi = _np.diff(_np.concatenate([[0.0], phi]))
+    dphi = _np.maximum(dphi, 0.0)
+    s = float(dphi.sum())
+    if s > 1e-12:
+        dphi = dphi / s
+    else:
+        dphi = w_sorted  # 안전 폴백(왜곡 실패 시 원본 유지)
+    new_weights = _np.empty_like(weights)
+    new_weights[order] = dphi
+    return new_weights
+
+
 def _gauss_hermite_shocks(mu: float, sigma: float, n: int = 32) -> Tuple[_np.ndarray, _np.ndarray]:
     """
     N(mu, sigma^2)에 대한 기댓값을 몬테카를로 없이 정확히 근사하는
@@ -283,6 +320,10 @@ class HJBSolver:
             weights = None
         else:
             shocks, weights = _gauss_hermite_shocks(self.mu, self.sigma, n=self.Nshock)
+            # 확률왜곡(식34/35): Prelec 가중함수로 구적 가중치 자체를 왜곡한다.
+            alpha_pw = float(getattr(self.cfg, "prob_weight_alpha", 1.0) or 1.0)
+            eta_pw = float(getattr(self.cfg, "prob_weight_eta", 1.0) or 1.0)
+            weights = _prelec_reweight(shocks, weights, alpha_pw, eta_pw)
 
         # η 후보 (λ<=0이면 0만)
         eta_values = tuple(getattr(self.cfg, "hjb_eta_grid", (0.0,))) if (self.lam > 0.0) else (0.0,)

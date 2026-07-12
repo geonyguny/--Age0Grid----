@@ -190,6 +190,8 @@ def make_cfg(args) -> SimConfig:
         pension_income_mult=_get(args, "pension_income_mult", getattr(cfg, "pension_income_mult", None)),
         pension_claim_age=_get(args, "pension_claim_age", getattr(cfg, "pension_claim_age", None)),
         regret_c_ref_rate=_get(args, "regret_c_ref_rate", getattr(cfg, "regret_c_ref_rate", None)),
+        prob_weight_alpha=_get(args, "prob_weight_alpha", getattr(cfg, "prob_weight_alpha", None)),
+        prob_weight_eta=_get(args, "prob_weight_eta", getattr(cfg, "prob_weight_eta", None)),
         # 헤지/시장
         hedge=_get(args, "hedge", getattr(cfg, "hedge", "off")),
         hedge_on=(str(_get(args, "hedge", "off")).lower() == "on"),
