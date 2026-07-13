@@ -72,9 +72,10 @@ except Exception:  # pragma: no cover
 
 # [ANN] annuity overlay
 try:
-    from ..annuity.overlay import init_from_sim_cfg  # type: ignore
+    from ..annuity.overlay import init_from_sim_cfg, compute_ax_real  # type: ignore
 except Exception:  # pragma: no cover
     init_from_sim_cfg = None  # type: ignore
+    compute_ax_real = None  # type: ignore
 
 
 # ---------- helpers ----------
@@ -271,6 +272,7 @@ class RetirementEnv:
         self.survive_bonus = _safe_float(self._get(cfg, kwargs, "survive_bonus", 0.0), 0.0)
         self.u_scale = _safe_float(self._get(cfg, kwargs, "u_scale", 0.05), 0.05)
         self.gamma = _safe_float(self._get(cfg, kwargs, "crra_gamma", 3.0), 3.0)
+        self.crra_gamma = self.gamma  # [FIX 2026-07] 별칭 추가 (다른 코드가 이 이름으로 찾을 경우 대비)
 
         # [NEW] HJB형 목적함수 옵션
         self.beta = _safe_float(self._get(cfg, kwargs, "beta", 1.0), 1.0)
@@ -375,6 +377,34 @@ class RetirementEnv:
         # --- 행동편향 사양(효용 레이어) ---
         self._bh_spec = getattr(cfg, "behavioral_spec", None)
         self.regret_c_ref_rate = self._get(cfg, kwargs, "regret_c_ref_rate", None)
+
+        # --- [2026-07 신규] 학습 중 무작위 연금매입 이벤트 주입 ---
+        # 기존엔 RL 정책이 학습 내내 "t=0 연금매입(또는 미매입)" 상태만 경험했고,
+        # 시뮬레이션 도중 갑자기 연금을 매입해 자산이 줄고 고정소득이 생기는 상황은
+        # 한 번도 겪어보지 못했다(Milevsky 연금화시점 분석에서 이로 인한 분포 밖
+        # 문제가 의심됨). train_random_annuity=on이면, 매 에피소드마다 일정 확률로
+        # (55~65세 사이 무작위 시점에 무작위 비율 θ만큼) 연금매입 이벤트를 실제로
+        # 경험시켜, 정책이 이런 전환에 적절히 반응하도록 학습 자체에 반영한다.
+        self.train_random_annuity = str(
+            self._get(cfg, kwargs, "train_random_annuity", "off") or "off"
+        ).lower() == "on"
+        self.train_annuity_prob = _safe_float(
+            self._get(cfg, kwargs, "train_annuity_prob", 0.5), 0.5
+        )
+        self.train_annuity_theta_max = _safe_float(
+            self._get(cfg, kwargs, "train_annuity_theta_max", 0.8), 0.8
+        )
+        self.train_annuity_age_min = _safe_float(
+            self._get(cfg, kwargs, "train_annuity_age_min", 55.0), 55.0
+        )
+        self.train_annuity_age_max = _safe_float(
+            self._get(cfg, kwargs, "train_annuity_age_max", 65.0), 65.0
+        )
+        self.train_annuity_load = _safe_float(
+            self._get(cfg, kwargs, "train_annuity_load", 0.08), 0.08
+        )
+        self._pending_annuity_month = None
+        self._pending_annuity_theta = 0.0
         self._prev_c = 0.0
 
         # --- seeding / RNG ---
@@ -711,6 +741,19 @@ class RetirementEnv:
         # 행동편향용 내부 상태
         self._prev_c = 0.0
 
+        # [2026-07 신규] 학습 중 무작위 연금매입 이벤트 스케줄링
+        self._pending_annuity_month = None
+        self._pending_annuity_theta = 0.0
+        if self.train_random_annuity and self.rng.random() < self.train_annuity_prob:
+            age_lo = min(self.train_annuity_age_min, self.train_annuity_age_max)
+            age_hi = max(self.train_annuity_age_min, self.train_annuity_age_max)
+            rand_age = self.rng.uniform(age_lo, age_hi)
+            rand_month = int(round((rand_age - self.age0) * self.steps_per_year))
+            rand_month = max(0, min(rand_month, self.T - 1))
+            rand_theta = float(self.rng.uniform(0.05, max(0.05, self.train_annuity_theta_max)))
+            self._pending_annuity_month = rand_month
+            self._pending_annuity_theta = rand_theta
+
         # HJB용 할인 관련 상태
         self._disc_factor = 1.0
         self._ruin_penalized = False
@@ -903,7 +946,12 @@ class RetirementEnv:
         self.W = max(_safe_float(W_before_fee - fee, 0.0), 0.0)
 
         # ----- 효용 계산 + 행동편향 훅 (논문 식44/45 순서: 손실회피→습관형성→후회→모호성회피) ---
-        gamma_c = _safe_float(getattr(self, "crra_gamma", 3.0), 3.0)
+        # [FIX 2026-07, 매우 중요] __init__에서 cfg.crra_gamma 값은 self.gamma로
+        # 저장되는데, 여기서는 존재하지도 않는 self.crra_gamma를 찾고 있었다.
+        # 그 결과 --crra_gamma를 무엇으로 지정하든 항상 폴백 기본값 3.0으로
+        # 조용히 되돌아가, RL 학습·평가의 실제 효용계산이 전부 γ=3.0으로
+        # 고정되어 있었다(HJB는 hjb.py에 별도의 올바른 경로가 있어 영향 없었음).
+        gamma_c = _safe_float(getattr(self, "gamma", getattr(self, "crra_gamma", 3.0)), 3.0)
         base_u = _crra_u(c, gamma_c)
         u_eff = base_u
         spec = getattr(self, "_bh_spec", None)
@@ -951,6 +999,25 @@ class RetirementEnv:
         self.t += 1
         self.age_years = float(self.age0) + (self.t / max(1, self.steps_per_year))
         self.is_new_year = (self.t % self.steps_per_year == 0)
+
+        # [2026-07 신규] 학습 중 무작위 연금매입 이벤트 실행
+        if self._pending_annuity_month is not None and self.t >= self._pending_annuity_month:
+            W_now = _safe_float(self.W, 0.0)
+            theta_ev = float(self._pending_annuity_theta)
+            if W_now > 0.0 and theta_ev > 0.0 and self.life_table is not None:
+                try:
+                    a_factor_ev = float(compute_ax_real(
+                        self.age_years, self.life_table,
+                        _safe_float(self.r_f_real_annual, 0.02), S=int(self.steps_per_year)
+                    ))
+                except Exception:
+                    a_factor_ev = 0.0
+                if a_factor_ev > 0.0:
+                    P_ev = theta_ev * W_now
+                    y_add = P_ev / a_factor_ev / (1.0 + self.train_annuity_load)
+                    self.W = max(0.0, W_now - P_ev)
+                    self.y_ann = _safe_float(getattr(self, "y_ann", 0.0), 0.0) + y_add
+            self._pending_annuity_month = None  # 1회성 이벤트, 재실행 방지
 
         # CPI YoY
         if self.t >= self.steps_per_year:

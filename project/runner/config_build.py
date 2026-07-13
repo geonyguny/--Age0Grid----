@@ -192,6 +192,12 @@ def make_cfg(args) -> SimConfig:
         regret_c_ref_rate=_get(args, "regret_c_ref_rate", getattr(cfg, "regret_c_ref_rate", None)),
         prob_weight_alpha=_get(args, "prob_weight_alpha", getattr(cfg, "prob_weight_alpha", None)),
         prob_weight_eta=_get(args, "prob_weight_eta", getattr(cfg, "prob_weight_eta", None)),
+        train_random_annuity=_get(args, "train_random_annuity", getattr(cfg, "train_random_annuity", None)),
+        train_annuity_prob=_get(args, "train_annuity_prob", getattr(cfg, "train_annuity_prob", None)),
+        train_annuity_theta_max=_get(args, "train_annuity_theta_max", getattr(cfg, "train_annuity_theta_max", None)),
+        train_annuity_age_min=_get(args, "train_annuity_age_min", getattr(cfg, "train_annuity_age_min", None)),
+        train_annuity_age_max=_get(args, "train_annuity_age_max", getattr(cfg, "train_annuity_age_max", None)),
+        train_annuity_load=_get(args, "train_annuity_load", getattr(cfg, "train_annuity_load", None)),
         # 헤지/시장
         hedge=_get(args, "hedge", getattr(cfg, "hedge", "off")),
         hedge_on=(str(_get(args, "hedge", "off")).lower() == "on"),

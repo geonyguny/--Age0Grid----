@@ -107,6 +107,13 @@ class SimConfig:
     # 확률왜곡(Prelec 1998, 식34/35): φ(p)=exp[-η(-ln p)^α]. 둘 다 1.0이면 왜곡 없음(기존과 동일)
     prob_weight_alpha: float = 1.0
     prob_weight_eta: float = 1.0
+    # 학습 중 무작위 연금매입 이벤트 (RL이 "연금매입으로 인한 소득변화"를 실제로 경험하게 함)
+    train_random_annuity: str = "off"
+    train_annuity_prob: float = 0.5
+    train_annuity_theta_max: float = 0.8
+    train_annuity_age_min: float = 55.0
+    train_annuity_age_max: float = 65.0
+    train_annuity_load: float = 0.08
 
     # --- Eval / bookkeeping ---
     # seeds는 리스트/튜플 모두 허용 → 내부적으로 튜플로 고정

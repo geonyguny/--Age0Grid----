@@ -351,6 +351,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "0<α<1일수록 꼬리확률을 과대평가(HJB 구적 가중치에 직접 적용).")
     p.add_argument("--prob_weight_eta", type=float,
                    help="확률왜곡 Prelec η (기본 1.0=왜곡없음, 0<η≤1). 논문 식(34)/(35).")
+    p.add_argument("--train_random_annuity", choices=["on", "off"], default="off",
+                   help="학습 중 무작위 시점(55~65세)에 무작위 비율(θ)로 종신연금 매입 "
+                        "이벤트를 실제로 경험시킨다(RL 정책이 '연금매입으로 인한 소득변화'를 "
+                        "학습 자체에서 겪어보게 하기 위함). off면 기존과 완전히 동일.")
+    p.add_argument("--train_annuity_prob", type=float,
+                   help="학습 에피소드당 무작위 연금매입 이벤트가 발생할 확률(기본 0.5)")
+    p.add_argument("--train_annuity_theta_max", type=float,
+                   help="학습 중 샘플링되는 연금전환비율의 상한(기본 0.8)")
+    p.add_argument("--train_annuity_age_min", type=float, help="학습 중 이벤트 발생 연령 하한(기본 55)")
+    p.add_argument("--train_annuity_age_max", type=float, help="학습 중 이벤트 발생 연령 상한(기본 65)")
+    p.add_argument("--train_annuity_load", type=float, help="학습 중 연금 부하율(기본 0.08)")
 
     # ---------------- stdout / logging ----------------
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",

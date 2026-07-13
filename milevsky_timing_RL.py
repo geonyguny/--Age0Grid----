@@ -56,9 +56,24 @@ def deterministic_action_batch(actor: BetaActor, obs_batch: np.ndarray, q_cap: f
 
 def simulate_with_midpoint_annuity_batch(actor, base_cfg, q_cap, w_max, age_ann, theta,
                                           life_df, r_f_annual, n_paths=200, seed0=0,
-                                          n_months=420):
+                                          n_months=420, u_scale=0.0001, ann_load=0.08):
     """[속도개선] n_paths개 환경을 리스트로 두고, 매 스텝마다 전체 경로의 관측치를
     한꺼번에 모아 배치로 신경망을 통과시킨다(환경 자체는 개별이지만 신경망 호출만 배치화).
+
+    [FIX 2026-07] 기존엔 info["u_eff"](u_scale 적용 전 원본 CRRA 효용, 소비가 조금만
+    낮아져도 -1e4~-1e6 단위로 폭발)를 그대로 누적하고 있었다. 그런데 RL 정책은
+    실제로 base_reward = u_scale * u_eff (u_scale=0.0001)를 보상으로 학습했으므로,
+    평가지표가 학습 목표와 스케일이 맞지 않아 정책 품질과 무관하게 원본 CRRA의
+    극단치에 압도되는 문제가 있었다(θ=1.0만 시장노출이 없어 이 문제를 원천적으로
+    피해가므로 항상 압도적으로 이기는 것처럼 보였음). u_scale을 곱해 학습 시와
+    동일한 스케일로 평가한다.
+
+    [FIX 2026-07, 2차] 연금 매입액을 부하율(사업비/이윤) 없이 순보험료(공정가격)
+    그대로 계산하고 있었다. 현실의 보험사는 항상 부하를 얹어 판매하므로, 이를
+    반영하지 않으면 연금화가 실제보다 유리하게(θ*가 인위적으로 높게) 나올 수
+    있다. ann_load(기본 8%)만큼 매입비용을 더 지불하는 것으로 반영한다:
+    실제 지급액 = θ*W / (1+ann_load) 만큼만 연금소득으로 환산(같은 P를 내고
+    더 적은 보장소득을 받는 것과 동일).
     """
     month_ann = int((age_ann - 55) * 12)
     envs = []
@@ -89,7 +104,8 @@ def simulate_with_midpoint_annuity_batch(actor, base_cfg, q_cap, w_max, age_ann,
             if (not annuitized[i]) and env.t >= month_ann:
                 W_now = env.W
                 P = theta * W_now
-                y_ann_add = (P / a_factor_cache) if (a_factor_cache and a_factor_cache > 0) else 0.0
+                # [FIX] 부하율 반영: 같은 보험료(P)를 내고 (1+ann_load)로 나눈 만큼만 지급
+                y_ann_add = (P / a_factor_cache / (1.0 + ann_load)) if (a_factor_cache and a_factor_cache > 0) else 0.0
                 env.W = max(0.0, W_now - P)
                 env.y_ann = float(getattr(env, "y_ann", 0.0)) + y_ann_add
                 annuitized[i] = True
@@ -103,7 +119,13 @@ def simulate_with_midpoint_annuity_batch(actor, base_cfg, q_cap, w_max, age_ann,
         for j, i in enumerate(active_idx):
             obs, rew, done, info = envs[i].step(q=float(q_batch[j]), w=float(w_batch[j]))
             obs_list[i] = obs
-            u_sum[i] += disc * float(info.get("u_eff", 0.0))
+            # [FIX 2026-07, 3차] info["u_eff"]는 현재편향(β) 할인이 적용되기 "전" 값이다
+            # (retirement_env.py에서 disc_factor는 reward에만 곱해지고 u_eff에는 안 곱해짐).
+            # 여기서 자체 표준할인(delta_m)만 곱하면, 실제 정책이 학습된 β 조정이
+            # presentbias 조건 분석에서 완전히 누락된다. info["disc_factor"](β 반영,
+            # beta=1.0인 다른 조건에서는 항상 1.0이라 무해함)를 추가로 곱해 보정한다.
+            env_disc = float(info.get("disc_factor", 1.0))
+            u_sum[i] += disc * env_disc * float(info.get("u_eff", 0.0)) * u_scale
             if done:
                 done_flags[i] = True
         disc *= delta_m
@@ -128,11 +150,11 @@ def simulate_with_midpoint_annuity_batch(actor, base_cfg, q_cap, w_max, age_ann,
     }
 
 
-def make_base_cfg(bias_kwargs=None):
+def make_base_cfg(bias_kwargs=None, crra_gamma=3.0):
     cfg = SimConfig()
     cfg.market_mode = "iid"
     cfg.horizon_years = 35
-    cfg.crra_gamma = 3.0
+    cfg.crra_gamma = crra_gamma
     cfg.w_max = 0.70
     cfg.pension_rho = 0.30
     cfg.pension_claim_age = 65.0
@@ -148,12 +170,19 @@ def make_base_cfg(bias_kwargs=None):
 
 def main():
     if len(sys.argv) < 2:
-        print("사용법: python milevsky_timing_RL.py <best_pt_경로> [--quick]")
+        print("사용법: python milevsky_timing_RL.py <best_pt_경로> [--quick] [--gamma 1.0]")
         sys.exit(1)
     ckpt_path = sys.argv[1]
     quick = "--quick" in sys.argv
+    # [FIX 2026-07] 정책이 학습된 gamma와 분석 환경의 gamma가 일치해야 효용
+    # 계산이 의미를 가진다. --gamma로 지정 가능하게 하고, 기본값은 3.0(기존과 동일).
+    gamma = 3.0
+    if "--gamma" in sys.argv:
+        idx = sys.argv.index("--gamma")
+        if idx + 1 < len(sys.argv):
+            gamma = float(sys.argv[idx + 1])
 
-    base_cfg = make_base_cfg()
+    base_cfg = make_base_cfg(crra_gamma=gamma)
     actor = load_actor(ckpt_path)
     q_cap = 0.02
     w_max = 0.70
@@ -163,7 +192,7 @@ def main():
     r_f = float(getattr(base_cfg, "rf_annual", 0.02))
 
     ages = [65] if quick else list(range(55, 66))  # 55~65세, 1세 단위
-    theta_candidates = [0.0, 0.3] if quick else [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # 0.6에서 안 꺾여 상한 확장
+    theta_candidates = [0.0, 0.3] if quick else [round(0.1 * i, 1) for i in range(11)]  # 0.0~1.0, 0.1 단위(11개)로 세분화
     n_paths = 60 if quick else 150  # 배치화 덕분에 경로수를 다시 늘려도 감당 가능
 
     all_results = []
