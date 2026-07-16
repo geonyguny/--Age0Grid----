@@ -14,23 +14,36 @@ ap.add_argument("--floor", default="off")
 ap.add_argument("--q_max_mult", type=float, default=1.5)
 ap.add_argument("--w_max", type=float, default=0.70)
 ap.add_argument("--pension_rho", type=float, default=0.30)
+ap.add_argument("--asset", default="KR", help="위험자산 프리셋: KR/US/Gold/TDF")
+ap.add_argument("--mu_annual", type=float, default=0.0, help=">0이면 위험자산 기대수익률 직접 지정(분산 포트폴리오용)")
+ap.add_argument("--sigma_annual", type=float, default=0.0, help=">0이면 위험자산 변동성 직접 지정")
 ap.add_argument("--bequest_kappa", type=float, default=0.0)
+ap.add_argument("--survival", choices=["on","off"], default="off")
+ap.add_argument("--w_grid_n", type=int, default=8)
 ap.add_argument("--n_paths", type=int, default=300)
 ap.add_argument("--rl_ckpt", default="", help="주어지면 HJB 대신 이 RL 체크포인트 정책을 특성화")
 a = ap.parse_args()
 
-cfg = make_base_cfg(crra_gamma=a.gamma, asset="KR")
+cfg = make_base_cfg(crra_gamma=a.gamma, asset=a.asset)
 cfg.floor_on = "on" if a.floor == "on" else False
 cfg.f_min_real = a.f_min_real
 cfg.q_floor = 0.0
 cfg.w_max = a.w_max
 # ★ SimConfig 생성 시점에 hjb_w_grid가 그때의 w_max(0.70) 기준으로 이미 만들어지므로,
 #   w_max를 바꾸면 격자도 같은 방식(0~w_max 8점 균등)으로 재생성해야 실제 반영된다.
-cfg.hjb_w_grid = tuple(np.linspace(0.0, a.w_max, 8))
+cfg.hjb_w_grid = tuple(np.linspace(0.0, a.w_max, a.w_grid_n))
 cfg.pension_rho = a.pension_rho
+if a.mu_annual > 0.0: cfg.mu_annual = a.mu_annual
+if a.sigma_annual > 0.0: cfg.sigma_annual = a.sigma_annual
 if a.bequest_kappa > 0.0:
-    cfg.bequest_kappa = a.bequest_kappa   # HJB 종단 유증효용(log형)
+    cfg.bequest_kappa = a.bequest_kappa
     cfg.bequest_gamma = 1.0
+if a.survival == "on":
+    _probe = RetirementEnv(copy.deepcopy(cfg))
+    _ldf = get_life_table_from_env(_probe)
+    _qx = {int(r['age']): float(r['qx']) for _, r in _ldf.iterrows()}
+    cfg.hjb_survival_px = np.array([(1.0-min(max(_qx.get(int(55+m//12), _qx[max(_qx)]),0.0),0.999))**(1.0/12.0) for m in range(420)])
+    print('[survival] HJB 해에 생존가중 적용')
 
 
 if a.rl_ckpt:

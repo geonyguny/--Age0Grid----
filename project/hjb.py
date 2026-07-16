@@ -174,6 +174,12 @@ class HJBSolver:
         # --- preferences (utility scale & gamma for tie-breaking consistency) ---
         self.gamma = float(getattr(cfg, "crra_gamma", 3.0) or 3.0)
         self.beta  = float(self.m.get("beta_m", 1.0) or 1.0)
+        # [2026-07 신규] 생존가중 할인(옵션): cfg.hjb_survival_px에 월별 1개월 생존확률
+        # 배열(길이 ≥ T)이 주어지면 시점 t의 할인율을 beta·px[t]로 사용한다(논문 식42의
+        # βt "생존확률 반영 할인"). 미지정 시 기존과 완전 동일(px=1).
+        self._beta0 = self.beta
+        _px = getattr(cfg, "hjb_survival_px", None)
+        self._survival_px = _np.asarray(_px, dtype=float) if _px is not None else None
 
         # --- risk process params (monthly) ---
         self.mu    = float(self.m.get("mu_m", 0.0) or 0.0)
@@ -359,6 +365,9 @@ class HJBSolver:
 
             # backward
             for t in reversed(range(self.T)):
+                # [2026-07] 생존가중 할인: beta_t = beta0 · px[t] (px 미지정 시 beta0 그대로)
+                if self._survival_px is not None and t < len(self._survival_px):
+                    self.beta = self._beta0 * float(self._survival_px[t])
                 for i, W in enumerate(self.W_grid):
                     # q grid with floor & floor_on(f_min_real)
                     # [FIX 2026-07] floor_on 판정을 env(retirement_env)와 동일하게

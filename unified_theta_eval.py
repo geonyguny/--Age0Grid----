@@ -28,8 +28,17 @@ ap.add_argument("--floor", choices=["on", "off"], default="off")
 ap.add_argument("--q_max_mult", type=float, default=1.5)
 ap.add_argument("--w_max", type=float, default=0.70)
 ap.add_argument("--pension_rho", type=float, default=0.30)
+ap.add_argument("--asset", default="KR", help="위험자산 프리셋: KR/US/Gold/TDF")
+ap.add_argument("--mu_annual", type=float, default=0.0, help=">0이면 위험자산 기대수익률 직접 지정(분산 포트폴리오용)")
+ap.add_argument("--sigma_annual", type=float, default=0.0, help=">0이면 위험자산 변동성 직접 지정")
 ap.add_argument("--bequest_kappa", type=float, default=0.0,
                 help="유증동기 강도. >0이면 HJB 해와 평가 EU 모두에 κ·log(W_T) 유증효용 반영")
+ap.add_argument("--survival", choices=["on", "off"], default="off",
+                help="on이면 HJB 해와 평가 EU 모두 생존확률 가중 할인(논문 식42 βt) 적용")
+ap.add_argument("--market", choices=["iid", "bootstrap"], default="iid",
+                help="bootstrap이면 정책은 iid 가정으로 풀되 평가는 실측 블록 부트스트랩 경로 사용(모형오설정 강건성)")
+ap.add_argument("--market_csv", default="project/data/market_test_600m.csv")
+ap.add_argument("--w_grid_n", type=int, default=8)
 ap.add_argument("--n_paths", type=int, default=150)
 ap.add_argument("--ages", default="55,60,65")
 a = ap.parse_args()
@@ -41,7 +50,7 @@ thetas = [round(0.1*i, 1) for i in range(9)]  # 0.0~0.8
 ages = [int(x) for x in a.ages.split(",")]
 
 def make_cfg():
-    cfg = make_base_cfg(crra_gamma=a.gamma, asset="KR")
+    cfg = make_base_cfg(crra_gamma=a.gamma, asset=a.asset)
     # ★ floor_on: HJB는 bool(), env는 str()=="on"로 판정 → 둘 다 맞도록
     #   ON = "on"(문자열), OFF = False(불리언)로 설정
     cfg.floor_on = "on" if a.floor == "on" else False
@@ -49,8 +58,16 @@ def make_cfg():
     cfg.q_floor = 0.0
     cfg.w_max = a.w_max   # 위험자산 한도 (0.70=현행 제도, 1.0=한도 폐지 시나리오)
     # SimConfig 생성 시 만들어진 hjb_w_grid(0~0.70)를 새 w_max로 재생성
-    cfg.hjb_w_grid = tuple(np.linspace(0.0, a.w_max, 8))
+    cfg.hjb_w_grid = tuple(np.linspace(0.0, a.w_max, a.w_grid_n))
     cfg.pension_rho = a.pension_rho   # 국민연금 실질 소득대체율 시나리오(0.20/0.30/0.40)
+    if a.mu_annual > 0.0: cfg.mu_annual = a.mu_annual
+    if a.sigma_annual > 0.0: cfg.sigma_annual = a.sigma_annual
+    if a.market == "bootstrap":
+        # 평가용 env만 부트스트랩(HJB 해는 여전히 iid 모수 사용 — 의도된 오설정 테스트)
+        cfg.market_mode = "bootstrap"
+        cfg.market_csv = a.market_csv
+        cfg.bootstrap_block = 24
+        cfg.use_real_rf = "on"
     if a.bequest_kappa > 0.0:
         cfg.bequest_kappa = a.bequest_kappa   # HJB 종단 유증효용(log형, bequest_gamma=1)
         cfg.bequest_gamma = 1.0
@@ -60,6 +77,20 @@ base_cfg = make_cfg()
 probe = RetirementEnv(base_cfg)
 life_df = get_life_table_from_env(probe)
 r_f = float(getattr(base_cfg, "rf_annual", 0.02))
+
+# 생존가중: KIDI 생명표에서 월별 1개월 생존확률 px[t]와 누적생존 S[t] 구성
+SURV_PX = None; SURV_S = None
+if a.survival == "on" and life_df is not None:
+    qx_by_age = {int(r["age"]): float(r["qx"]) for _, r in life_df.iterrows()}
+    px_m = []
+    for m in range(n_months):
+        age = int(55 + m // 12)
+        qx = qx_by_age.get(age, qx_by_age[max(qx_by_age)])
+        px_m.append((1.0 - min(max(qx, 0.0), 0.999)) ** (1.0 / 12.0))
+    SURV_PX = np.array(px_m)
+    SURV_S = np.cumprod(SURV_PX)          # S[t] = t+1개월 생존확률
+    base_cfg.hjb_survival_px = SURV_PX    # HJB 해에도 동일 적용
+    print(f"[survival] px 구성: S(65세)={SURV_S[119]:.3f}, S(80세)={SURV_S[299]:.3f}, S(90세)={SURV_S[-1]:.3f}")
 
 # ── 정책 actor(배치) 준비: obs_batch -> (q_arr, w_arr) 실제행동 ──
 if a.mode == "rl":
@@ -100,10 +131,11 @@ def sim_theta(age_ann, theta):
         act=[i for i in range(n) if not done[i]]
         ob=np.stack([obs_list[i] for i in act])
         qb,wb=act_batch(ob)
+        sw = float(SURV_S[t]) if SURV_S is not None else 1.0   # 생존가중(옵션)
         for j,i in enumerate(act):
             obs,rew,d,info=envs[i].step(q=float(qb[j]),w=float(wb[j]))
             obs_list[i]=obs
-            u_sum[i]+=disc*float(info.get("u_eff",0.0))*u_scale
+            u_sum[i]+=disc*sw*float(info.get("u_eff",0.0))*u_scale
             if d: done[i]=True; disc_end[i]=disc
         disc*=delta_m
     # 유증동기: HJB 종단효용과 동일한 "연금화 소비등가" 유증효용을 평가에도 반영
