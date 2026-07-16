@@ -190,6 +190,7 @@ def make_cfg(args) -> SimConfig:
         pension_income_mult=_get(args, "pension_income_mult", getattr(cfg, "pension_income_mult", None)),
         pension_claim_age=_get(args, "pension_claim_age", getattr(cfg, "pension_claim_age", None)),
         regret_c_ref_rate=_get(args, "regret_c_ref_rate", getattr(cfg, "regret_c_ref_rate", None)),
+        regret_c_ref_base=_get(args, "regret_c_ref_base", getattr(cfg, "regret_c_ref_base", None)),
         prob_weight_alpha=_get(args, "prob_weight_alpha", getattr(cfg, "prob_weight_alpha", None)),
         prob_weight_eta=_get(args, "prob_weight_eta", getattr(cfg, "prob_weight_eta", None)),
         train_random_annuity=_get(args, "train_random_annuity", getattr(cfg, "train_random_annuity", None)),
@@ -198,6 +199,10 @@ def make_cfg(args) -> SimConfig:
         train_annuity_age_min=_get(args, "train_annuity_age_min", getattr(cfg, "train_annuity_age_min", None)),
         train_annuity_age_max=_get(args, "train_annuity_age_max", getattr(cfg, "train_annuity_age_max", None)),
         train_annuity_load=_get(args, "train_annuity_load", getattr(cfg, "train_annuity_load", None)),
+        social_floor_on=_get(args, "social_floor_on", getattr(cfg, "social_floor_on", None)),
+        social_floor_min=_get(args, "social_floor_min", getattr(cfg, "social_floor_min", None)),
+        social_floor_asset_test=_get(args, "social_floor_asset_test", getattr(cfg, "social_floor_asset_test", None)),
+        social_floor_income_test=_get(args, "social_floor_income_test", getattr(cfg, "social_floor_income_test", None)),
         # 헤지/시장
         hedge=_get(args, "hedge", getattr(cfg, "hedge", "off")),
         hedge_on=(str(_get(args, "hedge", "off")).lower() == "on"),

@@ -104,7 +104,10 @@ def estimate_returns_and_pretrain_critic(actor, cfg: SimConfig, q_cap: float, w_
 
 
 def make_cfg(asset: str, crra_gamma: float, w_max: float, pension_rho: float,
-             hjb_W_grid: int = 150, hjb_q_max_mult: float = 4.0) -> SimConfig:
+             hjb_W_grid: int = 150, hjb_q_max_mult: float = 1.5) -> SimConfig:
+    # [FIX 2026-07] hjb_q_max_mult 기본값 4.0→1.5. 4.0은 연 최대 ~16% 인출을 허용해
+    # HJB 정책이 과다인출·조기고갈되고, 그 결과 종신연금이 인위적으로 과대평가되어
+    # θ*가 왜곡되던 문제가 있었다. 1.5(연 상한 ~6%)가 '4%룰'급 합리적 전략을 준다.
     cfg = SimConfig()
     cfg.market_mode = "iid"
     cfg.horizon_years = 35
@@ -113,6 +116,12 @@ def make_cfg(asset: str, crra_gamma: float, w_max: float, pension_rho: float,
     cfg.w_max = w_max
     cfg.pension_rho = pension_rho
     cfg.pension_claim_age = 65.0
+    # [FIX 2026-07] floor_on을 명시적 False로. floor_on(강제 최소인출 제약)은 자산이
+    # 낮아지면 q_min=f_min/W를 1.0까지 강제해 전액 인출→조기 파산을 유발하는
+    # 역효과가 있어(논문 식31의 Stone-Geary '효용' 플로어와 다른 메커니즘), 기준선
+    # 전략 산출에서는 끈다.
+    cfg.floor_on = False
+    cfg.f_min_real = 0.0
     cfg.asset = asset
     if asset in ASSET_PRESETS:
         for k, v in ASSET_PRESETS[asset].items():

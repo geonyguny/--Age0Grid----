@@ -253,6 +253,17 @@ class RetirementEnv:
         _qf = self._get(cfg, kwargs, "q_floor", 0.0)
         self.q_floor_base = _safe_float(0.0 if _qf is None else _qf, 0.0) / self.steps_per_year
         self.floor_on = str(self._get(cfg, kwargs, "floor_on", "off") or "off").lower() == "on"
+        # [2026-07 신규] 사회안전망(기초생활보장) - floor_on과 별개의 독립 메커니즘
+        self.social_floor_on = str(
+            self._get(cfg, kwargs, "social_floor_on", "off") or "off"
+        ).lower() == "on"
+        self.social_floor_min = _safe_float(self._get(cfg, kwargs, "social_floor_min", 0.0), 0.0)
+        self.social_floor_asset_test = _safe_float(
+            self._get(cfg, kwargs, "social_floor_asset_test", 0.0), 0.0
+        )
+        self.social_floor_income_test = _safe_float(
+            self._get(cfg, kwargs, "social_floor_income_test", 0.0), 0.0
+        )
         self.f_min_real = _safe_float(self._get(cfg, kwargs, "f_min_real", 0.0), 0.0)
 
         # ---- 수수료 체계: 펀드보수(지속)/연금 부가보험료(1회) 분리 ----
@@ -377,6 +388,8 @@ class RetirementEnv:
         # --- 행동편향 사양(효용 레이어) ---
         self._bh_spec = getattr(cfg, "behavioral_spec", None)
         self.regret_c_ref_rate = self._get(cfg, kwargs, "regret_c_ref_rate", None)
+        # [2026-07 신규] 기준소비의 기준자산: "W"(현재자산 비례, 기본) | "W0"(초기자산 고정 목표)
+        self.regret_c_ref_base = str(self._get(cfg, kwargs, "regret_c_ref_base", "W") or "W")
 
         # --- [2026-07 신규] 학습 중 무작위 연금매입 이벤트 주입 ---
         # 기존엔 RL 정책이 학습 내내 "t=0 연금매입(또는 미매입)" 상태만 경험했고,
@@ -909,7 +922,13 @@ class RetirementEnv:
         W_start = max(_safe_float(self.W, 0.0), 0.0)
 
         # 1) clipping ----------------------------------------------------
-        q_min = self._q_min_now()
+        # [FIX 2026-07] 기존 floor_on/f_min_real은 "최소 이만큼은 본인 자산에서
+        # 인출해야 한다"는 인출전략 제약(가드레일류)으로 설계된 것이었는데,
+        # 뒤이어 추가한 사회안전망(외생 지원금) 메커니즘을 실수로 같은 필드에
+        # 겹쳐 구현하면서 이 원래 제약이 무력화되어 있었다. 두 메커니즘은
+        # 경제적 가정이 다르므로(전자는 "본인 자산에서 더 인출", 후자는
+        # "정부가 부족분을 외부에서 채움") 별도 필드로 분리한다.
+        q_min = self._q_min_now()  # 원래 의도: 인출전략 제약(floor_on/f_min_real)
         q = max(q_min, _clip01(q))
         w = _clip01(min(w, _safe_float(getattr(self, "w_max", 1.0), 1.0)))
 
@@ -919,6 +938,35 @@ class RetirementEnv:
         c = _safe_float(y_ann + pension_y + q * W_start, 0.0)
         # annuity/국민연금 지급은 계정 밖에서 이뤄지므로, 계정 차감은 q*W_start만 적용
         W_after_c = max(W_start - q * W_start, 0.0)
+
+        # [2026-07 신규] 사회안전망(기초생활보장): 본인 자산과 무관하게 정부가 부족분을
+        # 외생적으로 채워주는 방식(계정 비차감). floor_on/f_min_real(위의 인출전략
+        # 제약)과는 별개의 독립적 메커니즘.
+        # [FIX 2026-07, 2차] 국민기초생활보장제도는 소득뿐 아니라 "재산의 소득환산액"
+        # 까지 반영하는 자산조사(means test)가 있어, 본 연구의 대표 은퇴자처럼
+        # 금융자산(1.37억원 상당, W0=1.0)을 보유한 경우 현실에서는 수급 대상이 될 수
+        # 없다. 기존 구현은 자산이 얼마가 남아있든 무관하게 항상 지원금을 얹어주는
+        # 방식이라 비현실적이었다. 본인의 남은 금융자산(W_start)이 자산조사 기준
+        # (social_floor_asset_test, 기본 0=완전 소진)을 넘으면 사회안전망이 아예
+        # 작동하지 않도록 수정한다 — 자산이 실질적으로 바닥난 경우에만 발동.
+        floor_topup = 0.0
+        if bool(getattr(self, "social_floor_on", False)):
+            asset_test = _safe_float(getattr(self, "social_floor_asset_test", 0.0), 0.0)
+            # [FIX 2026-07, 3차] 자산조사뿐 아니라 소득조사도 필요하다: 국민기초생활
+            # 보장제도의 소득인정액에는 사적연금(퇴직연금·개인연금) 등 공적이전소득
+            # 이외의 소득도 포함되므로, 이미 종신연금(y_ann)을 매입해 정기소득이
+            # 있는 사람은 자산이 없어도 원천적으로 수급 대상이 아니다. 이를 반영하지
+            # 않으면 완전연금화(θ=1.0)가 "연금소득 + 사회안전망"을 이중으로 누리는
+            # 비현실적 상황이 생긴다. y_ann > income_test(기본 0=조금이라도 있으면
+            # 실격)이면 안전망을 적용하지 않는다. 국민연금(pension_y)은 65세부터
+            # 개시되는 시점 자체가 이미 사회안전망의 필요성이 줄어드는 시점과
+            # 맞물리므로 별도 실격 사유로 넣지 않는다(오늘 확인한 Milevsky 결과와도 부합).
+            income_test = _safe_float(getattr(self, "social_floor_income_test", 0.0), 0.0)
+            if W_start <= asset_test and y_ann <= income_test:
+                f_min_month = _safe_float(getattr(self, "social_floor_min", 0.0), 0.0) / max(1, self.steps_per_year)
+                if c < f_min_month:
+                    floor_topup = f_min_month - c
+                    c = f_min_month
 
         # 3) returns (+hedge) --------------------------------------------
         r_risky_raw, r_safe = self._draw_returns()
@@ -964,7 +1012,18 @@ class RetirementEnv:
                 if _rcr is not None:
                     c_ref_rate_annual = _safe_float(_rcr, 0.04)
                     q_ref = 1.0 - (1.0 - c_ref_rate_annual) ** (1.0 / max(1, self.steps_per_year))
-                    c_ref = q_ref * W_start
+                    # [2026-07 신규] regret_c_ref_base: 기준소비의 기준자산 선택.
+                    #  - "W"(기본, 기존과 동일): 현재자산 비례 c_ref = q_ref·W_t.
+                    #    자산이 줄면 기준도 같이 내려가므로, 소비율이 일정한 정책에서는
+                    #    손실회피/후회 페널티가 사실상 발동하지 않는 문제가 있다.
+                    #  - "W0": 은퇴시점 초기자산 기준의 '고정 목표소비'(실질 절대액)
+                    #    c_ref = q_ref·W0. 자산이 감소해 소비가 목표 아래로 떨어지면
+                    #    페널티가 실제로 발동한다(전망이론의 고정 참조점, 논문 식32의
+                    #    c* 해석과 정합). 손실회피가 '소비 보장 수단(연금 등)' 선호로
+                    #    이어지는 경제적 채널을 살린다.
+                    _base_mode = str(getattr(self, "regret_c_ref_base", "W") or "W").upper()
+                    _ref_W = _safe_float(getattr(self, "W0", W_start), W_start) if _base_mode == "W0" else W_start
+                    c_ref = q_ref * _ref_W
                 else:
                     c_ref = prev_c
 
@@ -1131,6 +1190,7 @@ class RetirementEnv:
 
         info["base_reward"] = float(base_reward)
         info["u_eff"] = float(_safe_float(u_eff, base_u))
+        info["floor_topup"] = float(floor_topup)
         info["u_raw"] = float(_safe_float(base_u, 0.0))
         info["penalty"] = float(penalty)
         info["beta"] = float(beta)

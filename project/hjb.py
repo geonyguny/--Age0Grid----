@@ -349,8 +349,15 @@ class HJBSolver:
             for t in reversed(range(self.T)):
                 for i, W in enumerate(self.W_grid):
                     # q grid with floor & floor_on(f_min_real)
+                    # [FIX 2026-07] floor_on 판정을 env(retirement_env)와 동일하게
+                    # 문자열 "on" 기준으로 통일한다. 기존 bool(cfg.floor_on)은
+                    # 문자열 "off"를 True로 취급(비어있지 않은 문자열은 truthy)해,
+                    # env는 끄는데 HJB만 켜지는 불일치 버그가 있었다. "on"/"off"
+                    # 문자열과 True/False 불리언을 모두 안전하게 처리한다.
+                    _fl = getattr(self.cfg, "floor_on", False)
+                    _floor_on = (_fl is True) or (str(_fl).lower() in ("on", "true", "1", "yes"))
                     q_min = q_floor
-                    if bool(getattr(self.cfg, "floor_on", False)) and float(getattr(self.cfg, "f_min_real", 0.0)) > 0.0 and W > 0.0:
+                    if _floor_on and float(getattr(self.cfg, "f_min_real", 0.0)) > 0.0 and W > 0.0:
                         q_min = max(q_min, min(1.0, float(getattr(self.cfg, "f_min_real")) / float(W)))
                     q_grid = _np.maximum(self.q_actions, q_min)
 
