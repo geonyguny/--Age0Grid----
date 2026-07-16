@@ -29,13 +29,36 @@ from project.config import SimConfig
 from project.env.retirement_env import RetirementEnv
 from project.annuity.overlay import compute_ax_real
 from project.runner.helpers import get_life_table_from_env
-from project.trainer.rl_trainer import BetaActor
+from project.trainer.rl_trainer import BetaActor, ResidualBetaActor
 
 
-def load_actor(ckpt_path: str, obs_dim: int = 3, hidden=(128, 128)) -> BetaActor:
+def load_actor(ckpt_path: str, obs_dim: int = 3, hidden=(128, 128)):
+    """
+    RL 체크포인트에서 액터를 복원한다.
+
+    [2026-07] 잔차 정책(residual_policy=on)으로 학습한 best.pt는 액터가
+    ResidualBetaActor이며 state_dict 키가 일반 BetaActor와 다르다
+    (baseline.*, res_net.*, log_conc_*). 체크포인트 구조를 자동 감지해
+    올바른 액터를 재구성한다. 두 액터 모두 forward가 (dist_q, dist_w, _)를
+    반환하므로 이후 deterministic_action_batch는 그대로 동작한다.
+    """
     state = torch.load(ckpt_path, map_location="cpu")
-    actor = BetaActor(obs_dim, list(hidden))
-    actor.load_state_dict(state["actor"])
+    actor_sd = state["actor"]
+    is_residual = any(
+        k.startswith("res_net.") or k.startswith("baseline.")
+        for k in actor_sd.keys()
+    )
+    if is_residual:
+        cfgd = state.get("cfg", {}) or {}
+        rscale = float(cfgd.get("residual_scale", 0.15))
+        baseline = BetaActor(obs_dim, list(hidden))
+        actor = ResidualBetaActor(
+            baseline, obs_dim, list(hidden), residual_scale=rscale
+        )
+        actor.load_state_dict(actor_sd)
+    else:
+        actor = BetaActor(obs_dim, list(hidden))
+        actor.load_state_dict(actor_sd)
     actor.eval()
     return actor
 
@@ -150,7 +173,8 @@ def simulate_with_midpoint_annuity_batch(actor, base_cfg, q_cap, w_max, age_ann,
     }
 
 
-def make_base_cfg(bias_kwargs=None, crra_gamma=3.0):
+def make_base_cfg(bias_kwargs=None, crra_gamma=3.0, social_floor_on=False, social_floor_min=0.0, asset="KR"):
+    from project.config import ASSET_PRESETS
     cfg = SimConfig()
     cfg.market_mode = "iid"
     cfg.horizon_years = 35
@@ -162,6 +186,15 @@ def make_base_cfg(bias_kwargs=None, crra_gamma=3.0):
     cfg.mort_table = "project/data/kidi_qx.csv"
     cfg.sex = "M"
     cfg.age0 = 55
+    cfg.social_floor_on = "on" if social_floor_on else "off"
+    cfg.social_floor_min = social_floor_min
+    # [FIX 2026-07] 자산 프리셋(mu_annual/sigma_annual)을 명시적으로 반영하지 않으면
+    # SimConfig 기본값(mu=0.06, sigma=0.20 — KR도 TDF도 아닌 제3의 값)이 쓰여
+    # 학습 때 사용한 자산가정과 분석 환경이 어긋나는 문제가 있었다.
+    cfg.asset = asset
+    if asset in ASSET_PRESETS:
+        for k, v in ASSET_PRESETS[asset].items():
+            setattr(cfg, k, v)
     if bias_kwargs:
         for k, v in bias_kwargs.items():
             setattr(cfg, k, v)
@@ -181,8 +214,19 @@ def main():
         idx = sys.argv.index("--gamma")
         if idx + 1 < len(sys.argv):
             gamma = float(sys.argv[idx + 1])
+    social_floor_on = "--social_floor_on" in sys.argv
+    social_floor_min = 0.0
+    if "--social_floor_min" in sys.argv:
+        idx = sys.argv.index("--social_floor_min")
+        if idx + 1 < len(sys.argv):
+            social_floor_min = float(sys.argv[idx + 1])
+    asset = "KR"
+    if "--asset" in sys.argv:
+        idx = sys.argv.index("--asset")
+        if idx + 1 < len(sys.argv):
+            asset = sys.argv[idx + 1]
 
-    base_cfg = make_base_cfg(crra_gamma=gamma)
+    base_cfg = make_base_cfg(crra_gamma=gamma, social_floor_on=social_floor_on, social_floor_min=social_floor_min, asset=asset)
     actor = load_actor(ckpt_path)
     q_cap = 0.02
     w_max = 0.70

@@ -74,6 +74,28 @@ class RLConfig:
     # Hooks (future)
     teacher_kl_coef: float = 0.0  # if >0, add KL(π||π_teacher)
 
+    # [2026-07 신규] HJB 정책 모방학습(behavior cloning) 후 워밍업된 액터 체크포인트를
+    # 불러와 PPO 학습의 초기값으로 사용한다(무작위 초기화 대비 훨씬 나은 출발점).
+    warm_start_ckpt: str = ""
+
+    # [2026-07 신규] 잔차 정책(Residual Policy) 옵션
+    # ------------------------------------------------------------------
+    # 무편향 RL을 처음부터 학습시키면 HJB(θ*=0)에서 너무 멀리 벗어난 지점에서 출발해,
+    # 그 격차가 편향의 미세한 효과를 전부 삼켜버려 모든 편향에서 θ*≈1.0으로 뭉개졌다.
+    # 잔차 정책은 HJB(모방) 정책을 "고정된 기준선"으로 두고, 그 위에 작고(bounded)
+    # 상태의존적인 보정(residual)만 학습한다:
+    #     action = clip(baseline(s) + tanh(net(s)) * residual_scale, 0, 1)
+    # · residual_policy=True 이면 baseline_ckpt(없으면 warm_start_ckpt)의 액터를
+    #   frozen baseline으로 로드하고, 그 위에 잔차 네트워크만 학습한다.
+    # · 잔차 네트워크의 마지막 층은 0으로 초기화되어, 학습 시작 시점의 정책이 정확히
+    #   baseline(=HJB 근사)과 일치한다("보정=0"이 공짜로 얻어짐 → 무편향 θ*≈0).
+    # · residual_scale로 보정폭을 제한해, 편향이 있어도 baseline 근방에서만 벗어나도록
+    #   구조적으로 강제한다(편향 유형별로 서로 다른 보정을 학습할 여지가 커짐).
+    residual_policy: bool = False
+    residual_scale: float = 0.15      # 잔차 보정의 최대 절대폭(raw [0,1] 액션 기준)
+    residual_l2_coef: float = 0.0     # 잔차 크기에 대한 L2 정규화(0=미사용; 무편향 시 0 유지 유도)
+    baseline_ckpt: str = ""           # frozen baseline 액터 체크포인트(없으면 warm_start_ckpt 사용)
+
     def __post_init__(self):
         if self.hidden_dims is None:
             self.hidden_dims = [128, 128]
@@ -137,6 +159,98 @@ class BetaActor(nn.Module):
         dist_q = Beta(a_q, b_q)
         dist_w = Beta(a_w, b_w)
         return dist_q, dist_w, raw
+
+
+class ResidualBetaActor(nn.Module):
+    """
+    잔차 정책(Residual Policy) 액터.
+
+    고정된 baseline 액터(HJB 모방정책)를 감싸고, 그 위에 작고 상태의존적인 보정
+    (residual)만 학습한다. 최종 행동의 평균은
+
+        mean = clip(baseline_mean(s) + tanh(res_net(s)) * residual_scale, eps, 1-eps)
+
+    로 정의되며, 이를 Beta(mean·conc, (1-mean)·conc)로 변환해 확률정책으로 사용한다.
+
+    설계 포인트
+    -----------
+    1) baseline은 완전히 고정(requires_grad=False, eval 모드)한다. 학습되는 것은
+       잔차 네트워크(res_net)와 head별 집중도(log_conc)뿐이다.
+    2) res_net의 마지막 층은 weight=0, bias=0으로 초기화한다. 따라서 학습 시작
+       시점의 tanh(0)=0 → 보정=0 → 정책이 정확히 baseline과 일치한다. 무편향
+       상황에서는 어드밴티지가 baseline을 밀어낼 이유가 없으므로 보정이 0 근방에
+       머물러 자연스럽게 HJB(θ*≈0)를 재현한다.
+    3) residual_scale로 보정폭을 [-scale, +scale]로 제한해, 편향이 있어도 정책이
+       baseline 근방에서만 벗어나도록 구조적으로 강제한다.
+
+    반환 시그니처는 BetaActor와 동일하게 (dist_q, dist_w, residual)이며,
+    세 번째 원소(residual)는 L2 정규화에 사용할 수 있도록 보정값 [N,2]를 담는다.
+    """
+
+    def __init__(
+        self,
+        baseline: "BetaActor",
+        obs_dim: int,
+        hidden: List[int],
+        residual_scale: float = 0.15,
+        init_conc: float = 12.0,
+    ):
+        super().__init__()
+        # ── 고정 baseline (학습 제외) ──
+        self.baseline = baseline
+        for p in self.baseline.parameters():
+            p.requires_grad_(False)
+        self.baseline.eval()
+
+        self.residual_scale = float(residual_scale)
+        self.softplus = nn.Softplus()
+
+        # ── 학습되는 잔차 네트워크: (delta_q, delta_w) 2개 출력 ──
+        self.res_net = MLP(obs_dim, hidden, out_dim=2)
+        last = self.res_net.net[-1]
+        if isinstance(last, nn.Linear):
+            with torch.no_grad():
+                last.weight.zero_()
+                last.bias.zero_()  # 시작 시 보정=0 → 정책 == baseline
+
+        # ── head별 집중도(탐색폭). conc = softplus(log_conc)+2 ──
+        # init_conc≈12 근방이 되도록 raw 파라미터를 역산 초기화.
+        raw_init = float(init_conc - 2.0)
+        self.log_conc_q = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+        self.log_conc_w = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+
+        # 마지막 forward의 보정값(정규화용)
+        self.last_residual: Optional[torch.Tensor] = None
+
+    def _baseline_means(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            dq, dw, _ = self.baseline(x)
+            mq = dq.concentration1 / (dq.concentration1 + dq.concentration0)
+            mw = dw.concentration1 / (dw.concentration1 + dw.concentration0)
+        return mq, mw
+
+    def forward(self, x: torch.Tensor) -> Tuple[Beta, Beta, torch.Tensor]:
+        mq, mw = self._baseline_means(x)  # (0,1), no grad
+
+        delta = torch.tanh(self.res_net(x)) * self.residual_scale  # [N,2] in [-s, s]
+        d_q, d_w = torch.chunk(delta, 2, dim=-1)
+        d_q = d_q.reshape(mq.shape)
+        d_w = d_w.reshape(mw.shape)
+
+        eps = 1e-4
+        mean_q = torch.clamp(mq + d_q, eps, 1.0 - eps)
+        mean_w = torch.clamp(mw + d_w, eps, 1.0 - eps)
+
+        conc_q = self.softplus(self.log_conc_q) + 2.0
+        conc_w = self.softplus(self.log_conc_w) + 2.0
+
+        a_q = mean_q * conc_q
+        b_q = (1.0 - mean_q) * conc_q
+        a_w = mean_w * conc_w
+        b_w = (1.0 - mean_w) * conc_w
+
+        self.last_residual = delta
+        return Beta(a_q, b_q), Beta(a_w, b_w), delta
 
 
 class ValueCritic(nn.Module):
@@ -270,10 +384,77 @@ class RLTrainer:
             cfg.obs_dim = int(np.asarray(o, dtype=np.float32).shape[-1])
 
         # nets
-        self.actor = BetaActor(cfg.obs_dim, cfg.hidden_dims).to(self.device)
         self.critic = ValueCritic(cfg.obs_dim, cfg.hidden_dims).to(self.device)
+
+        # [2026-07 신규] 잔차 정책 모드: HJB 모방 액터를 frozen baseline으로 두고
+        # 그 위에 작은 보정만 학습하는 ResidualBetaActor를 사용한다.
+        if getattr(cfg, "residual_policy", False):
+            baseline = BetaActor(cfg.obs_dim, cfg.hidden_dims).to(self.device)
+            # baseline 가중치 로드: baseline_ckpt 우선, 없으면 warm_start_ckpt 재활용
+            base_ckpt = cfg.baseline_ckpt or cfg.warm_start_ckpt
+            self.baseline_loaded = False
+            self.baseline_error = ""
+            if base_ckpt:
+                try:
+                    bstate = torch.load(base_ckpt, map_location=self.device)
+                    baseline.load_state_dict(bstate["actor"])
+                    # 크리틱도 함께 로드해 액터-크리틱 스케일을 맞춘다(BC critic 재활용).
+                    if "critic" in bstate:
+                        self.critic.load_state_dict(bstate["critic"])
+                    self.baseline_loaded = True
+                    if cfg.verbose:
+                        print(f"[RL][residual] baseline 로드 완료(critic 포함={'critic' in bstate}): {base_ckpt}")
+                except Exception as e:
+                    self.baseline_error = repr(e)
+                    if cfg.verbose:
+                        print(f"[RL][residual][WARN] baseline 로드 실패({e!r}), bias-init baseline으로 진행")
+            elif cfg.verbose:
+                print("[RL][residual][WARN] baseline_ckpt/warm_start_ckpt 미지정 → bias-init BetaActor를 baseline으로 사용")
+
+            self.actor = ResidualBetaActor(
+                baseline=baseline,
+                obs_dim=cfg.obs_dim,
+                hidden=cfg.hidden_dims,
+                residual_scale=float(getattr(cfg, "residual_scale", 0.15)),
+            ).to(self.device)
+        else:
+            self.actor = BetaActor(cfg.obs_dim, cfg.hidden_dims).to(self.device)
+
+        # [2026-07 신규] HJB 모방학습(BC) 워밍업 체크포인트가 지정되어 있으면 로드.
+        # obs_dim/hidden_dims가 정확히 일치해야 하며, 일치하지 않으면 무시하고
+        # 기존(무작위/bias-init) 초기화로 안전하게 폴백한다.
+        # [FIX 2026-07] cli.py가 학습 중 모든 stdout을 io.StringIO로 가로채 버려서
+        # print() 로그로는 성공/실패 여부를 확인할 수 없었다. 인스턴스 속성으로
+        # 저장해 두어, run.py가 최종 반환 metrics에 이 값을 포함시킬 수 있게 한다.
+        # [FIX 2026-07, 2차] 액터만 로드하고 크리틱은 무작위 초기화로 남겨두면,
+        # PPO 시작 직후 크리틱의 잘못된 가치추정이 어드밴티지를 왜곡시켜 모처럼
+        # 워밍업된 액터를 초반에 망가뜨리는 문제가 있었다. 체크포인트에 "critic"
+        # 키가 있으면 그것도 같이 로드한다(pretrain_bc.py가 이제 크리틱도 저장).
+        self.warm_start_loaded = False
+        self.warm_start_error = ""
+        # 잔차 모드에서는 baseline 로드가 위에서 이미 끝났고, self.actor(ResidualBetaActor)의
+        # state_dict 구조가 BC 체크포인트("actor" 키)와 다르므로 이 경로를 건너뛴다.
+        if cfg.warm_start_ckpt and not getattr(cfg, "residual_policy", False):
+            try:
+                state = torch.load(cfg.warm_start_ckpt, map_location=self.device)
+                self.actor.load_state_dict(state["actor"])
+                if "critic" in state:
+                    self.critic.load_state_dict(state["critic"])
+                self.warm_start_loaded = True
+                if cfg.verbose:
+                    print(f"[RL] warm_start_ckpt 로드 완료(critic 포함={'critic' in state}): {cfg.warm_start_ckpt}")
+            except Exception as e:
+                self.warm_start_error = repr(e)
+                if cfg.verbose:
+                    print(f"[RL][WARN] warm_start_ckpt 로드 실패({e!r}), 기본 초기화로 진행")
+
+        # frozen baseline 파라미터(requires_grad=False)는 옵티마이저에서 제외한다.
+        trainable_params = [
+            p for p in (list(self.actor.parameters()) + list(self.critic.parameters()))
+            if p.requires_grad
+        ]
         self.opt = optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()),
+            trainable_params,
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
         )
@@ -385,6 +566,13 @@ class RLTrainer:
             - self.cfg.ent_coef * entropy
             + self.cfg.ent_coef * entropy_floor_penalty
         )
+
+        # [2026-07 신규] 잔차 정규화: 잔차 정책 모드에서 보정 크기(delta)에 L2 페널티를
+        # 부과하면, "굳이 보정할 이유가 없는" 무편향/무의미한 상태에서 보정이 0으로
+        # 수렴하도록 추가로 유도한다(baseline=HJB로의 회귀). raw는 forward가 반환한
+        # 잔차 delta [N,2]. residual_l2_coef=0이면 완전히 비활성.
+        if getattr(self.cfg, "residual_policy", False) and self.cfg.residual_l2_coef > 0.0:
+            loss_pi = loss_pi + float(self.cfg.residual_l2_coef) * (raw ** 2).mean()
 
         v_pred = self.critic(obs)
         v_target = ret

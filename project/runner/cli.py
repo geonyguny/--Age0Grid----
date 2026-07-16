@@ -263,6 +263,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="엔트로피 하한선(0=미사용). 학습 후반 엔트로피가 계속 줄어들며 "
                         "정책이 과도하게 확정적으로 붕괴하는 것을 막기 위한 최소 엔트로피 "
                         "보너스 하한(예: 0.1~0.3).")
+    p.add_argument("--warm_start_ckpt", type=str, default="",
+                   help="HJB 모방학습(behavior cloning)으로 워밍업된 액터 체크포인트 경로. "
+                        "지정하면 PPO 학습을 무작위 초기화 대신 이 지점에서 시작한다.")
+
+    # ---------------- Residual Policy (잔차 정책) ----------------
+    p.add_argument("--residual_policy", choices=["on", "off"], default="off",
+                   help="잔차 정책 모드. on이면 baseline_ckpt(없으면 warm_start_ckpt)의 "
+                        "HJB 모방 액터를 고정 기준선으로 두고, 그 위에 작은 보정(residual)만 "
+                        "학습한다. 무편향에서는 보정≈0으로 baseline(HJB, θ*≈0)을 재현하고, "
+                        "편향 유형별로 서로 다른 보정을 학습하도록 구조적으로 유도한다.")
+    p.add_argument("--baseline_ckpt", type=str, default="",
+                   help="잔차 정책의 frozen baseline 액터 체크포인트. 미지정 시 "
+                        "--warm_start_ckpt 값을 대신 사용한다.")
+    p.add_argument("--residual_scale", type=float, default=0.15,
+                   help="잔차 보정의 최대 절대폭(raw [0,1] 액션 기준). 예: 0.15면 "
+                        "baseline 대비 ±0.15 범위에서만 벗어날 수 있다.")
+    p.add_argument("--residual_l2_coef", type=float, default=0.0,
+                   help="잔차 크기에 대한 L2 정규화 계수(0=미사용). 무편향 시 보정이 "
+                        "0으로 수렴하도록 추가 유도할 때 작은 값(예: 0.001~0.01) 사용.")
     p.add_argument("--rl_q_cap", type=float, default=0.02,
                    help="정책의 분기별 소비율 상한(월간 기준, 예: 0.02=월 2%). "
                         "HJB의 q_actions 최댓값(4%룰 월환산 q4≈0.0034)보다 넉넉하게 잡아 "
@@ -362,6 +381,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train_annuity_age_min", type=float, help="학습 중 이벤트 발생 연령 하한(기본 55)")
     p.add_argument("--train_annuity_age_max", type=float, help="학습 중 이벤트 발생 연령 상한(기본 65)")
     p.add_argument("--train_annuity_load", type=float, help="학습 중 연금 부하율(기본 0.08)")
+    p.add_argument("--social_floor_on", choices=["on", "off"], default="off",
+                   help="사회안전망(기초생활보장) on/off. 기존 --floor_on(인출전략 제약, "
+                        "본인자산에서 더 인출하도록 강제)과는 별개의 독립적 메커니즘으로, "
+                        "본인 자산과 무관하게 정부가 부족분을 외생적으로 채워준다(계정 비차감).")
+    p.add_argument("--social_floor_min", type=float,
+                   help="사회안전망 최소소비 수준(연, W0 기준 정규화 단위)")
+    p.add_argument("--social_floor_asset_test", type=float,
+                   help="사회안전망 자산조사 기준(W0 정규화 단위, 기본 0=자산 완전소진 시에만 적용)")
+    p.add_argument("--social_floor_income_test", type=float,
+                   help="사회안전망 소득조사 기준(사적연금 y_ann, 기본 0=조금이라도 있으면 실격)")
 
     # ---------------- stdout / logging ----------------
     p.add_argument("--print_mode", choices=["full", "metrics", "summary"], default="full",

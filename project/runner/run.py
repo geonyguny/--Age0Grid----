@@ -1513,6 +1513,11 @@ def run_rl(args):
             device="auto",
             value_clip=float(getattr(args, "value_clip", 0.0) or 0.0),
             entropy_clip=float(getattr(args, "entropy_clip", 0.0) or 0.0),
+            warm_start_ckpt=str(getattr(args, "warm_start_ckpt", "") or ""),
+            residual_policy=(str(getattr(args, "residual_policy", "off") or "off").lower() == "on"),
+            residual_scale=float(getattr(args, "residual_scale", 0.15) or 0.15),
+            residual_l2_coef=float(getattr(args, "residual_l2_coef", 0.0) or 0.0),
+            baseline_ckpt=str(getattr(args, "baseline_ckpt", "") or ""),
         )
 
         t3 = time.perf_counter()
@@ -1592,6 +1597,22 @@ def run_rl(args):
         metrics_dict["eval_episodes"] = int(
             extras_dict.get("episodes", 0)
         )
+        # [FIX 2026-07] cli.py가 학습 중 print() 로그를 전부 io.StringIO로 가로채
+        # 버려서, warm_start_ckpt 성공/실패 여부를 콘솔에서 확인할 방법이 없었다.
+        # 최종 metrics에 직접 포함시켜 항상 확인 가능하게 한다.
+        if getattr(cfg_rl, "warm_start_ckpt", ""):
+            metrics_dict["warm_start_loaded"] = bool(getattr(trainer, "warm_start_loaded", False))
+            if getattr(trainer, "warm_start_error", ""):
+                metrics_dict["warm_start_error"] = str(trainer.warm_start_error)
+
+        # 잔차 정책: baseline 로드 성공 여부/설정을 metrics에 남겨 항상 확인 가능하게 한다.
+        if getattr(cfg_rl, "residual_policy", False):
+            metrics_dict["residual_policy"] = True
+            metrics_dict["residual_scale"] = float(getattr(cfg_rl, "residual_scale", 0.15))
+            metrics_dict["residual_l2_coef"] = float(getattr(cfg_rl, "residual_l2_coef", 0.0))
+            metrics_dict["baseline_loaded"] = bool(getattr(trainer, "baseline_loaded", False))
+            if getattr(trainer, "baseline_error", ""):
+                metrics_dict["baseline_error"] = str(trainer.baseline_error)
 
         # ★ RL episode return을 기대효용(EU)로 간주하여 정식 메트릭으로 반영
         if debug_eval_mean is not None:
