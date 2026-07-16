@@ -273,11 +273,23 @@ class HJBSolver:
         inv = 1.0 / max(1e-12, (1.0 - self.alpha))
         return self.lam * (eta + inv * _np.maximum(self.F - W - float(eta), 0.0))
 
-    # --- Terminal bequest utility (CRRA on terminal wealth) ---
+    # --- Terminal bequest utility (annuitized-consumption equivalent) ---
     def _bequest_U(self, W: _np.ndarray) -> _np.ndarray:
+        """
+        [FIX 2026-07] 기존 log형(κ·log W_T, bequest_gamma=1)은 γ=3 CRRA 소비효용의
+        스케일(월소비 ~0.008 기준 |u|~수천)에 비해 수천 배 작아, κ를 아무리 키워도
+        정책에 흔적을 남기지 못하는 사실상 무효한 구현이었다(κ=0.5와 2.0의 결과가
+        소수점 4자리까지 동일함을 확인). 유증효용을 가치함수와 같은 스케일이 되도록
+        "상속인이 유산 W를 S개월(bequest_months, 기본 180=15년)에 걸쳐 균등 소비할
+        때의 효용 × κ"로 정의한다:
+            v(W) = κ · S · u_CRRA(W/S; γ_소비)
+        κ=1이면 상속인의 소비를 본인 소비와 동일한 한계가치로 평가한다는 해석.
+        """
         if self.bequest_kappa <= 0.0:
             return _np.zeros_like(W, dtype=float)
-        return self.bequest_kappa * _crra_u(W, self.bequest_gamma)
+        S = float(getattr(self.cfg, "bequest_months", 180.0) or 180.0)
+        gamma_c = float(getattr(self.cfg, "crra_gamma", 3.0) or 3.0)
+        return self.bequest_kappa * S * _crra_u(_np.maximum(W, 1e-12) / S, gamma_c)
 
     # --- value backup for (W, q, w) ---
     def _backup_val(self, V_next: _np.ndarray, W: float, q: float, w: float, shocks: _np.ndarray,

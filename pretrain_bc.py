@@ -131,6 +131,11 @@ def make_cfg(asset: str, crra_gamma: float, w_max: float, pension_rho: float,
     cfg.hjb_W_focus = 2.0
     cfg.hjb_W_focus_frac = 0.85
     cfg.hjb_q_max_mult = hjb_q_max_mult
+    # [FIX 2026-07] SimConfig 생성 시점에 hjb_w_grid가 기본 w_max(0.70) 기준으로
+    # 만들어지므로, w_max를 나중에 바꿔도 격자가 0~0.70에 갇힌다. w_max에 맞춰
+    # 같은 방식(0~w_max, 8점 균등)으로 재생성한다(w_max=1.0 한도폐지 실험 대비).
+    import numpy as _np
+    cfg.hjb_w_grid = tuple(float(x) for x in _np.linspace(0.0, w_max, 8))
     return cfg
 
 

@@ -26,11 +26,15 @@ ap.add_argument("--gamma", type=float, default=3.0)
 ap.add_argument("--f_min_real", type=float, default=0.072)
 ap.add_argument("--floor", choices=["on", "off"], default="off")
 ap.add_argument("--q_max_mult", type=float, default=1.5)
+ap.add_argument("--w_max", type=float, default=0.70)
+ap.add_argument("--pension_rho", type=float, default=0.30)
+ap.add_argument("--bequest_kappa", type=float, default=0.0,
+                help="유증동기 강도. >0이면 HJB 해와 평가 EU 모두에 κ·log(W_T) 유증효용 반영")
 ap.add_argument("--n_paths", type=int, default=150)
 ap.add_argument("--ages", default="55,60,65")
 a = ap.parse_args()
 
-q_cap, w_max, u_scale, ann_load = 0.02, 0.70, 0.0001, 0.08
+q_cap, w_max, u_scale, ann_load = 0.02, a.w_max, 0.0001, 0.08
 delta_m = 0.9530 ** (1.0/12.0)
 n_months = 420
 thetas = [round(0.1*i, 1) for i in range(9)]  # 0.0~0.8
@@ -43,6 +47,13 @@ def make_cfg():
     cfg.floor_on = "on" if a.floor == "on" else False
     cfg.f_min_real = a.f_min_real
     cfg.q_floor = 0.0
+    cfg.w_max = a.w_max   # 위험자산 한도 (0.70=현행 제도, 1.0=한도 폐지 시나리오)
+    # SimConfig 생성 시 만들어진 hjb_w_grid(0~0.70)를 새 w_max로 재생성
+    cfg.hjb_w_grid = tuple(np.linspace(0.0, a.w_max, 8))
+    cfg.pension_rho = a.pension_rho   # 국민연금 실질 소득대체율 시나리오(0.20/0.30/0.40)
+    if a.bequest_kappa > 0.0:
+        cfg.bequest_kappa = a.bequest_kappa   # HJB 종단 유증효용(log형, bequest_gamma=1)
+        cfg.bequest_gamma = 1.0
     return cfg
 
 base_cfg = make_cfg()
@@ -75,6 +86,7 @@ def sim_theta(age_ann, theta):
     for i in range(n):
         env=RetirementEnv(copy.deepcopy(base_cfg)); obs=env.reset(seed=i); envs.append(env); obs_list.append(obs)
     annu=[theta<=0.0]*n; u_sum=np.zeros(n); done=[False]*n
+    disc_end=np.ones(n)
     a_fac = float(compute_ax_real(age_ann, life_df, r_f, S=12)) if theta>0 and life_df is not None else 0.0
     disc=1.0
     for t in range(n_months):
@@ -92,8 +104,20 @@ def sim_theta(age_ann, theta):
             obs,rew,d,info=envs[i].step(q=float(qb[j]),w=float(wb[j]))
             obs_list[i]=obs
             u_sum[i]+=disc*float(info.get("u_eff",0.0))*u_scale
-            if d: done[i]=True
+            if d: done[i]=True; disc_end[i]=disc
         disc*=delta_m
+    # 유증동기: HJB 종단효용과 동일한 "연금화 소비등가" 유증효용을 평가에도 반영
+    #   v(W_T) = κ · S · u_CRRA(W_T/S; γ),  S=180개월(15년) — hjb._bequest_U와 동일 형태
+    if a.bequest_kappa > 0.0:
+        WT=np.array([env.W for env in envs])
+        S_beq = 180.0
+        g = a.gamma
+        x = np.maximum(WT, 1e-12) / S_beq
+        if abs(g - 1.0) < 1e-9:
+            u_beq = np.log(x)
+        else:
+            u_beq = (x**(1.0-g) - 1.0) / (1.0-g)
+        u_sum = u_sum + disc_end * a.bequest_kappa * S_beq * u_beq * u_scale
     return u_sum   # per-path 배열 반환 (CRN: seed i가 θ 전반에 공통)
 
 print(f"=== 통합 θ* 평가 (mode={a.mode} γ={a.gamma} floor={a.floor} f_min={a.f_min_real} n={a.n_paths}) ===")

@@ -1480,8 +1480,14 @@ def run_rl(args):
         cfg_rl = RLConfig(
             obs_dim=-1,
             hidden_dims=[128, 128],
+            # [FIX 2026-07] 기존엔 gamma를 args.beta에서 가져왔는데, --beta는 현재편향
+            # (present bias, 준쌍곡선 할인의 β) 계수다. --beta 0.85로 현재편향 실험을
+            # 하면 트레이너의 시간할인이 월 0.85(연환산 ~0.14)로 붕괴해 학습 자체가
+            # 망가지는 심각한 혼선이 있었다(현재편향은 env 보상의 disc_factor로만
+            # 반영되어야 함). 트레이너 할인은 delta_annual(연 표준할인, 기본 0.9530)의
+            # 월환산으로 계산한다.
             gamma=float(
-                getattr(args, "beta", 0.996) or 0.996
+                (getattr(args, "delta_annual", None) or 0.9530) ** (1.0 / 12.0)
             ),
             lam=float(
                 getattr(args, "gae_lambda", 0.95) or 0.95
