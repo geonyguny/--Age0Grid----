@@ -332,6 +332,16 @@ class RetirementEnv:
             0, int(round((self._pension_claim_age - self.age0) * self.steps_per_year))
         )
 
+        # --- 계속고용/브릿지 근로소득 [2026-07 신규] ---
+        # 소득공백기(국민연금 개시 전) 근로소득. 국민연금과 동일하게 "포트폴리오에서
+        # 차감되지 않는 외부소득"으로 취급한다. labor_income_m은 W0=1.0 정규화 단위의
+        # 월소득(예: 월 100만원 ≈ 100/13700 = 0.0073), labor_until_age 도달 전까지 지급.
+        self._labor_income_m = float(self._get(cfg, kwargs, "labor_income_m", 0.0) or 0.0)
+        self._labor_until_age = float(self._get(cfg, kwargs, "labor_until_age", 0.0) or 0.0)
+        self._labor_end_month_idx = max(
+            0, int(round((self._labor_until_age - self.age0) * self.steps_per_year))
+        ) if self._labor_until_age > self.age0 else 0
+
         # --- market sources ---
         self.market_mode = str(self._get(cfg, kwargs, "market_mode", "bootstrap") or "bootstrap").lower()
         self.market_csv = str(self._get(cfg, kwargs, "market_csv", "") or "")
@@ -800,7 +810,12 @@ class RetirementEnv:
         pension_month = _safe_float(getattr(self, "_pension_Y_month", 0.0), 0.0)
         claim_idx = int(getattr(self, "_pension_claim_month_idx", 0) or 0)
         pension_y = pension_month if self.t >= claim_idx else 0.0
-        income_total = y_ann + pension_y
+        labor_y = (
+            self._labor_income_m
+            if self.t < int(getattr(self, "_labor_end_month_idx", 0) or 0)
+            else 0.0
+        )
+        income_total = y_ann + pension_y + labor_y
         return np.asarray(
             [_safe_float(t_norm, 0.0), _safe_float(self.W, 0.0), _safe_float(income_total, 0.0)],
             dtype=np.float32,
@@ -935,7 +950,8 @@ class RetirementEnv:
         # 2) consumption -------------------------------------------------
         y_ann = _safe_float(getattr(self, "y_ann", 0.0), 0.0)
         pension_y = self._pension_Y_month if self.t >= self._pension_claim_month_idx else 0.0
-        c = _safe_float(y_ann + pension_y + q * W_start, 0.0)
+        labor_y = self._labor_income_m if self.t < self._labor_end_month_idx else 0.0
+        c = _safe_float(y_ann + pension_y + labor_y + q * W_start, 0.0)
         # annuity/국민연금 지급은 계정 밖에서 이뤄지므로, 계정 차감은 q*W_start만 적용
         W_after_c = max(W_start - q * W_start, 0.0)
 

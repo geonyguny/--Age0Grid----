@@ -251,6 +251,16 @@ class HJBSolver:
         if claim_month_idx < self.T:
             self.Y_sched[claim_month_idx:] = Y_month
 
+        # --- 계속고용/브릿지 근로소득 [2026-07 신규] ---
+        # 소득공백기(수급개시 전) 근로소득을 국민연금과 동일한 외생소득으로 취급.
+        # retirement_env의 labor_income_m/labor_until_age와 계산식을 일치시켜야
+        # "근로소득을 알고 덜 인출하는" 정책의 순방향 평가가 정합적이다.
+        labor_m = float(getattr(cfg, "labor_income_m", 0.0) or 0.0)
+        labor_until = float(getattr(cfg, "labor_until_age", 0.0) or 0.0)
+        if labor_m > 0.0 and labor_until > self.age0:
+            labor_end_idx = min(self.T, max(0, int(round((labor_until - self.age0) * spm))))
+            self.Y_sched[:labor_end_idx] += labor_m
+
         # --- 종신연금(1회성 매입) 외생소득 ---
         # [2026-07 신규] θ(연금전환비율)는 t=0에서 1회 선택되는 결정으로 취급한다.
         # 이미 runner.annuity_wiring.setup_annuity_overlay()가 HJBSolver 생성 전에

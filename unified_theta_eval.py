@@ -39,11 +39,14 @@ ap.add_argument("--market", choices=["iid", "bootstrap"], default="iid",
                 help="bootstrap이면 정책은 iid 가정으로 풀되 평가는 실측 블록 부트스트랩 경로 사용(모형오설정 강건성)")
 ap.add_argument("--market_csv", default="project/data/market_test_600m.csv")
 ap.add_argument("--w_grid_n", type=int, default=8)
+ap.add_argument("--ann_load", type=float, default=0.08, help="종신연금 부가보험료(사업비 부하)")
+ap.add_argument("--labor_wan", type=float, default=0.0, help="계속고용 월 근로소득(만원, W0=1.37억 정규화)")
+ap.add_argument("--labor_until", type=float, default=0.0, help="근로소득 종료 연령(60 또는 65)")
 ap.add_argument("--n_paths", type=int, default=150)
 ap.add_argument("--ages", default="55,60,65")
 a = ap.parse_args()
 
-q_cap, w_max, u_scale, ann_load = 0.02, a.w_max, 0.0001, 0.08
+q_cap, w_max, u_scale, ann_load = 0.02, a.w_max, 0.0001, a.ann_load
 delta_m = 0.9530 ** (1.0/12.0)
 n_months = 420
 thetas = [round(0.1*i, 1) for i in range(9)]  # 0.0~0.8
@@ -71,6 +74,9 @@ def make_cfg():
     if a.bequest_kappa > 0.0:
         cfg.bequest_kappa = a.bequest_kappa   # HJB 종단 유증효용(log형, bequest_gamma=1)
         cfg.bequest_gamma = 1.0
+    if a.labor_wan > 0.0 and a.labor_until > 55.0:
+        cfg.labor_income_m = a.labor_wan / 13700.0   # 월소득(정규화), W0=1.0=1.37억
+        cfg.labor_until_age = a.labor_until
     return cfg
 
 base_cfg = make_cfg()
