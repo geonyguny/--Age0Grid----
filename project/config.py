@@ -114,6 +114,13 @@ class SimConfig:
     train_annuity_age_min: float = 55.0
     train_annuity_age_max: float = 65.0
     train_annuity_load: float = 0.08
+    # [2026-07 신규] 사회안전망(기초생활보장): floor_on/f_min_real(인출전략 제약,
+    # 기존 의도)과는 별개의 독립적 메커니즘. 본인 자산과 무관하게 정부가 부족분을
+    # 외생적으로 채워주는 방식(계정 비차감).
+    social_floor_on: str = "off"
+    social_floor_min: float = 0.0
+    social_floor_asset_test: float = 0.0   # 자산조사 기준(W0 정규화 단위, 기본 0=완전소진 시만)
+    social_floor_income_test: float = 0.0  # 소득조사 기준(사적연금 y_ann, 기본 0=조금이라도 있으면 실격)
 
     # --- Eval / bookkeeping ---
     # seeds는 리스트/튜플 모두 허용 → 내부적으로 튜플로 고정
@@ -256,5 +263,15 @@ ASSET_PRESETS = {
     "KR":   dict(mu_annual=0.055, sigma_annual=0.22),  # KOSPI, 2000-2024
     "US":   dict(mu_annual=0.065, sigma_annual=0.18),  # S&P500, 2000-2024
     "Gold": dict(mu_annual=0.02,  sigma_annual=0.15),  # LBMA, 2000-2024
+    # [2026-07 신규] TDF(2015&2020, 은퇴임박형 빈티지) 실증 자산배분 비중을 반영한
+    # 합성 위험자산(국내주식 14.6% : 해외주식 85.4%). 국내:해외 비중 근거는
+    # 최재윤·송인욱·박영규(2024, 경영학연구), 자산군별 베타(민감도) 추정치
+    # (국내주식 β=0.0534, 해외주식 β=0.3131). μ,σ는 위 KR/US 장기(2000-2024)
+    # 파라미터를 국내:해외 비중으로 가중합성(상관계수 ρ=0.60 가정)한 값이다.
+    # (q,w) 구조·HJB·RL 등 모형 구조는 변경 없이, 위험자산의 "질"만 개선한 것이며,
+    # 안전자산(2%, 무위험)은 기존과 동일하게 유지한다. 하위자산 간 동적 재조정
+    # (전술적 자산배분)은 고려하지 않고 정적 비중으로 고정하였다(생애주기에 따른
+    # 위험 조정은 (q,w) 자체의 동적 최적화를 통해 이루어짐).
+    "TDF":  dict(mu_annual=0.0635, sigma_annual=0.1749),
 }
 # 안전자산: 3년 만기 국채수익률 ≈ 연 2.0% (rf_annual 기본값과 일치, config 상단 참조)

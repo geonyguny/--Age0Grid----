@@ -26,7 +26,7 @@ foreach ($gkey in $gammaSets.Keys) {
         Write-Host "===== [${gkey}/${key}] $($folder.Name) (gamma=$gamma) =====" -ForegroundColor Cyan
         python milevsky_timing_RL.py "$ckpt" --gamma $gamma --asset TDF --social_floor_on --social_floor_min 0.072
 
-        $outFile = "milevsky_timing_RL_tdf_${gkey}_${key}.json"
+        $outFile = "milevsky_timing_RL_tdfwithfloor_${gkey}_${key}.json"
         if (Test-Path "milevsky_timing_RL_results.json") {
             Move-Item -Force "milevsky_timing_RL_results.json" $outFile
             Write-Host "저장됨: $outFile" -ForegroundColor Green

@@ -11,7 +11,7 @@ $biasKeys = @("base", "lossaversion", "habit", "regret", "presentbias", "ambigui
 foreach ($gkey in $gammaSets.Keys) {
     $gamma = $gammaSets[$gkey]
     foreach ($key in $biasKeys) {
-        $pattern = "rl_tdf_${gkey}_${key}_s0_*"
+        $pattern = "rl_tdfnofloor_${gkey}_${key}_s0_*"
         $folder = Get-ChildItem "outputs\_logs" -Directory -ErrorAction SilentlyContinue |
                   Where-Object { $_.Name -like "*$pattern*" -and (Test-Path (Join-Path $_.FullName "best.pt")) } |
                   Sort-Object LastWriteTime -Descending |
@@ -24,9 +24,9 @@ foreach ($gkey in $gammaSets.Keys) {
 
         $ckpt = Join-Path $folder.FullName "best.pt"
         Write-Host "===== [${gkey}/${key}] $($folder.Name) (gamma=$gamma) =====" -ForegroundColor Cyan
-        python milevsky_timing_RL.py "$ckpt" --gamma $gamma --asset TDF --social_floor_on --social_floor_min 0.072
+        python milevsky_timing_RL.py "$ckpt" --gamma $gamma --asset TDF
 
-        $outFile = "milevsky_timing_RL_tdf_${gkey}_${key}.json"
+        $outFile = "milevsky_timing_RL_tdfnofloor_${gkey}_${key}.json"
         if (Test-Path "milevsky_timing_RL_results.json") {
             Move-Item -Force "milevsky_timing_RL_results.json" $outFile
             Write-Host "저장됨: $outFile" -ForegroundColor Green
